@@ -146,6 +146,28 @@
  * threads/fds. Deliberately generous relative to real concurrent
  * avctl/GUI usage (a handful at most) rather than tightly tuned. */
 #define AVD_CONTROL_MAX_CONNS 32
+/* Caps how many of AVD_CONTROL_MAX_CONNS's slots a single uid may hold at
+ * once. Without this, the global cap alone doesn't stop one unprivileged
+ * local user from opening AVD_CONTROL_MAX_CONNS connections and sitting on
+ * them for AVD_CONTROL_RECV_TIMEOUT_SECS each (repeating indefinitely) -
+ * every *other* user's avctl/GUI use gets "too many concurrent control
+ * connections" for as long as that lasts, on a 0666 socket every local user
+ * can reach. A quarter of the global cap is generous for one user's real
+ * concurrent avctl/GUI usage while leaving room for others. */
+#define AVD_CONTROL_MAX_CONNS_PER_UID (AVD_CONTROL_MAX_CONNS / 4)
+/* Caps how many control-socket SCAN commands may run at once, separately
+ * from AVD_CONTROL_MAX_CONNS. SCAN is the one control verb that runs
+ * perform_scan() (bounded by SCAN_TIMEOUT_SECS, not
+ * AVD_CONTROL_RECV_TIMEOUT_SECS) directly on its own connection's thread
+ * rather than sharing the kernel-triggered scan queue's worker pool - see
+ * docs/avd-socket-protocol.md's SCAN section. Without a cap of its own, a
+ * root-authenticated client issuing AVD_CONTROL_MAX_CONNS concurrent SCANs
+ * would occupy every control connection slot for up to SCAN_TIMEOUT_SECS
+ * each, starving ordinary STATUS/VERDICTS/QUARANTINE LIST use by every
+ * other local user for that whole window - left well under
+ * AVD_CONTROL_MAX_CONNS so those verbs always have room regardless of how
+ * many SCANs are in flight. */
+#define AVD_CONTROL_MAX_SCAN_CONNS 4
 /* Bounds how long a single control connection may sit idle waiting for
  * its request line - without this, a client that connects and never
  * sends a newline (or a slow/hostile one trickling bytes) would block
@@ -453,13 +475,24 @@ static int load_rules(const char *dir) {
     size_t len = strlen(entry->d_name);
     FILE *fp;
     int errors;
+    int fn;
     bool is_yar = len >= 4 && !strcmp(entry->d_name + len - 4, ".yar");
     bool is_yara = len >= 5 && !strcmp(entry->d_name + len - 5, ".yara");
 
     if (!is_yar && !is_yara)
       continue;
 
-    snprintf(filepath, sizeof(filepath), "%s/%s", dir, entry->d_name);
+    /* Fail closed on truncation: a silently-truncated path could open
+     * (and compile in) a different, unintended rule file with no error -
+     * same "reject, don't quietly reinterpret" stance as everywhere else
+     * in this codebase that builds a path with snprintf(). */
+    fn = snprintf(filepath, sizeof(filepath), "%s/%s", dir, entry->d_name);
+    if (fn < 0 || (size_t)fn >= sizeof(filepath)) {
+      fprintf(stderr, "avd: rule path too long, skipping: \"%s/%s\"\n", dir,
+              entry->d_name);
+      total_errors++;
+      continue;
+    }
 
     fp = fopen(filepath, "r");
     if (!fp) {
@@ -665,8 +698,16 @@ static int load_fuzzy_corpus(const char *path) {
 static bool fuzzy_tlsh_size_ok(int fd, const char *label) {
   struct stat st;
 
-  if (fstat(fd, &st) != 0)
-    return true;
+  /* Fail closed: an fstat() failure on an fd we already opened
+   * successfully means something is wrong (not a legitimate "file is
+   * small enough" case), so skip the hash rather than let it through
+   * unbounded - same stance as this function's own over-cap rejection
+   * just below. */
+  if (fstat(fd, &st) != 0) {
+    fprintf(stderr, "avd: skipping %s hash - fstat failed: %s\n", label,
+            strerror(errno));
+    return false;
+  }
   if (st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
     fprintf(stderr,
             "avd: skipping %s hash - file is %lld bytes, over the %d cap\n",
@@ -2594,6 +2635,16 @@ static void cmd_scan(int fd, const char *path) {
 #define PREFIX_MATCH(line, literal) \
   (!strncmp((line), (literal), sizeof(literal) - 1))
 
+/* Guards control_scan_conn_count against AVD_CONTROL_MAX_SCAN_CONNS - see
+ * that constant's comment. A separate lock from control_conn_count_lock
+ * rather than reusing it: this one is held only around the SCAN branch
+ * below (a coarser, much longer-held region spanning the whole
+ * perform_scan() call), so keeping it distinct avoids adding that hold
+ * time to control_conn_count_lock's otherwise brief, frequent critical
+ * sections. */
+static pthread_mutex_t control_scan_conn_lock = PTHREAD_MUTEX_INITIALIZER;
+static int control_scan_conn_count;
+
 static void handle_control_line(int fd, const char *line, uid_t peer_uid,
                                 bool is_root) {
   unsigned long n;
@@ -2627,11 +2678,29 @@ static void handle_control_line(int fd, const char *line, uid_t peer_uid,
     }
     cmd_quarantine_delete(fd, line + sizeof("QUARANTINE DELETE ") - 1);
   } else if (PREFIX_MATCH(line, "SCAN ")) {
+    bool scan_slot_reserved;
+
     if (!is_root) {
       send_err(fd, "permission denied (use: pkexec avctl scan <path>)");
       return;
     }
+
+    pthread_mutex_lock(&control_scan_conn_lock);
+    scan_slot_reserved = control_scan_conn_count < AVD_CONTROL_MAX_SCAN_CONNS;
+    if (scan_slot_reserved)
+      control_scan_conn_count++;
+    pthread_mutex_unlock(&control_scan_conn_lock);
+
+    if (!scan_slot_reserved) {
+      send_err(fd, "too many concurrent SCAN requests - try again shortly");
+      return;
+    }
+
     cmd_scan(fd, line + sizeof("SCAN ") - 1);
+
+    pthread_mutex_lock(&control_scan_conn_lock);
+    control_scan_conn_count--;
+    pthread_mutex_unlock(&control_scan_conn_lock);
   } else {
     send_err(fd, "unknown command");
   }
@@ -2639,6 +2708,13 @@ static void handle_control_line(int fd, const char *line, uid_t peer_uid,
 
 struct control_conn_ctx {
   int fd;
+  /* Resolved once in control_accept_main() (before the per-uid slot
+   * check below reserves against it) and reused here for both that
+   * reservation's matching release and is_root, instead of a second
+   * SO_PEERCRED call on the same fd for the same, connection-lifetime-
+   * invariant value. */
+  uid_t uid;
+  bool have_uid;
 };
 
 /* Guards control_conn_count, incremented (with the AVD_CONTROL_MAX_CONNS
@@ -2648,17 +2724,70 @@ struct control_conn_ctx {
 static pthread_mutex_t control_conn_count_lock = PTHREAD_MUTEX_INITIALIZER;
 static int control_conn_count;
 
+/* Per-uid connection counts backing AVD_CONTROL_MAX_CONNS_PER_UID - sized
+ * to AVD_CONTROL_MAX_CONNS since that's the hard ceiling on how many
+ * distinct uids can have a slot open at any one time, so a fixed array
+ * scanned linearly is simpler than a hash table and plenty fast at this
+ * size. Both helpers below assume control_conn_count_lock is already held
+ * by the caller - they're not independently thread-safe. A slot with
+ * count == 0 is free regardless of what `uid` last held it. */
+struct uid_conn_count {
+  uid_t uid;
+  int count;
+};
+static struct uid_conn_count uid_conn_counts[AVD_CONTROL_MAX_CONNS];
+
+/* Returns true and records the reservation if `uid` is under
+ * AVD_CONTROL_MAX_CONNS_PER_UID, false (no state change) otherwise. */
+static bool uid_conn_reserve(uid_t uid) {
+  int free_idx = -1;
+
+  for (int i = 0; i < AVD_CONTROL_MAX_CONNS; i++) {
+    if (uid_conn_counts[i].count > 0 && uid_conn_counts[i].uid == uid) {
+      if (uid_conn_counts[i].count >= AVD_CONTROL_MAX_CONNS_PER_UID)
+        return false;
+      uid_conn_counts[i].count++;
+      return true;
+    }
+    if (uid_conn_counts[i].count == 0 && free_idx < 0)
+      free_idx = i;
+  }
+  /* free_idx < 0 cannot happen here: the table has AVD_CONTROL_MAX_CONNS
+   * slots and a reservation is only ever made alongside a global
+   * control_conn_count increment bounded by that same constant, so at
+   * most AVD_CONTROL_MAX_CONNS uids can be reserved at once. */
+  uid_conn_counts[free_idx].uid = uid;
+  uid_conn_counts[free_idx].count = 1;
+  return true;
+}
+
+static void uid_conn_release(uid_t uid) {
+  for (int i = 0; i < AVD_CONTROL_MAX_CONNS; i++) {
+    if (uid_conn_counts[i].count > 0 && uid_conn_counts[i].uid == uid) {
+      uid_conn_counts[i].count--;
+      return;
+    }
+  }
+}
+
+/* Releases one control_conn_count slot and, if `have_uid`, its matching
+ * per-uid reservation - the two are always taken and released together
+ * (see control_accept_main()), so every release path shares this instead
+ * of repeating the lock/decrement/release pairing at each of the three
+ * spots that need it. */
+static void control_conn_release_slot(uid_t uid, bool have_uid) {
+  pthread_mutex_lock(&control_conn_count_lock);
+  control_conn_count--;
+  if (have_uid)
+    uid_conn_release(uid);
+  pthread_mutex_unlock(&control_conn_count_lock);
+}
+
 static void *control_conn_main(void *arg) {
   struct control_conn_ctx *ctx = arg;
   char line[AVD_SOCK_LINE_MAX];
-  /* uid pre-set to the same "unknown owner" sentinel perform_scan()
-   * uses ((uid_t)-1, never a real uid in practice) so a failed
-   * getsockopt() below can't leave cred.uid as uninitialized garbage
-   * that might accidentally match a real verdict/quarantine owner. */
-  struct ucred cred = {.pid = 0, .uid = (uid_t)-1, .gid = (gid_t)-1};
-  socklen_t cred_len = sizeof(cred);
   struct timeval tv;
-  bool is_root = false;
+  bool is_root;
   ssize_t len;
 
   /* Bounds how long this connection's thread (and therefore its
@@ -2690,31 +2819,29 @@ static void *control_conn_main(void *arg) {
     fprintf(stderr, "avd: could not set control connection send timeout: %s\n",
             strerror(errno));
 
-  /* SO_PEERCRED is valid any time on a connected AF_UNIX stream socket
-   * (not just immediately post-accept), and returns credentials the
-   * KERNEL captured at connect() time from the connecting process -
-   * not attacker-writable, same trust boundary as nlmsg_get_src() in
-   * msg_handler() above. A failure here (should not happen for a
-   * genuine AF_UNIX peer) fails closed: is_root stays false, so every
-   * privileged verb gets rejected rather than silently trusted. */
-  if (getsockopt(ctx->fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0)
-    is_root = (cred.uid == 0);
+  /* ctx->uid/ctx->have_uid came from control_accept_main()'s SO_PEERCRED
+   * call, which returns credentials the KERNEL captured at connect()
+   * time from the connecting process - not attacker-writable, same
+   * trust boundary as nlmsg_get_src() in msg_handler() above, and
+   * invariant for the life of the connection so resolving it once
+   * there and reusing it here is equivalent to a second call. A
+   * failure there (should not happen for a genuine AF_UNIX peer) fails
+   * closed: is_root stays false, so every privileged verb gets
+   * rejected rather than silently trusted. */
+  is_root = ctx->have_uid && ctx->uid == 0;
 
   len = read_line(ctx->fd, line, sizeof(line));
   if (len < 0)
     send_err(ctx->fd,
              "malformed request (missing newline, line too long, or timed out)");
   else if (len > 0)
-    handle_control_line(ctx->fd, line, cred.uid, is_root);
+    handle_control_line(ctx->fd, line, ctx->uid, is_root);
   /* len == 0: peer connected and disconnected without sending
    * anything - nothing to respond to, not an error. */
 
   close(ctx->fd);
+  control_conn_release_slot(ctx->uid, ctx->have_uid);
   free(ctx);
-
-  pthread_mutex_lock(&control_conn_count_lock);
-  control_conn_count--;
-  pthread_mutex_unlock(&control_conn_count_lock);
 
   return NULL;
 }
@@ -2920,6 +3047,9 @@ static void *control_accept_main(void *arg) {
   while (running) {
     struct control_conn_ctx *ctx;
     pthread_t tid;
+    uid_t peer_uid = (uid_t)-1;
+    bool have_uid;
+    bool slot_reserved;
     int cfd = accept(control_sock_fd, NULL, NULL);
 
     if (cfd < 0) {
@@ -2932,42 +3062,54 @@ static void *control_accept_main(void *arg) {
       continue;
     }
 
+    /* Resolved here, before the slot check, so AVD_CONTROL_MAX_CONNS_PER_UID
+     * can be enforced alongside the global cap below - see
+     * control_conn_main()'s comment for why this is the connection's one
+     * SO_PEERCRED call rather than a second one there. have_uid false
+     * (should not happen for a genuine AF_UNIX peer) means this
+     * connection is exempt from the per-uid cap but still counts toward
+     * the global one. */
     {
-      bool slot_reserved;
+      struct ucred cred = {.pid = 0, .uid = (uid_t)-1, .gid = (gid_t)-1};
+      socklen_t cred_len = sizeof(cred);
 
-      pthread_mutex_lock(&control_conn_count_lock);
-      slot_reserved = control_conn_count < AVD_CONTROL_MAX_CONNS;
-      if (slot_reserved)
-        control_conn_count++;
-      pthread_mutex_unlock(&control_conn_count_lock);
+      have_uid = (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0);
+      if (have_uid)
+        peer_uid = cred.uid;
+    }
 
-      if (!slot_reserved) {
-        /* Reject outright rather than queueing - see
-         * AVD_CONTROL_MAX_CONNS's comment. A real client (avctl/GUI)
-         * gets a clear error and can just retry shortly; a client
-         * trying to exhaust connections gets nothing to hold onto. */
-        send_err(cfd, "too many concurrent control connections - try again shortly");
-        close(cfd);
-        continue;
-      }
+    pthread_mutex_lock(&control_conn_count_lock);
+    slot_reserved = control_conn_count < AVD_CONTROL_MAX_CONNS &&
+                    (!have_uid || uid_conn_reserve(peer_uid));
+    if (slot_reserved)
+      control_conn_count++;
+    pthread_mutex_unlock(&control_conn_count_lock);
+
+    if (!slot_reserved) {
+      /* Reject outright rather than queueing - see
+       * AVD_CONTROL_MAX_CONNS's/AVD_CONTROL_MAX_CONNS_PER_UID's
+       * comments. A real client (avctl/GUI) gets a clear error and can
+       * just retry shortly; a client trying to exhaust connections gets
+       * nothing to hold onto. */
+      send_err(cfd, "too many concurrent control connections - try again shortly");
+      close(cfd);
+      continue;
     }
 
     ctx = malloc(sizeof(*ctx));
     if (!ctx) {
       close(cfd);
-      pthread_mutex_lock(&control_conn_count_lock);
-      control_conn_count--;
-      pthread_mutex_unlock(&control_conn_count_lock);
+      control_conn_release_slot(peer_uid, have_uid);
       continue;
     }
     ctx->fd = cfd;
+    ctx->uid = peer_uid;
+    ctx->have_uid = have_uid;
 
     if (pthread_create(&tid, NULL, control_conn_main, ctx) != 0) {
       close(cfd);
       free(ctx);
-      pthread_mutex_lock(&control_conn_count_lock);
-      control_conn_count--;
-      pthread_mutex_unlock(&control_conn_count_lock);
+      control_conn_release_slot(peer_uid, have_uid);
       continue;
     }
     pthread_detach(tid);

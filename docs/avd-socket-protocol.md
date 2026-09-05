@@ -45,6 +45,13 @@ loosening `GENL_ADMIN_PERM`, both worse than a purpose-built socket.
   connection also has an `AVD_CONTROL_RECV_TIMEOUT_SECS` (5s) idle
   timeout on receiving its request line, so a client that connects and
   never sends anything can't hold a slot open indefinitely.
+- Of those 32, at most `AVD_CONTROL_MAX_CONNS_PER_UID` (8) may belong to
+  any single uid at once - resolved via `SO_PEERCRED` at accept time. On
+  a `0666` socket the global cap alone doesn't stop one unprivileged
+  local user from opening all 32 connections and sitting on each for the
+  5s idle timeout, repeating indefinitely - the per-uid cap leaves room
+  for every other user regardless. A connection beyond a uid's own cap
+  gets the same `ERR too many concurrent control connections` response.
 
 ## Wire format
 
@@ -154,17 +161,20 @@ it gets there.
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
-- **`SCAN` is not rate-limited and does not share the kernel-triggered
-  scan queue.** Unlike `AV_C_SCAN_REQUEST` (which goes through the
-  bounded worker pool (size/queue depth runtime-tunable via the
-  `AVD_SCAN_THREADS`/`AVD_SCAN_QUEUE_MAX` environment variables - see
+- **`SCAN` does not share the kernel-triggered scan queue.** Unlike
+  `AV_C_SCAN_REQUEST` (which goes through the bounded worker pool
+  (size/queue depth runtime-tunable via the `AVD_SCAN_THREADS`/
+  `AVD_SCAN_QUEUE_MAX` environment variables - see
   `docs/netlink-protocol.md`), a control-socket `SCAN` command calls
-  `perform_scan()` directly on that connection's own thread. Bounded
-  only by `AVD_CONTROL_MAX_CONNS` (how many control connections can be
-  open at once) and each connection's `AVD_CONTROL_RECV_TIMEOUT_SECS`
-  idle timeout, not by anything specific to scanning - a root-
-  authenticated client issuing many `SCAN` requests can run that many
-  scans concurrently, uncoordinated with kernel-triggered scans.
+  `perform_scan()` directly on that connection's own thread, uncoordinated
+  with kernel-triggered scans. It has its own concurrency cap,
+  `AVD_CONTROL_MAX_SCAN_CONNS` (4, well under `AVD_CONTROL_MAX_CONNS`) -
+  a root-authenticated client issuing more concurrent `SCAN`s than that
+  gets `ERR too many concurrent SCAN requests - try again shortly`
+  rather than tying up every control connection slot (each held for up
+  to `SCAN_TIMEOUT_SECS`, not the much shorter
+  `AVD_CONTROL_RECV_TIMEOUT_SECS`) and starving ordinary
+  STATUS/VERDICTS/QUARANTINE LIST use by every other local user.
 - **`avd` must already be registered with the kernel module for the
   control socket to exist at all** - `main()` in `avd.c` still exits
   before starting the control socket if `genl_connect()`/
