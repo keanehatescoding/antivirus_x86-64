@@ -83,22 +83,22 @@ as every other in-memory kernel-side state here; `avctl save`/`avctl
 load` round-trip it alongside signatures/trust/protected-paths if you
 want it to persist across reloads.
 
-**Timing caveat, found while building this:** the policy is read
-inside `av_work_fn()` — i.e. at *verdict* time, asynchronously,
-whenever that specific exec's workqueue item happens to run — not
-captured back at the kprobe/exec moment itself. A process that started
-(and was allowed past the kprobe) while this was still fail-open can
-still get killed if an operator flips it to fail-closed before that
-exec's work item is processed, since the check reads the *current*
-value, not the value at launch time. With no daemon connected the scan
-fails fast rather than waiting the full `DAEMON_TIMEOUT_MS`, so this
-window is normally small, but it's not zero — and it isn't scoped to
-some other process either: if you flip this from an interactive shell
-with no daemon running, don't be surprised if that shell's own recent
-exec gets caught by it too. Arguably defensible (fail-closed's whole
-point is not trusting anything in-flight you can't get a verdict for),
-but worth knowing before you flip it live rather than discovering it
-by watching your own shell die.
+**Timing caveat, found while building this — since fixed:** the policy
+used to be read inside `av_work_fn()` — i.e. at *verdict* time,
+asynchronously, whenever that specific exec's workqueue item happened
+to run — rather than captured back at the kprobe/exec moment itself. A
+process that started (and was allowed past the kprobe) while this was
+still fail-open could still get killed if an operator flipped it to
+fail-closed before that exec's work item was processed, since the
+check read the *current* value, not the value at launch time, and it
+wasn't scoped to some other process either — flipping this from an
+interactive shell with no daemon running could get that shell's own
+recent exec caught by it too. **Fixed:** `handler_pre()`/
+`handler_pre_execveat()` now snapshot the policy into `struct
+av_work`'s `fail_closed` field at kprobe time, and `av_work_fn()`
+enforces that snapshot instead of re-reading the live value — an
+operator toggling the policy now only affects execs observed *after*
+the flip, never ones already in flight.
 
 ## Commands
 
@@ -156,11 +156,9 @@ by watching your own shell die.
   closed instead, at runtime, no module reload needed. Fail-open
   remains the default for the reason given above (avoid a crashed
   daemon becoming a system-wide DoS); fail-closed is opt-in for
-  deployments that want it. Not calling this "fixed" outright since
-  it's a genuine tradeoff either way, not a bug — see the timing
-  caveat above the Commands table for a real, if narrow, hazard this
-  introduces (a flip to fail-closed can retroactively catch an
-  already-in-flight exec, including the flipping shell's own).
+  deployments that want it. The retroactive-kill hazard from flipping
+  this mid-flight (see the timing caveat above the Commands table) is
+  now fixed too — the policy is captured per-exec at kprobe time.
 - **Kernel netlink API surface is version-sensitive**, same caveat as
   the syscall-wrapper kprobe hooking — `genl_family` struct layout has
   changed across kernel versions (notably where `.policy` lives). This

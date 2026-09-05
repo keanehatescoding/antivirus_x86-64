@@ -503,11 +503,16 @@ static int trust_proc_open(struct inode *inode, struct file *file) {
   return single_open(file, trust_proc_show, NULL);
 }
 
-static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
-                                size_t count, loff_t *ppos) {
+/* ppos is only read here, but proc_write must match struct proc_ops's
+ * fixed non-const loff_t * signature exactly - same class of false
+ * positive as protected_proc_write()'s own identical suppression
+ * below. */
+/* cppcheck-suppress constParameterCallback */
+static ssize_t trust_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
   char kbuf[192];
   char cmd[8], hex[SHA256_HEX_LEN + 1], name[TRUST_NAME_LEN];
   int n;
+  size_t len;
 
   /* DAC mode (0644) alone only checks UID 0, not the capability that
    * UID actually holds - any root process, even one that dropped
@@ -516,6 +521,13 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
    * GENL_ADMIN_PERM; this proc handler needs the same bar. */
   if (!capable(CAP_SYS_ADMIN))
     return -EPERM;
+
+  /* Reject anything but the first write to a freshly-opened fd - same
+   * multi-chunk-truncation defense as protected_proc_write() below;
+   * see its comment for why a size cap alone doesn't catch a large
+   * write arriving as several separate, individually-small calls. */
+  if (*ppos != 0)
+    return -EINVAL;
 
   /* Reject oversized writes instead of silently truncating them -
    * same fix, same reasoning as sig_proc_write() in sigtable.c: the
@@ -529,6 +541,20 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
   if (copy_from_user(kbuf, ubuf, count))
     return -EFAULT;
   kbuf[count] = '\0';
+
+  /* Require (and then strip) a trailing newline terminator - the other
+   * half of the multi-chunk defense above: a write truncated mid-content
+   * by chunked delivery ends mid-field, not on a newline, so this is
+   * what actually rejects a truncated fragment instead of silently
+   * parsing it as a short-but-valid hex hash. Same convention as
+   * protected_proc_write()'s trailing-terminator requirement, optional
+   * preceding \r included. */
+  len = strlen(kbuf);
+  if (len == 0 || kbuf[len - 1] != '\n')
+    return -EINVAL;
+  kbuf[--len] = '\0';
+  if (len > 0 && kbuf[len - 1] == '\r')
+    kbuf[--len] = '\0';
 
   n = sscanf(kbuf, "%7s %64s %63[^\n]", cmd, hex, name);
   if (n < 2)

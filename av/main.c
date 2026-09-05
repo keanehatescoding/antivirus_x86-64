@@ -86,6 +86,21 @@
 #include "netlink_proto.h"
 #include "sigtable.h"
 
+/* x86_64 only, for now (see CONTRIBUTING.md) - every hook below is
+ * registered by hardcoded __x64_sys_* symbol name. On an arch using a
+ * different wrapper naming (e.g. arm64's __arm64_sys_*), those symbols
+ * don't exist: register_kprobe() would fail for each hook in turn and
+ * av_init() unwinds and refuses to load, so this was never actually a
+ * silent-inertness risk at runtime - but that failure mode only shows
+ * up as a handful of "register_kprobe(execve) failed: -22" dmesg lines
+ * with no indication of *why*, on a kernel someone spent real time
+ * building this module against. Fail at compile time instead, with an
+ * explicit reason, rather than letting a builder discover the
+ * architecture mismatch via cryptic runtime errors. */
+#ifndef CONFIG_X86_64
+#error "av.ko is x86_64-only for now - it resolves __x64_sys_* symbols by name; porting to another arch means finding the equivalent wrapper symbols throughout, not just relaxing this check (see CONTRIBUTING.md)"
+#endif
+
 #define HOOKED_SYSCALL_NAME "__x64_sys_execve" /* see README re: arch */
 #define HOOKED_SYSCALLAT_NAME                                                  \
   "__x64_sys_execveat" /* see README re: arch -                                \
@@ -488,6 +503,15 @@ struct av_work {
                     * cwd happens to be by the time av_work_fn()
                     * runs - see open_exec_target(). Released with
                     * path_put() in av_work_fn()'s cleanup. */
+  bool fail_closed; /* av_daemon_fail_closed, snapshotted here (kprobe
+                     * time) rather than re-read in av_work_fn() at
+                     * verdict time - see the policy-flip race note on
+                     * av_daemon_fail_closed's own declaration below.
+                     * Locks in "policy as of launch" semantics instead
+                     * of "policy as of verdict", so an operator toggling
+                     * fail-closed mid-flight can no longer retroactively
+                     * kill an exec that was already committed under
+                     * fail-open. */
   char path[PATH_MAX];
 };
 
@@ -725,23 +749,20 @@ out:
  * it), so atomic load/store is both sufficient and cheaper than a
  * lock for this access pattern.
  *
- * TIMING NOTE, confirmed the hard way during development: this flag
- * is read inside av_work_fn() below - i.e. asynchronously, whenever
- * that exec's workqueue item happens to run - not captured at the
- * kprobe/exec moment itself. An exec that started (and was allowed
- * past the kprobe) while this was still fail-open can still be
- * killed if an operator flips it to fail-closed before that specific
- * exec's work item is processed - the process sees the policy as of
- * *verdict* time, not launch time. In practice this window is short
- * (no daemon means av_netlink_scan_request() fails fast, not after
- * the full DAEMON_TIMEOUT_MS), but it's not zero, especially under
- * workqueue backlog. This isn't scoped to some OTHER process either -
- * it includes whatever shell/process issued the flip itself, if that
- * shell's own earlier exec's work item is still pending. Arguably
- * defensible (fail-closed's whole point is "don't trust anything
- * in-flight I can't get a verdict for"), but worth knowing before you
- * flip this interactively: don't be surprised if your own shell gets
- * SIGKILLed moments after you enable it with no daemon running. */
+ * TIMING NOTE, and the fix for it: this flag used to be read directly
+ * inside av_work_fn() below - i.e. asynchronously, whenever that
+ * exec's workqueue item happened to run - rather than captured at the
+ * kprobe/exec moment itself. That meant an exec that started (and was
+ * allowed past the kprobe) while this was still fail-open could still
+ * be killed if an operator flipped it to fail-closed before that
+ * specific exec's work item was processed - the process saw the
+ * policy as of *verdict* time, not launch time, and that window grew
+ * with workqueue backlog. handler_pre()/handler_pre_execveat() now
+ * snapshot this into struct av_work's fail_closed field at kprobe
+ * time instead, so av_work_fn() enforces the policy that was in
+ * effect when the exec was actually observed - flipping this
+ * interactively no longer risks retroactively killing execs (including
+ * your own shell's) that already committed under the old policy. */
 static atomic_t av_daemon_fail_closed = ATOMIC_INIT(0);
 
 static int daemon_policy_proc_show(struct seq_file *m, void *v) {
@@ -990,15 +1011,17 @@ static void av_work_fn(struct work_struct *w) {
                           abs_path, pid_nr(aw->target_pid), digest.md5,
                           digest.sha1, digest.sha256, MAJOR(ident.dev),
                           MINOR(ident.dev), ident.ino);
-    } else if (atomic_read(&av_daemon_fail_closed)) {
-      /* Operator has opted into fail-closed via
-       * /proc/kernel_av_daemon_policy - -ENOTCONN/-ETIMEDOUT/other
-       * error is treated as "no verdict, don't trust it" rather than
-       * "clean". Goes through the same av_kill() as every other kill
-       * path, so it still respects the PID-1 guard and the
-       * operator-managed protected-path allow-list - fail-closed
-       * mode changes what "inconclusive" means, not those existing
-       * safety rails. */
+    } else if (aw->fail_closed) {
+      /* Operator had opted into fail-closed via
+       * /proc/kernel_av_daemon_policy as of THIS exec's kprobe time
+       * (see the policy comment above av_daemon_fail_closed's
+       * declaration for why that's aw->fail_closed and not a fresh
+       * atomic_read() here) - -ENOTCONN/-ETIMEDOUT/other error is
+       * treated as "no verdict, don't trust it" rather than "clean".
+       * Goes through the same av_kill() as every other kill path, so
+       * it still respects the PID-1 guard and the operator-managed
+       * protected-path allow-list - fail-closed mode changes what
+       * "inconclusive" means, not those existing safety rails. */
       snprintf(reason, sizeof(reason), "no-verdict:err=%d", nl_ret);
       av_kill(aw->target_pid, abs_path, "fail-closed", reason, &ident);
     } else {
@@ -1115,6 +1138,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
   aw->start_time = current->start_time;
+  aw->fail_closed = atomic_read(&av_daemon_fail_closed);
   /* get_fs_pwd() takes fs->lock and bumps refcounts under it - no
    * sleeping, so this is fine in this atomic kprobe context. This is
    * the fix for the relative-path evasion: capture the calling
@@ -1245,6 +1269,7 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
   aw->start_time = current->start_time;
+  aw->fail_closed = atomic_read(&av_daemon_fail_closed);
   INIT_WORK(&aw->work, av_work_fn);
   queue_work(av_wq, &aw->work);
 
@@ -1776,11 +1801,18 @@ static int __init av_init(void) {
   }
 
   /* Seed a default signature so testing works out of the box without
-   * needing a separate `avctl add` step first. */
-  av_sigtable_add(
+   * needing a separate `avctl add` step first. Not fatal to av_init()
+   * if this fails - detection still works via avctl/the daemon path,
+   * just without the EICAR convenience entry - but silently ignoring
+   * the return value would leave "why doesn't EICAR trigger a kill on
+   * a fresh module load" with no dmesg trail to explain it, so log it
+   * loudly enough to notice. */
+  ret = av_sigtable_add(
       AV_ALGO_SHA256,
       "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
       "EICAR-Test-File");
+  if (ret)
+    pr_warn("kernel-av: failed to seed default EICAR signature: %d\n", ret);
 
   ret = av_behavior_init();
   if (ret) {
