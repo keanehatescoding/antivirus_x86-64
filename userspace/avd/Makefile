@@ -6,7 +6,8 @@ CC ?= gcc
 # -Wformat but is spelled out anyway since it's the one CodeQL/distro
 # hardening scanners specifically check for.
 CFLAGS ?= -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-          -Wformat -Wformat-security
+          -Wformat -Wformat-security -fPIE
+LDFLAGS ?= -pie -Wl,-z,relro,-z,now
 PKG_CONFIG ?= pkg-config
 
 # install target only - PREFIX/SYSCONFDIR/UNITDIR follow the usual
@@ -82,7 +83,7 @@ checkdeps:
 	fi
 
 avd: avd.o sha256.o tlsh_core.o tlsh_shim.o
-	$(CC) -o avd avd.o sha256.o tlsh_core.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) -lpthread
+	$(CC) $(CFLAGS) $(LDFLAGS) -o avd avd.o sha256.o tlsh_core.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) -lpthread
 
 # Every translation unit here is plain C, built and linked with
 # $(CC) - this project has no C++ code left (TLSH fuzzy hashing used

@@ -4,7 +4,8 @@ CC ?= gcc
 # extra runtime checks _FORTIFY_SOURCE and stack-protector buy are
 # worth the small overhead.
 CFLAGS ?= -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-          -Wformat -Wformat-security
+          -Wformat -Wformat-security -fPIE
+LDFLAGS ?= -pie -Wl,-z,relro,-z,now
 
 # install target only - avctl itself is still most commonly just built
 # and run in place (./avctl, see the top-level README's examples),
@@ -26,7 +27,7 @@ DESTDIR         ?=
 POLKIT_ACTIONDIR ?= /usr/share/polkit-1/actions
 
 avctl: avctl.c
-	$(CC) $(CFLAGS) -o avctl avctl.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o avctl avctl.c
 
 clean:
 	rm -f avctl
