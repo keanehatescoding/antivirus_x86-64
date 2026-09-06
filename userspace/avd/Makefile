@@ -6,8 +6,15 @@ CC ?= gcc
 # -Wformat but is spelled out anyway since it's the one CodeQL/distro
 # hardening scanners specifically check for.
 CFLAGS ?= -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-          -Wformat -Wformat-security -fPIE
-LDFLAGS ?= -pie -Wl,-z,relro,-z,now
+          -Wformat -Wformat-security
+LDFLAGS ?=
+# -fPIE and -pie/RELRO/BIND_NOW must stay coupled: a plain `+=` is
+# ignored for command-line `make CFLAGS=...` overrides (which CI uses
+# for -Werror in build-matrix.yml), so `override` forces the append
+# even then. Keeps a non-PIE-default toolchain from hitting a
+# relocation/link error on a mismatched pair.
+override CFLAGS += -fPIE
+override LDFLAGS += -pie -Wl,-z,relro,-z,now
 PKG_CONFIG ?= pkg-config
 
 # install target only - PREFIX/SYSCONFDIR/UNITDIR follow the usual
