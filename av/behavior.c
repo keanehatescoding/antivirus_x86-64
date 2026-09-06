@@ -548,11 +548,22 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf, size
    * what actually rejects a truncated fragment instead of silently
    * parsing it as a short-but-valid hex hash. Same convention as
    * protected_proc_write()'s trailing-terminator requirement, optional
-   * preceding \r included. */
-  len = strlen(kbuf);
-  if (len == 0 || kbuf[len - 1] != '\n')
+   * preceding \r included.
+   *
+   * Checked against `count` (what copy_from_user() actually copied),
+   * not strlen(kbuf): copy_from_user() doesn't stop at an embedded
+   * NUL, so a write containing one (e.g. "add <hex> name\n\0junk")
+   * would have strlen() see only the truncated prefix - the trailing
+   * '\n' check would pass against that prefix while `junk` after the
+   * NUL was silently never validated, yet the handler still reports
+   * the full `count` bytes as consumed below. Reject any embedded
+   * NUL outright instead of just ignoring what follows it. */
+  if (count == 0 || kbuf[count - 1] != '\n')
     return -EINVAL;
-  kbuf[--len] = '\0';
+  if (memchr(kbuf, '\0', count - 1))
+    return -EINVAL;
+  len = count - 1;
+  kbuf[len] = '\0';
   if (len > 0 && kbuf[len - 1] == '\r')
     kbuf[--len] = '\0';
 
