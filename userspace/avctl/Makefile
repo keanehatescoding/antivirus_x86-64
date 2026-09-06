@@ -31,7 +31,9 @@ DESTDIR         ?=
 # it is not relocatable the way PREFIX-based installs are.
 POLKIT_ACTIONDIR ?= /usr/share/polkit-1/actions
 
-avctl: avctl.c
+# Makefile prerequisite: a flags-only Makefile edit must invalidate the
+# binary, or incremental builds keep installing the stale artifact.
+avctl: avctl.c Makefile
 	$(CC) $(CFLAGS) $(LDFLAGS) -o avctl avctl.c
 
 clean:
