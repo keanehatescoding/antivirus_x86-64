@@ -5,6 +5,12 @@ CC ?= gcc
 # worth the small overhead.
 CFLAGS ?= -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
           -Wformat -Wformat-security
+LDFLAGS ?=
+# Same coupling note as userspace/avd/Makefile: `override` keeps -fPIE
+# and -pie/RELRO/BIND_NOW together even when CI passes its own
+# `make CFLAGS=...` (build-matrix.yml) without them.
+override CFLAGS += -fPIE
+override LDFLAGS += -pie -Wl,-z,relro,-z,now
 
 # install target only - avctl itself is still most commonly just built
 # and run in place (./avctl, see the top-level README's examples),
@@ -25,8 +31,10 @@ DESTDIR         ?=
 # it is not relocatable the way PREFIX-based installs are.
 POLKIT_ACTIONDIR ?= /usr/share/polkit-1/actions
 
-avctl: avctl.c
-	$(CC) $(CFLAGS) -o avctl avctl.c
+# Makefile prerequisite: a flags-only Makefile edit must invalidate the
+# binary, or incremental builds keep installing the stale artifact.
+avctl: avctl.c Makefile
+	$(CC) $(CFLAGS) $(LDFLAGS) -o avctl avctl.c
 
 clean:
 	rm -f avctl
