@@ -5,7 +5,12 @@ name: Static analysis
 # (pre-commit:30-113), so a machine without shellcheck/cppcheck/
 # yamllint can still commit. This job installs all three
 # unconditionally, so a lint regression fails here even if the
-# author's machine skipped it.
+# author's machine skipped it. Scopes below mirror the hook's scopes
+# on purpose - notably, cppcheck covers av/ and userspace/avctl/
+# only, not userspace/avd/ or tests/ (the hook never cppcheck'd
+# those; avd.c alone has pre-existing style findings that deserve
+# their own triage, not a drive-by in a CI PR). avd correctness is
+# covered elsewhere: build-matrix.yml compiles it with -Werror.
 
 on:
   push:
