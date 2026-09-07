@@ -1260,6 +1260,12 @@ static int control_request(const char *cmd, char **out)
                 werr = errno;
                 break;
             }
+            /* A zero-byte write makes no progress — without this, off
+             * never advances and the loop spins forever. */
+            if (n == 0) {
+                werr = EIO;
+                break;
+            }
             off += (size_t)n;
         }
         free(req);

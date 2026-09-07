@@ -1485,6 +1485,12 @@ static int copy_fd_to(int fd, const char *dst) {
           ret = -1;
           break;
         }
+        /* Same no-progress guard as control_request()'s write loop in
+         * avctl.c: a zero-byte write would otherwise spin forever. */
+        if (w == 0) {
+          ret = -1;
+          break;
+        }
         off += (size_t)w;
       }
       if (ret != 0)
@@ -1496,9 +1502,16 @@ static int copy_fd_to(int fd, const char *dst) {
 
   /* Persist the copy before handing it back: a crash between close()
    * and a later read must not surface a truncated quarantine file as
-   * intact. */
-  if (ret == 0 && fsync(out_fd) != 0)
-    ret = -1;
+   * intact. EINTR is retryable (avd's signal handlers don't use
+   * SA_RESTART); anything else is fatal. */
+  if (ret == 0) {
+    int r;
+    do {
+      r = fsync(out_fd);
+    } while (r != 0 && errno == EINTR);
+    if (r != 0)
+      ret = -1;
+  }
 
   close(out_fd);
 
@@ -2155,6 +2168,13 @@ static int write_all(int fd, const char *buf, size_t len) {
     if (n < 0) {
       if (errno == EINTR)
         continue;
+      return -1;
+    }
+    /* Same no-progress guard as the new loops above: a zero-byte
+     * write would otherwise spin here forever holding a control
+     * connection slot. */
+    if (n == 0) {
+      errno = EIO;
       return -1;
     }
     off += (size_t)n;
