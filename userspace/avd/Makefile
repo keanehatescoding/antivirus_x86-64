@@ -7,6 +7,14 @@ CC ?= gcc
 # hardening scanners specifically check for.
 CFLAGS ?= -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
           -Wformat -Wformat-security
+LDFLAGS ?=
+# -fPIE and -pie/RELRO/BIND_NOW must stay coupled: a plain `+=` is
+# ignored for command-line `make CFLAGS=...` overrides (which CI uses
+# for -Werror in build-matrix.yml), so `override` forces the append
+# even then. Keeps a non-PIE-default toolchain from hitting a
+# relocation/link error on a mismatched pair.
+override CFLAGS += -fPIE
+override LDFLAGS += -pie -Wl,-z,relro,-z,now
 PKG_CONFIG ?= pkg-config
 
 # install target only - PREFIX/SYSCONFDIR/UNITDIR follow the usual
@@ -81,8 +89,12 @@ checkdeps:
 		exit 1; \
 	fi
 
-avd: avd.o sha256.o tlsh_core.o tlsh_shim.o
-	$(CC) -o avd avd.o sha256.o tlsh_core.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) -lpthread
+# Makefile is a normal prerequisite throughout: GNU Make won't rebuild
+# objects/binaries on a flags-only Makefile change otherwise, so an
+# incremental build could install stale artifacts missing the hardening
+# flags above. install depends on avd, so it inherits the rebuild.
+avd: avd.o sha256.o tlsh_core.o tlsh_shim.o Makefile
+	$(CC) $(CFLAGS) $(LDFLAGS) -o avd avd.o sha256.o tlsh_core.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) -lpthread
 
 # Every translation unit here is plain C, built and linked with
 # $(CC) - this project has no C++ code left (TLSH fuzzy hashing used
@@ -91,23 +103,23 @@ avd: avd.o sha256.o tlsh_core.o tlsh_shim.o
 # checkdeps to run first without making a checkdeps timestamp change
 # trigger a needless rebuild of these objects (checkdeps has no file
 # output to have a timestamp in the first place).
-avd.o: avd.c ../../av/netlink_proto.h sha256.h tlsh_shim.h | checkdeps
+avd.o: avd.c ../../av/netlink_proto.h sha256.h tlsh_shim.h Makefile | checkdeps
 	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
 
 # sha256.o needs none of avd's third-party deps (libnl/yara/fuzzy)
 # - no "| checkdeps" prerequisite, so `make` in a tree missing those
 # still builds this object on its own (harmless; the final link still
 # needs them regardless).
-sha256.o: sha256.c sha256.h
+sha256.o: sha256.c sha256.h Makefile
 	$(CC) $(CFLAGS) -c sha256.c -o sha256.o
 
 # tlsh_core.o is the vendored TLSH algorithm itself - no third-party
 # deps either (tlsh_diff_table.h is a header, not a link dependency),
 # same no-checkdeps reasoning as sha256.o.
-tlsh_core.o: tlsh_core.c tlsh_core.h tlsh_diff_table.h
+tlsh_core.o: tlsh_core.c tlsh_core.h tlsh_diff_table.h Makefile
 	$(CC) $(CFLAGS) -c tlsh_core.c -o tlsh_core.o
 
-tlsh_shim.o: tlsh_shim.c tlsh_shim.h tlsh_core.h
+tlsh_shim.o: tlsh_shim.c tlsh_shim.h tlsh_core.h Makefile
 	$(CC) $(CFLAGS) -c tlsh_shim.c -o tlsh_shim.o
 
 clean:
