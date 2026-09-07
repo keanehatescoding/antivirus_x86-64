@@ -1217,6 +1217,14 @@ static bool is_extension_append_rename(const char *old_path,
 static void kill_with_reason(struct pid *target_pid, const char *path,
                              const char *reason) {
   struct task_struct *task;
+  /* PID-1 guard before any allocation: never spend a PATH_MAX kmalloc
+   * on a target that is unconditionally suppressed. */
+  if (pid_nr(target_pid) == 1) {
+    pr_alert("kernel-av: event=suppressed action=none type=behavioral "
+             "path=\"%s\" reason=\"%s\" pid=1\n",
+             path, reason);
+    return;
+  }
   /* PATH_MAX (4096) is far too large for the kernel stack (typically
    * 8-16KB total, shared with everything else on this call path) -
    * heap-allocate rather than declare a PATH_MAX array here. Sleepable
@@ -1225,14 +1233,6 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
    * not that the protection check is skipped - av_behavior_target_
    * is_protected() tolerates a NULL path_out for exactly this case. */
   char *protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
-
-  if (pid_nr(target_pid) == 1) {
-    pr_alert("kernel-av: event=suppressed action=none type=behavioral "
-             "path=\"%s\" reason=\"%s\" pid=1\n",
-             path, reason);
-    kfree(protected_path);
-    return;
-  }
 
   if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
     pr_alert("kernel-av: event=suppressed action=none type=behavioral "
