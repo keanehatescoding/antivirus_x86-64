@@ -1,8 +1,8 @@
 {
   "_comment": "Auto-updated weekly by .github/workflows/update-kernel-matrix.yml (see .github/scripts/update-kernel-matrix.sh). This is a plain data file, not a workflow file, deliberately: GitHub refuses to let the default GITHUB_TOKEN push a change to anything under .github/workflows/ even with contents:write granted, so the versions list lives here instead and build-matrix.yml reads it at run time via fromJSON(). Hand-editing \"versions\" is fine but wont survive the next scheduled run - add a one-off extra leg directly in build-matrix.yml instead.",
   "versions": [
-    "6.12.107",
-    "6.18.48",
-    "7.2.2"
+    "6.12.108",
+    "6.18.49",
+    "7.2.3"
   ]
 }
