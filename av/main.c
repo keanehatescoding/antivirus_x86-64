@@ -847,6 +847,7 @@ static struct proc_dir_entry *daemon_policy_proc_entry;
 static void av_kill(struct pid *target_pid, const char *path, const char *type,
                     const char *reason, const struct av_file_identity *ident) {
   struct task_struct *task;
+  char *protected_path;
   /* PID 1 checked before any allocation: killing init can panic the
    * kernel, so bail before spending a PATH_MAX kmalloc on it. */
   if (pid_nr(target_pid) == 1) {
@@ -861,7 +862,7 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
    * context (workqueue), GFP_KERNEL is fine. A kmalloc failure just
    * drops the protected-exe path from the log line, not the check
    * itself - av_behavior_target_is_protected() tolerates NULL path_out. */
-  char *protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
+  protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
   /* See behavior.h's comment on av_behavior_target_is_protected() -
    * an operator-managed allow-list, same suppressed-not-skipped

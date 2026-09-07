@@ -1217,6 +1217,7 @@ static bool is_extension_append_rename(const char *old_path,
 static void kill_with_reason(struct pid *target_pid, const char *path,
                              const char *reason) {
   struct task_struct *task;
+  char *protected_path;
   /* PID-1 guard before any allocation: never spend a PATH_MAX kmalloc
    * on a target that is unconditionally suppressed. */
   if (pid_nr(target_pid) == 1) {
@@ -1232,7 +1233,7 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
    * means the protected-exe path is missing from the log line below,
    * not that the protection check is skipped - av_behavior_target_
    * is_protected() tolerates a NULL path_out for exactly this case. */
-  char *protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
+  protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
   if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
     pr_alert("kernel-av: event=suppressed action=none type=behavioral "
