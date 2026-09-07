@@ -3,7 +3,8 @@
 # .githooks/pre-push - runs the full build+load+detect+unload test suite
 # before anything leaves your machine, but ONLY when the push actually
 # touches av/, userspace/avctl/, userspace/avd/, userspace/av-gui/,
-# rules/, or corpus/ - a docs-only push shouldn't insmod a kernel module.
+# rules/, corpus/, or packaging/ - a docs-only push shouldn't insmod
+# a kernel module.
 #
 # This needs root (insmod/rmmod) and should only run inside your VM.
 # Runs via pkexec rather than sudo: pkexec goes through the system's
@@ -69,12 +70,12 @@ done
 # match result, so a real match could be misreported as "no match"
 # and the test suite silently skipped. A herestring has no second
 # process and no pipe to close early, so this can't happen.
-if ! grep -qE '^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/)' <<< "$CHANGED_FILES"; then
-    echo "pre-push: no changes under av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, or corpus/ - skipping test suite"
+if ! grep -qE '^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/|packaging/)' <<< "$CHANGED_FILES"; then
+    echo "pre-push: no changes under av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, corpus/, or packaging/ - skipping test suite"
     exit 0
 fi
 
-echo "==> pre-push: changes detected in av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, or corpus/"
+echo "==> pre-push: changes detected in av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, corpus/, or packaging/"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
 # No separate preflight credential check: 'pkexec tests/run_all.sh'

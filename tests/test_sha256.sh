@@ -21,7 +21,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AVD_DIR="$REPO_ROOT/userspace/avd"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/av_test_sha256.XXXXXX")" || exit 1
 
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 # False positive: cleanup() IS invoked, via `trap` on the very next
 # line - the linter loses track of that reference across the C
 # heredoc further down (verified by bisecting this file: truncating it

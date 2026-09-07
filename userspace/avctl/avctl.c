@@ -1335,6 +1335,11 @@ static int do_scan(const char *path)
 {
     char cmd[PATH_MAX + 8];
     char *resp, *cursor;
+    /* cppcheck-suppress constVariablePointer
+     * `line` is never written through directly, but it must stay char *:
+     * strchr(line, ...) feeds char *tab1/2/3 below and those ARE written
+     * through (*tabN = '\0'), so const-qualifying line breaks the
+     * -Werror build (-Wdiscarded-qualifiers at the strchr assignment). */
     char *line;
     int n;
 
