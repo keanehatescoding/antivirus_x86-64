@@ -75,6 +75,7 @@
 #include <linux/namei.h>
 #include <linux/pid.h>
 #include <linux/proc_fs.h>
+#include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -706,6 +707,9 @@ static int hash_file_multi(const char *path, const struct path *pwd,
       if (ret)
         goto out;
     }
+    /* Sleepable kworker: yield each chunk so a large cached file can't
+     * monopolize the CPU on CONFIG_PREEMPT_NONE. */
+    cond_resched();
   }
   if (n < 0) {
     ret = n;
@@ -843,21 +847,22 @@ static struct proc_dir_entry *daemon_policy_proc_entry;
 static void av_kill(struct pid *target_pid, const char *path, const char *type,
                     const char *reason, const struct av_file_identity *ident) {
   struct task_struct *task;
+  char *protected_path;
+  /* PID 1 checked before any allocation: killing init can panic the
+   * kernel, so bail before spending a PATH_MAX kmalloc on it. */
+  if (pid_nr(target_pid) == 1) {
+    pr_alert("kernel-av: event=suppressed action=none type=%s "
+             "path=\"%s\" reason=\"%s\" pid=1\n",
+             type, path, reason);
+    return;
+  }
   /* PATH_MAX (4096) is far too large for the kernel stack - heap-
    * allocate rather than declare a PATH_MAX array here, same reasoning
    * as kill_with_reason()'s identical pattern in behavior.c. Sleepable
    * context (workqueue), GFP_KERNEL is fine. A kmalloc failure just
    * drops the protected-exe path from the log line, not the check
    * itself - av_behavior_target_is_protected() tolerates NULL path_out. */
-  char *protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
-
-  if (pid_nr(target_pid) == 1) {
-    pr_alert("kernel-av: event=suppressed action=none type=%s "
-             "path=\"%s\" reason=\"%s\" pid=1\n",
-             type, path, reason);
-    kfree(protected_path);
-    return;
-  }
+  protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
   /* See behavior.h's comment on av_behavior_target_is_protected() -
    * an operator-managed allow-list, same suppressed-not-skipped
