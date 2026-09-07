@@ -177,7 +177,7 @@ echo
 
 echo "-- Test 2: AT_FDCWD + relative path --"
 dmesg -C
-(cd "$TESTDIR" && "$TESTDIR/execveat_runner" AT_FDCWD eicar.com 0 || true)
+(cd "$TESTDIR" && "$TESTDIR/execveat_runner" AT_FDCWD eicar.com 0) || true
 sleep 1
 if check_detected "$TESTDIR/eicar.com"; then
 	echo "PASS: relative path resolved against cwd correctly"

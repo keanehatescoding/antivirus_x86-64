@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AVD_DIR="$REPO_ROOT/userspace/avd"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/av_test_tlsh.XXXXXX")" || exit 1
 
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() { rm -rf "$BUILD_DIR"; }
 trap cleanup EXIT
 
