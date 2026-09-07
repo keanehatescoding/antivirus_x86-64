@@ -246,7 +246,18 @@ static int write_command_to(const char *path, const char *cmd)
     buf[cmd_len] = '\n';
     buf[cmd_len + 1] = '\0';
 
-    written = write(fd, buf, cmd_len + 1);
+    /* EINTR: retry the WHOLE buffer, not the remainder — kernel proc
+     * handlers reject any write at nonzero ppos (see trust_proc_write/
+     * protected_proc_write/sig_proc_write's *ppos != 0 → -EINVAL), so a
+     * short-write resume would itself be rejected as a continuation.
+     * A short write here is therefore a hard failure, unlike the
+     * socket path in control_request() where resume is correct. */
+    for (;;) {
+        written = write(fd, buf, cmd_len + 1);
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
     saved_errno = errno; /* capture before close()/free() can touch it */
     free(buf);
     close(fd);
@@ -255,6 +266,11 @@ static int write_command_to(const char *path, const char *cmd)
         fprintf(stderr, "avctl: write failed: %s\n"
                          "(need sudo? malformed hash/algo?)\n", strerror(saved_errno));
         return -saved_errno;
+    }
+    if ((size_t)written != cmd_len + 1) {
+        fprintf(stderr, "avctl: short write to %s (%zd of %zu bytes)\n",
+                path, written, cmd_len + 1);
+        return -EIO;
     }
 
     return 0;
@@ -1229,12 +1245,30 @@ static int control_request(const char *cmd, char **out)
     memcpy(req, cmd, cmd_len);
     req[cmd_len] = '\n';
     req[cmd_len + 1] = '\0';
-    n = write(fd, req, cmd_len + 1);
-    free(req);
-    if (n != (ssize_t)(cmd_len + 1)) {
-        fprintf(stderr, "avctl: write to control socket failed: %s\n", strerror(errno));
-        close(fd);
-        return -1;
+    /* SOCK_STREAM: resume the remainder on EINTR/short-write (same
+     * write_all() pattern avd uses on its side of this protocol) — the
+     * opposite of write_command_to()'s proc path, where a resume would
+     * land at nonzero ppos and be rejected. */
+    {
+        size_t off = 0, total = cmd_len + 1;
+        int werr = 0;
+        while (off < total) {
+            n = write(fd, req + off, total - off);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                werr = errno;
+                break;
+            }
+            off += (size_t)n;
+        }
+        free(req);
+        if (off != total) {
+            fprintf(stderr, "avctl: write to control socket failed: %s\n",
+                    strerror(werr ? werr : EIO));
+            close(fd);
+            return -1;
+        }
     }
     shutdown(fd, SHUT_WR);
 
