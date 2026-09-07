@@ -1,0 +1,71 @@
+name: Static analysis
+
+# Enforced CI backstop for .githooks/pre-commit: the hook runs these
+# same tools but skips gracefully when one isn't installed locally
+# (pre-commit:30-113), so a machine without shellcheck/cppcheck/
+# yamllint can still commit. This job installs all three
+# unconditionally, so a lint regression fails here even if the
+# author's machine skipped it.
+
+on:
+  push:
+  pull_request:
+
+# Nothing here pushes, comments, or writes back - read-only is enough.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Install shellcheck, cppcheck, yamllint
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            shellcheck cppcheck yamllint
+
+      - name: shellcheck tracked shell scripts and hooks
+        run: |
+          set -euxo pipefail
+          # Tracked files only (git ls-files), not bare globs: the
+          # pre-commit hook covers tests/*.sh and .githooks/*, this
+          # covers every tracked *.sh plus the extensionless hooks.
+          # Untracked build copies (e.g. packaging/arch/src/, ignored
+          # via .gitignore) are never linted.
+          mapfile -t SHELL_FILES < <(git ls-files '*.sh' '.githooks/*')
+          shellcheck "${SHELL_FILES[@]}"
+
+      - name: cppcheck av/ (kernel module sources)
+        run: |
+          set -euxo pipefail
+          # Same flags as .githooks/pre-commit's av/*.c|av/*.h case.
+          # Tracked sources only, so stale build artifacts under av/
+          # (*.o, *.ko, Module.symvers) can't pollute the run.
+          mapfile -t AV_FILES < <(git ls-files 'av/*.c' 'av/*.h')
+          cppcheck --quiet --enable=warning,style,performance \
+            --suppress=missingIncludeSystem --inline-suppr \
+            --error-exitcode=1 "${AV_FILES[@]}"
+
+      - name: cppcheck userspace/avctl/
+        run: |
+          set -euxo pipefail
+          # Same flags as .githooks/pre-commit's userspace/avctl/*.c case.
+          mapfile -t AVCTL_FILES < <(git ls-files 'userspace/avctl/*.c')
+          cppcheck --quiet --enable=warning,style --inline-suppr \
+            --error-exitcode=1 "${AVCTL_FILES[@]}"
+
+      - name: yamllint tracked YAML files
+        run: |
+          set -euxo pipefail
+          # Tracked files only: a bare `yamllint .` also walks ignored
+          # build copies such as packaging/arch/src/ and fails on
+          # files that were never committed. Uses .yamllint at the
+          # repo root for rule relaxations (line-length 150, truthy,
+          # document-start).
+          mapfile -t YAML_FILES < <(git ls-files '*.yml' '*.yaml')
+          yamllint "${YAML_FILES[@]}"

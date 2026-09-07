@@ -82,7 +82,7 @@ that loads the module and checks clean-vs-EICAR detection
 - **On push** — `.githooks/pre-push` runs the full suite
   (`pkexec tests/run_all.sh`), but only when the push touches `av/`,
   `userspace/avctl/`, `userspace/avd/`, `userspace/av-gui/`, `rules/`,
-  or `corpus/`. Docs-only pushes skip it.
+  `corpus/`, or `packaging/`. Docs-only pushes skip it.
 
 Both accept `--no-verify` if you really need to skip them, but that's
 best avoided — particularly right before a tag.
