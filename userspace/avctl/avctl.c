@@ -42,8 +42,10 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 
 #define PROC_PATH "/proc/kernel_av_signatures"
@@ -57,6 +59,24 @@
  * any C struct. Override with AVD_SOCK_PATH, same env var avd itself
  * accepts, for tests/non-default installs. */
 #define CONTROL_SOCK_PATH_DEFAULT "/run/avd/control.sock"
+
+/* Client-side timeouts for the avd control socket (issue #122): without
+ * these, control_request() blocks forever when avd accepts a connection
+ * but then hangs before responding. Connect/send use the same 5s as
+ * avd's own AVD_CONTROL_RECV_TIMEOUT_SECS (userspace/avd/avd.c) and the
+ * GUI client's SOCKET_TIMEOUT_SECS (userspace/av-gui/av_gui/avd_client.py),
+ * while receive allows 30s: a control-socket SCAN runs perform_scan()
+ * synchronously on the server side, bounded by its SCAN_TIMEOUT_SECS (10s)
+ * plus the uncapped-time fuzzy/TLSH pass, so 5s would abort legitimate
+ * slow scans. AVCTL_MAX_RESPONSE_BYTES is a generous ceiling on the
+ * accumulated response: the largest bounded server response (VERDICTS
+ * RECENT, capped at AVD_VERDICT_HISTORY_MAX = 500 rows) is ~2MB worst
+ * case, so 16MiB leaves ample headroom while stopping a
+ * compromised/wedged avd from growing this client without bound. */
+#define AVCTL_CONNECT_TIMEOUT_SECS 5
+#define AVCTL_SEND_TIMEOUT_SECS 5
+#define AVCTL_RECV_TIMEOUT_SECS 30
+#define AVCTL_MAX_RESPONSE_BYTES (16 * 1024 * 1024)
 
 /* Must match the kernel side's own field-width limits: AV_HASH_HEX_MAXLEN
  * (av/sigtable.h) / SHA256_HEX_LEN (av/behavior.c) for hashes, and
@@ -1226,13 +1246,100 @@ static int control_request(const char *cmd, char **out)
         return -1;
     }
 
-    if (connect(fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
-        fprintf(stderr,
-                "avctl: could not connect to avd control socket %s: %s\n"
-                "(is avd running? try: systemctl status avd)\n",
-                control_sock_path(), strerror(errno));
-        close(fd);
-        return -1;
+    /* Bound connect(): a blocking connect() to a backlog-full listener
+     * would wait indefinitely, and SO_SNDTIMEO does not bound it, so go
+     * non-blocking and poll() for completion instead. */
+    {
+        int flags = fcntl(fd, F_GETFL, 0);
+        struct pollfd pfd;
+        int so_err;
+        socklen_t so_errlen;
+        if (flags < 0) {
+            fprintf(stderr, "avctl: fcntl(F_GETFL) failed: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            fprintf(stderr, "avctl: fcntl(O_NONBLOCK) failed: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        if (connect(fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
+            if (errno != EINPROGRESS) {
+                fprintf(stderr,
+                        "avctl: could not connect to avd control socket %s: %s\n"
+                        "(is avd running? try: systemctl status avd)\n",
+                        control_sock_path(), strerror(errno));
+                close(fd);
+                return -1;
+            }
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            int pr;
+            for (;;) {
+                pr = poll(&pfd, 1, AVCTL_CONNECT_TIMEOUT_SECS * 1000);
+                if (pr < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
+            if (pr == 0) {
+                fprintf(stderr,
+                        "avctl: timed out connecting to avd control socket %s "
+                        "(>%ds, is avd overloaded?)\n",
+                        control_sock_path(), AVCTL_CONNECT_TIMEOUT_SECS);
+                close(fd);
+                return -1;
+            }
+            if (pr < 0) {
+                fprintf(stderr, "avctl: poll while connecting failed: %s\n",
+                        strerror(errno));
+                close(fd);
+                return -1;
+            }
+            so_err = 0;
+            so_errlen = sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_errlen) != 0)
+                so_err = errno;
+            if (so_err != 0) {
+                fprintf(stderr,
+                        "avctl: could not connect to avd control socket %s: %s\n"
+                        "(is avd running? try: systemctl status avd)\n",
+                        control_sock_path(), strerror(so_err));
+                close(fd);
+                return -1;
+            }
+        }
+        if (fcntl(fd, F_SETFL, flags) != 0) {
+            fprintf(stderr, "avctl: fcntl(restore flags) failed: %s\n",
+                    strerror(errno));
+            close(fd);
+            return -1;
+        }
+    }
+
+    /* Bound each subsequent send()/recv() call: without these, avd
+     * accepting the connection and then going silent hangs the matching
+     * write()/read() below forever (same gap avd_client.py already closes
+     * with settimeout(), and avd closes on its side of this same protocol
+     * with SO_RCVTIMEO/SO_SNDTIMEO). Fail closed if either cannot be set -
+     * proceeding without a timeout would silently reintroduce the hang. */
+    {
+        struct timeval tv;
+        tv.tv_sec = AVCTL_SEND_TIMEOUT_SECS;
+        tv.tv_usec = 0;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
+            fprintf(stderr, "avctl: setsockopt(SO_SNDTIMEO) failed: %s\n",
+                    strerror(errno));
+            close(fd);
+            return -1;
+        }
+        tv.tv_sec = AVCTL_RECV_TIMEOUT_SECS;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+            fprintf(stderr, "avctl: setsockopt(SO_RCVTIMEO) failed: %s\n",
+                    strerror(errno));
+            close(fd);
+            return -1;
+        }
     }
 
     cmd_len = strlen(cmd);
@@ -1248,7 +1355,9 @@ static int control_request(const char *cmd, char **out)
     /* SOCK_STREAM: resume the remainder on EINTR/short-write (same
      * write_all() pattern avd uses on its side of this protocol) — the
      * opposite of write_command_to()'s proc path, where a resume would
-     * land at nonzero ppos and be rejected. */
+     * land at nonzero ppos and be rejected. SO_SNDTIMEO (set above)
+     * surfaces as EAGAIN/EWOULDBLOCK when avd stops reading — report
+     * that as a timeout, not a generic write failure. */
     {
         size_t off = 0, total = cmd_len + 1;
         int werr = 0;
@@ -1270,8 +1379,14 @@ static int control_request(const char *cmd, char **out)
         }
         free(req);
         if (off != total) {
-            fprintf(stderr, "avctl: write to control socket failed: %s\n",
-                    strerror(werr ? werr : EIO));
+            if (werr == EAGAIN || werr == EWOULDBLOCK)
+                fprintf(stderr,
+                        "avctl: timed out sending to avd control socket "
+                        "(>%ds, is avd overloaded?)\n",
+                        AVCTL_SEND_TIMEOUT_SECS);
+            else
+                fprintf(stderr, "avctl: write to control socket failed: %s\n",
+                        strerror(werr ? werr : EIO));
             close(fd);
             return -1;
         }
@@ -1303,8 +1418,18 @@ static int control_request(const char *cmd, char **out)
             break;
         len += (size_t)n;
         if (len >= cap - 1) {
-            cap *= 2;
-            grown = realloc(buf, cap);
+            size_t ncap;
+            if (cap >= AVCTL_MAX_RESPONSE_BYTES) {
+                fprintf(stderr, "avctl: avd response exceeds %d bytes - aborting\n",
+                        AVCTL_MAX_RESPONSE_BYTES);
+                free(buf);
+                close(fd);
+                return -1;
+            }
+            ncap = cap * 2;
+            if (ncap > AVCTL_MAX_RESPONSE_BYTES)
+                ncap = AVCTL_MAX_RESPONSE_BYTES;
+            grown = realloc(buf, ncap);
             if (!grown) {
                 fprintf(stderr, "avctl: out of memory\n");
                 free(buf);
@@ -1312,14 +1437,25 @@ static int control_request(const char *cmd, char **out)
                 return -1;
             }
             buf = grown;
+            cap = ncap;
         }
     }
-    close(fd);
-
-    if (n < 0) {
-        fprintf(stderr, "avctl: read from control socket failed: %s\n", strerror(errno));
-        free(buf);
-        return -1;
+    {
+        /* close() must not clobber the read outcome reported below. */
+        int read_err = (n < 0) ? errno : 0;
+        close(fd);
+        if (n < 0) {
+            if (read_err == EAGAIN || read_err == EWOULDBLOCK)
+                fprintf(stderr,
+                        "avctl: timed out waiting for avd response "
+                        "(>%ds, is avd wedged?)\n",
+                        AVCTL_RECV_TIMEOUT_SECS);
+            else
+                fprintf(stderr, "avctl: read from control socket failed: %s\n",
+                        strerror(read_err));
+            free(buf);
+            return -1;
+        }
     }
 
     buf[len] = '\0';
