@@ -1548,7 +1548,15 @@ static int control_request(const char *cmd, char **out)
         len += (size_t)n;
         if (len >= cap - 1) {
             size_t ncap;
-            if (cap >= AVCTL_MAX_RESPONSE_BYTES) {
+            /* cap holds payload plus the NUL terminator, so a full buffer
+             * holds cap - 1 payload bytes. The buffer may grow one payload
+             * byte past AVCTL_MAX_RESPONSE_BYTES: that byte is what tells
+             * "response ends exactly at the cap" (the next read returns
+             * EOF and the response is accepted) apart from "another
+             * response byte arrived past the cap" (rejected below).
+             * Rejecting at cap - 1 == MAX would instead refuse a response
+             * that fits, before EOF has had a chance to confirm its size. */
+            if (cap - 1 > AVCTL_MAX_RESPONSE_BYTES) {
                 fprintf(stderr, "avctl: avd response exceeds %d bytes - aborting\n",
                         AVCTL_MAX_RESPONSE_BYTES);
                 free(buf);
@@ -1556,8 +1564,8 @@ static int control_request(const char *cmd, char **out)
                 return -1;
             }
             ncap = cap * 2;
-            if (ncap > AVCTL_MAX_RESPONSE_BYTES)
-                ncap = AVCTL_MAX_RESPONSE_BYTES;
+            if (ncap > (size_t)AVCTL_MAX_RESPONSE_BYTES + 2)
+                ncap = (size_t)AVCTL_MAX_RESPONSE_BYTES + 2;
             grown = realloc(buf, ncap);
             if (!grown) {
                 fprintf(stderr, "avctl: out of memory\n");
