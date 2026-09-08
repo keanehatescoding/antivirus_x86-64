@@ -1453,6 +1453,11 @@ static int copy_fd_to(int fd, const char *dst) {
   char buf[65536];
   ssize_t n;
   int ret = 0;
+  /* errno at the failure point: close()/unlink() below may clobber it,
+   * but the caller logs strerror(errno) right after we return (see the
+   * copy-fallback branch in quarantine_file()), so restore this before
+   * returning -1. */
+  int saved_errno = 0;
 
   if (lseek(fd, 0, SEEK_SET) < 0)
     return -1;
@@ -1470,6 +1475,7 @@ static int copy_fd_to(int fd, const char *dst) {
     if (n == 0)
       break;
     if (n < 0) {
+      saved_errno = errno;
       ret = -1;
       break;
     }
@@ -1482,12 +1488,16 @@ static int copy_fd_to(int fd, const char *dst) {
         if (w < 0) {
           if (errno == EINTR)
             continue;
+          saved_errno = errno;
           ret = -1;
           break;
         }
         /* Same no-progress guard as control_request()'s write loop in
-         * avctl.c: a zero-byte write would otherwise spin forever. */
+         * avctl.c: a zero-byte write would otherwise spin forever.
+         * Set EIO explicitly — a 0 return leaves errno untouched,
+         * so without this the caller would log a stale strerror. */
         if (w == 0) {
+          saved_errno = EIO;
           ret = -1;
           break;
         }
@@ -1509,14 +1519,20 @@ static int copy_fd_to(int fd, const char *dst) {
     do {
       r = fsync(out_fd);
     } while (r != 0 && errno == EINTR);
-    if (r != 0)
+    if (r != 0) {
+      saved_errno = errno;
       ret = -1;
+    }
   }
 
   close(out_fd);
 
-  if (ret != 0)
+  if (ret != 0) {
     unlink(dst); /* best-effort cleanup of the partial copy */
+    /* Restore the failure-point errno clobbered by close()/unlink(). */
+    if (saved_errno != 0)
+      errno = saved_errno;
+  }
 
   return ret;
 }
