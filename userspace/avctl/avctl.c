@@ -73,10 +73,19 @@
  * accumulated response: the largest bounded server response (VERDICTS
  * RECENT, capped at AVD_VERDICT_HISTORY_MAX = 500 rows) is ~2MB worst
  * case, so 16MiB leaves ample headroom while stopping a
- * compromised/wedged avd from growing this client without bound. */
+ * compromised/wedged avd from growing this client without bound. Reads
+ * additionally run under an absolute AVCTL_RESPONSE_TIMEOUT_SECS wall-clock
+ * budget (checked before every read, tightening the per-read timeout as it
+ * approaches): SO_RCVTIMEO alone resets after each successful read, so a
+ * peer dribbling one byte per interval would otherwise hold this client
+ * indefinitely — the same slow-trickle case read_line()'s own absolute
+ * deadline guards against on avd's side. 120s covers the worst legitimate
+ * case (10s server SCAN bound plus a slow-disk fuzzy/TLSH pass) several
+ * times over while capping a trickling peer at ~2 minutes per invocation. */
 #define AVCTL_CONNECT_TIMEOUT_SECS 5
 #define AVCTL_SEND_TIMEOUT_SECS 5
 #define AVCTL_RECV_TIMEOUT_SECS 30
+#define AVCTL_RESPONSE_TIMEOUT_SECS 120
 #define AVCTL_MAX_RESPONSE_BYTES (16 * 1024 * 1024)
 
 /* Must match the kernel side's own field-width limits: AV_HASH_HEX_MAXLEN
@@ -1199,16 +1208,18 @@ static int do_policy(int argc, char **argv)
  * avd control socket client - scan/quarantine. See
  * docs/avd-socket-protocol.md for the wire protocol this speaks.
  * ------------------------------------------------------------------ */
-/* Milliseconds left in control_request()'s connect() attempt started at
- * `t0`, against AVCTL_CONNECT_TIMEOUT_SECS. Returns <= 0 once the
- * deadline has passed (or clock_gettime() itself fails — fail closed as
- * a timeout either way rather than spinning unbounded). */
-static long connect_ms_left(const struct timespec *t0)
+/* Milliseconds left against a `budget_ms` millisecond budget started at
+ * `t0` (monotonic clock). Returns <= 0 once the deadline has passed (or
+ * clock_gettime() itself fails — fail closed as a timeout either way
+ * rather than spinning unbounded). Every wait-and-retry loop below
+ * recomputes this before EACH wait: reusing a stale value across an EINTR
+ * retry would let a signal storm push past the deadline. */
+static long ms_left_since(const struct timespec *t0, long budget_ms)
 {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return -1;
-    return (long)AVCTL_CONNECT_TIMEOUT_SECS * 1000L
+    return budget_ms
          - ((now.tv_sec - t0->tv_sec) * 1000L
             + (now.tv_nsec - t0->tv_nsec) / 1000000L);
 }
@@ -1306,7 +1317,7 @@ static int control_request(const char *cmd, char **out)
                 close(fd);
                 return -1;
             }
-            left = connect_ms_left(&t0);
+            left = ms_left_since(&t0, (long)AVCTL_CONNECT_TIMEOUT_SECS * 1000L);
             if (left <= 0) {
                 fprintf(stderr,
                         "avctl: timed out connecting to avd control socket %s "
@@ -1319,9 +1330,22 @@ static int control_request(const char *cmd, char **out)
                 int pr;
                 pfd.fd = fd;
                 pfd.events = POLLOUT;
-                do {
+                for (;;) {
+                    left = ms_left_since(&t0,
+                            (long)AVCTL_CONNECT_TIMEOUT_SECS * 1000L);
+                    if (left <= 0) {
+                        fprintf(stderr,
+                                "avctl: timed out connecting to avd control socket %s "
+                                "(>%ds, is avd overloaded?)\n",
+                                control_sock_path(), AVCTL_CONNECT_TIMEOUT_SECS);
+                        close(fd);
+                        return -1;
+                    }
                     pr = poll(&pfd, 1, (int)left);
-                } while (pr < 0 && errno == EINTR);
+                    if (pr < 0 && errno == EINTR)
+                        continue;
+                    break;
+                }
                 if (pr == 0) {
                     fprintf(stderr,
                             "avctl: timed out connecting to avd control socket %s "
@@ -1350,13 +1374,27 @@ static int control_request(const char *cmd, char **out)
                 }
                 break;
             }
-            /* EAGAIN/EWOULDBLOCK: pause briefly, then retry connect(). */
-            {
+            /* EAGAIN/EWOULDBLOCK: pause briefly, then retry connect(). The
+             * deadline is recomputed for every nap for the same signal-storm
+             * reason as the EINPROGRESS poll above. */
+            for (;;) {
                 int pr;
-                int nap = left > 100 ? 100 : (int)left;
-                do {
-                    pr = poll(NULL, 0, nap);
-                } while (pr < 0 && errno == EINTR);
+                int nap;
+                left = ms_left_since(&t0,
+                        (long)AVCTL_CONNECT_TIMEOUT_SECS * 1000L);
+                if (left <= 0) {
+                    fprintf(stderr,
+                            "avctl: timed out connecting to avd control socket %s "
+                            "(>%ds, is avd overloaded?)\n",
+                            control_sock_path(), AVCTL_CONNECT_TIMEOUT_SECS);
+                    close(fd);
+                    return -1;
+                }
+                nap = left > 100 ? 100 : (int)left;
+                pr = poll(NULL, 0, nap);
+                if (pr < 0 && errno == EINTR)
+                    continue;
+                break;
             }
         }
         if (fcntl(fd, F_SETFL, flags) != 0) {
@@ -1443,6 +1481,13 @@ static int control_request(const char *cmd, char **out)
     }
     shutdown(fd, SHUT_WR);
 
+    /* Absolute wall-clock budget for the whole response, on top of the
+     * per-read SO_RCVTIMEO set above: that timeout resets after every
+     * successful read(), so a peer dribbling one byte just under every
+     * interval would otherwise hold this client indefinitely (the 16MiB
+     * cap bounds bytes, not time). Same defense as read_line()'s own
+     * absolute deadline on avd's side of this protocol. */
+    struct timespec r0;
     cap = 65536;
     buf = malloc(cap);
     if (!buf) {
@@ -1450,8 +1495,42 @@ static int control_request(const char *cmd, char **out)
         close(fd);
         return -1;
     }
+    if (clock_gettime(CLOCK_MONOTONIC, &r0) != 0) {
+        fprintf(stderr, "avctl: clock_gettime() failed: %s\n", strerror(errno));
+        free(buf);
+        close(fd);
+        return -1;
+    }
     len = 0;
     for (;;) {
+        long rleft = ms_left_since(&r0,
+                (long)AVCTL_RESPONSE_TIMEOUT_SECS * 1000L);
+        if (rleft <= 0) {
+            fprintf(stderr,
+                    "avctl: timed out waiting for avd response "
+                    "(>%ds total, is avd wedged?)\n",
+                    AVCTL_RESPONSE_TIMEOUT_SECS);
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        if (rleft < (long)AVCTL_RECV_TIMEOUT_SECS * 1000L) {
+            /* Deadline approaching: tighten this read to the remaining
+             * budget instead of a full 30s interval, so the overshoot past
+             * the deadline is one short final read. rleft >= 1 here, so tv
+             * is never zeroed — a zero timeval would disable the timeout
+             * entirely rather than expiring immediately. */
+            struct timeval rtv;
+            rtv.tv_sec = rleft / 1000L;
+            rtv.tv_usec = (rleft % 1000L) * 1000L;
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv)) != 0) {
+                fprintf(stderr, "avctl: setsockopt(SO_RCVTIMEO) failed: %s\n",
+                        strerror(errno));
+                free(buf);
+                close(fd);
+                return -1;
+            }
+        }
         n = read(fd, buf + len, cap - len - 1);
         if (n < 0) {
             /* A signal arriving mid-read makes read() return -1/EINTR
