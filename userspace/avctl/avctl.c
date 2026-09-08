@@ -43,6 +43,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -1198,6 +1199,19 @@ static int do_policy(int argc, char **argv)
  * avd control socket client - scan/quarantine. See
  * docs/avd-socket-protocol.md for the wire protocol this speaks.
  * ------------------------------------------------------------------ */
+/* Milliseconds left in control_request()'s connect() attempt started at
+ * `t0`, against AVCTL_CONNECT_TIMEOUT_SECS. Returns <= 0 once the
+ * deadline has passed (or clock_gettime() itself fails — fail closed as
+ * a timeout either way rather than spinning unbounded). */
+static long connect_ms_left(const struct timespec *t0)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return -1;
+    return (long)AVCTL_CONNECT_TIMEOUT_SECS * 1000L
+         - ((now.tv_sec - t0->tv_sec) * 1000L
+            + (now.tv_nsec - t0->tv_nsec) / 1000000L);
+}
 
 static const char *control_sock_path(void)
 {
@@ -1248,10 +1262,19 @@ static int control_request(const char *cmd, char **out)
 
     /* Bound connect(): a blocking connect() to a backlog-full listener
      * would wait indefinitely, and SO_SNDTIMEO does not bound it, so go
-     * non-blocking and poll() for completion instead. */
+     * non-blocking with a monotonic deadline. Two different "not yet"
+     * errnos: EINPROGRESS means completion is pending (poll for POLLOUT,
+     * then confirm via SO_ERROR), but Linux reports EAGAIN instead for a
+     * non-blocking AF_UNIX connect() that cannot complete immediately
+     * (connect(2) ERRORS) — the backlog-full case. EAGAIN leaves nothing
+     * pending (poll returns writable at once with SO_ERROR 0 while the
+     * socket is still unconnected, so poll-and-proceed ends in ENOTCONN
+     * on the first write), hence it must RETRY the connect(), pausing
+     * briefly between attempts, until the deadline below. */
     {
         int flags = fcntl(fd, F_GETFL, 0);
         struct pollfd pfd;
+        struct timespec t0;
         int so_err;
         socklen_t so_errlen;
         if (flags < 0) {
@@ -1264,25 +1287,27 @@ static int control_request(const char *cmd, char **out)
             close(fd);
             return -1;
         }
-        if (connect(fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
-            if (errno != EINPROGRESS) {
+        if (clock_gettime(CLOCK_MONOTONIC, &t0) != 0) {
+            fprintf(stderr, "avctl: clock_gettime() failed: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        for (;;) {
+            int cerr;
+            long left;
+            if (connect(fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) == 0)
+                break;
+            cerr = errno;
+            if (cerr != EINPROGRESS && cerr != EAGAIN && cerr != EWOULDBLOCK) {
                 fprintf(stderr,
                         "avctl: could not connect to avd control socket %s: %s\n"
                         "(is avd running? try: systemctl status avd)\n",
-                        control_sock_path(), strerror(errno));
+                        control_sock_path(), strerror(cerr));
                 close(fd);
                 return -1;
             }
-            pfd.fd = fd;
-            pfd.events = POLLOUT;
-            int pr;
-            for (;;) {
-                pr = poll(&pfd, 1, AVCTL_CONNECT_TIMEOUT_SECS * 1000);
-                if (pr < 0 && errno == EINTR)
-                    continue;
-                break;
-            }
-            if (pr == 0) {
+            left = connect_ms_left(&t0);
+            if (left <= 0) {
                 fprintf(stderr,
                         "avctl: timed out connecting to avd control socket %s "
                         "(>%ds, is avd overloaded?)\n",
@@ -1290,23 +1315,48 @@ static int control_request(const char *cmd, char **out)
                 close(fd);
                 return -1;
             }
-            if (pr < 0) {
-                fprintf(stderr, "avctl: poll while connecting failed: %s\n",
-                        strerror(errno));
-                close(fd);
-                return -1;
+            if (cerr == EINPROGRESS) {
+                int pr;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                do {
+                    pr = poll(&pfd, 1, (int)left);
+                } while (pr < 0 && errno == EINTR);
+                if (pr == 0) {
+                    fprintf(stderr,
+                            "avctl: timed out connecting to avd control socket %s "
+                            "(>%ds, is avd overloaded?)\n",
+                            control_sock_path(), AVCTL_CONNECT_TIMEOUT_SECS);
+                    close(fd);
+                    return -1;
+                }
+                if (pr < 0) {
+                    fprintf(stderr, "avctl: poll while connecting failed: %s\n",
+                            strerror(errno));
+                    close(fd);
+                    return -1;
+                }
+                so_err = 0;
+                so_errlen = sizeof(so_err);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_errlen) != 0)
+                    so_err = errno;
+                if (so_err != 0) {
+                    fprintf(stderr,
+                            "avctl: could not connect to avd control socket %s: %s\n"
+                            "(is avd running? try: systemctl status avd)\n",
+                            control_sock_path(), strerror(so_err));
+                    close(fd);
+                    return -1;
+                }
+                break;
             }
-            so_err = 0;
-            so_errlen = sizeof(so_err);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_errlen) != 0)
-                so_err = errno;
-            if (so_err != 0) {
-                fprintf(stderr,
-                        "avctl: could not connect to avd control socket %s: %s\n"
-                        "(is avd running? try: systemctl status avd)\n",
-                        control_sock_path(), strerror(so_err));
-                close(fd);
-                return -1;
+            /* EAGAIN/EWOULDBLOCK: pause briefly, then retry connect(). */
+            {
+                int pr;
+                int nap = left > 100 ? 100 : (int)left;
+                do {
+                    pr = poll(NULL, 0, nap);
+                } while (pr < 0 && errno == EINTR);
             }
         }
         if (fcntl(fd, F_SETFL, flags) != 0) {
