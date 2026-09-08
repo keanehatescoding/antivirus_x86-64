@@ -1410,6 +1410,17 @@ static int control_request(const char *cmd, char **out)
                 return -1;
             }
         }
+        /* Scheduling delay can let even the success path land past the
+         * deadline (immediate connect() returning late, or a wakeup
+         * after the final poll above) — fail closed before sending. */
+        if (ms_left_since(&t0, (long)AVCTL_CONNECT_TIMEOUT_SECS * 1000L) <= 0) {
+            fprintf(stderr,
+                    "avctl: timed out connecting to avd control socket %s "
+                    "(>%ds, is avd overloaded?)\n",
+                    control_sock_path(), AVCTL_CONNECT_TIMEOUT_SECS);
+            close(fd);
+            return -1;
+        }
         if (fcntl(fd, F_SETFL, flags) != 0) {
             fprintf(stderr, "avctl: fcntl(restore flags) failed: %s\n",
                     strerror(errno));

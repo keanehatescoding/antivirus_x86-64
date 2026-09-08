@@ -13,9 +13,6 @@ on:
 
 permissions:
   contents: read
-  # actions/upload-artifact's FinalizeArtifact API call fails with
-  # 403 without this (bytes upload first, then finalize 403s).
-  actions: write
 
 jobs:
   # Reads .github/kernel-versions.json and hands its "versions" array to
