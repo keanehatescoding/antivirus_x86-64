@@ -1263,13 +1263,19 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
     return -1;
   }
 
-  fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600);
-  fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0);
-  fprintf(f, "ORIGINAL_GID=%d\n", orig_st ? (int)orig_st->st_gid : 0);
-  fprintf(f, "TIMESTAMP=%lld\n", (long long)time(NULL));
-  fprintf(f, "RULE_NAME=%s\n", rule_name ? rule_name : "");
-  fprintf(f, "SHA256=%s\n", sha256_hex ? sha256_hex : "");
-  fprintf(f, "ORIGINAL_PATH=%s\n", orig_path);
+  if (fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600) < 0 ||
+      fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0) < 0 ||
+      fprintf(f, "ORIGINAL_GID=%d\n", orig_st ? (int)orig_st->st_gid : 0) < 0 ||
+      fprintf(f, "TIMESTAMP=%lld\n", (long long)time(NULL)) < 0 ||
+      fprintf(f, "RULE_NAME=%s\n", rule_name ? rule_name : "") < 0 ||
+      fprintf(f, "SHA256=%s\n", sha256_hex ? sha256_hex : "") < 0 ||
+      fprintf(f, "ORIGINAL_PATH=%s\n", orig_path) < 0) {
+    /* fclose() to avoid leaking mfd, then drop the partial sidecar so
+     * a later restore never reads a truncated meta file as valid. */
+    fclose(f);
+    unlink(meta_path);
+    return -1;
+  }
 
   if (fclose(f) != 0) {
     unlink(meta_path);
@@ -1447,6 +1453,11 @@ static int copy_fd_to(int fd, const char *dst) {
   char buf[65536];
   ssize_t n;
   int ret = 0;
+  /* errno at the failure point: close()/unlink() below may clobber it,
+   * but the caller logs strerror(errno) right after we return (see the
+   * copy-fallback branch in quarantine_file()), so restore this before
+   * returning -1. */
+  int saved_errno = 0;
 
   if (lseek(fd, 0, SEEK_SET) < 0)
     return -1;
@@ -1455,19 +1466,73 @@ static int copy_fd_to(int fd, const char *dst) {
   if (out_fd < 0)
     return -1;
 
-  while ((n = read(fd, buf, sizeof(buf))) > 0) {
-    if (write(out_fd, buf, (size_t)n) != n) {
+  for (;;) {
+    /* EINTR is not a real I/O error (avd installs signal handlers) —
+     * retry the read rather than aborting the copy. */
+    do {
+      n = read(fd, buf, sizeof(buf));
+    } while (n < 0 && errno == EINTR);
+    if (n == 0)
+      break;
+    if (n < 0) {
+      saved_errno = errno;
       ret = -1;
       break;
+    }
+    /* Regular file: resume the remainder, same write_all() pattern as
+     * the control-socket path. */
+    {
+      size_t off = 0;
+      while (off < (size_t)n) {
+        ssize_t w = write(out_fd, buf + off, (size_t)n - off);
+        if (w < 0) {
+          if (errno == EINTR)
+            continue;
+          saved_errno = errno;
+          ret = -1;
+          break;
+        }
+        /* Same no-progress guard as control_request()'s write loop in
+         * avctl.c: a zero-byte write would otherwise spin forever.
+         * Set EIO explicitly — a 0 return leaves errno untouched,
+         * so without this the caller would log a stale strerror. */
+        if (w == 0) {
+          saved_errno = EIO;
+          ret = -1;
+          break;
+        }
+        off += (size_t)w;
+      }
+      if (ret != 0)
+        break;
     }
   }
   if (n < 0)
     ret = -1;
 
+  /* Persist the copy before handing it back: a crash between close()
+   * and a later read must not surface a truncated quarantine file as
+   * intact. EINTR is retryable (avd's signal handlers don't use
+   * SA_RESTART); anything else is fatal. */
+  if (ret == 0) {
+    int r;
+    do {
+      r = fsync(out_fd);
+    } while (r != 0 && errno == EINTR);
+    if (r != 0) {
+      saved_errno = errno;
+      ret = -1;
+    }
+  }
+
   close(out_fd);
 
-  if (ret != 0)
+  if (ret != 0) {
     unlink(dst); /* best-effort cleanup of the partial copy */
+    /* Restore the failure-point errno clobbered by close()/unlink(). */
+    if (saved_errno != 0)
+      errno = saved_errno;
+  }
 
   return ret;
 }
@@ -2121,6 +2186,13 @@ static int write_all(int fd, const char *buf, size_t len) {
         continue;
       return -1;
     }
+    /* Same no-progress guard as the new loops above: a zero-byte
+     * write would otherwise spin here forever holding a control
+     * connection slot. */
+    if (n == 0) {
+      errno = EIO;
+      return -1;
+    }
     off += (size_t)n;
   }
   return 0;
@@ -2656,7 +2728,10 @@ static void handle_control_line(int fd, const char *line, uid_t peer_uid,
     const char *arg = line + sizeof("VERDICTS RECENT ") - 1;
 
     n = strtoul(arg, &end, 10);
-    if (end == arg) {
+    /* end == arg catches empty/non-numeric; *end != '\0' catches
+     * trailing garbage ("5abc" → n=5) that would otherwise parse as a
+     * valid count on this authenticated channel. */
+    if (end == arg || *end != '\0') {
       send_err(fd, "malformed VERDICTS RECENT (expected a count)");
       return;
     }
