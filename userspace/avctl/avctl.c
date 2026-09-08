@@ -1396,6 +1396,19 @@ static int control_request(const char *cmd, char **out)
                     continue;
                 break;
             }
+            /* The nap above consumed up to 100ms: recheck the deadline
+             * before retrying connect(), otherwise a listener that frees
+             * up exactly at expiry yields a post-deadline success. */
+            left = ms_left_since(&t0,
+                    (long)AVCTL_CONNECT_TIMEOUT_SECS * 1000L);
+            if (left <= 0) {
+                fprintf(stderr,
+                        "avctl: timed out connecting to avd control socket %s "
+                        "(>%ds, is avd overloaded?)\n",
+                        control_sock_path(), AVCTL_CONNECT_TIMEOUT_SECS);
+                close(fd);
+                return -1;
+            }
         }
         if (fcntl(fd, F_SETFL, flags) != 0) {
             fprintf(stderr, "avctl: fcntl(restore flags) failed: %s\n",
@@ -1449,7 +1462,42 @@ static int control_request(const char *cmd, char **out)
     {
         size_t off = 0, total = cmd_len + 1;
         int werr = 0;
+        struct timespec s0;
+        /* Absolute wall-clock budget for the whole send: SO_SNDTIMEO
+         * bounds each write(), not the loop — every short write or
+         * EINTR retry would otherwise start a fresh interval. */
+        if (clock_gettime(CLOCK_MONOTONIC, &s0) != 0) {
+            fprintf(stderr, "avctl: clock_gettime() failed: %s\n",
+                    strerror(errno));
+            free(req);
+            close(fd);
+            return -1;
+        }
         while (off < total) {
+            long sleft = ms_left_since(&s0,
+                    (long)AVCTL_SEND_TIMEOUT_SECS * 1000L);
+            if (sleft <= 0) {
+                werr = EAGAIN;
+                break;
+            }
+            if (sleft < (long)AVCTL_SEND_TIMEOUT_SECS * 1000L) {
+                /* Deadline approaching: tighten this write to the
+                 * remaining budget so the overshoot is one short
+                 * final write. sleft >= 1, so the timeval is never
+                 * zeroed (zero would disable the timeout). */
+                struct timeval stv;
+                stv.tv_sec = sleft / 1000L;
+                stv.tv_usec = (sleft % 1000L) * 1000L;
+                if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv,
+                        sizeof(stv)) != 0) {
+                    fprintf(stderr,
+                            "avctl: setsockopt(SO_SNDTIMEO) failed: %s\n",
+                            strerror(errno));
+                    free(req);
+                    close(fd);
+                    return -1;
+                }
+            }
             n = write(fd, req + off, total - off);
             if (n < 0) {
                 if (errno == EINTR)
@@ -1488,6 +1536,7 @@ static int control_request(const char *cmd, char **out)
      * cap bounds bytes, not time). Same defense as read_line()'s own
      * absolute deadline on avd's side of this protocol. */
     struct timespec r0;
+    int recv_tightened = 0;
     cap = 65536;
     buf = malloc(cap);
     if (!buf) {
@@ -1530,6 +1579,7 @@ static int control_request(const char *cmd, char **out)
                 close(fd);
                 return -1;
             }
+            recv_tightened = 1;
         }
         n = read(fd, buf + len, cap - len - 1);
         if (n < 0) {
@@ -1582,11 +1632,18 @@ static int control_request(const char *cmd, char **out)
         int read_err = (n < 0) ? errno : 0;
         close(fd);
         if (n < 0) {
-            if (read_err == EAGAIN || read_err == EWOULDBLOCK)
-                fprintf(stderr,
-                        "avctl: timed out waiting for avd response "
-                        "(>%ds, is avd wedged?)\n",
-                        AVCTL_RECV_TIMEOUT_SECS);
+            if (read_err == EAGAIN || read_err == EWOULDBLOCK) {
+                if (recv_tightened)
+                    fprintf(stderr,
+                            "avctl: timed out waiting for avd response "
+                            "(>%ds total, is avd wedged?)\n",
+                            AVCTL_RESPONSE_TIMEOUT_SECS);
+                else
+                    fprintf(stderr,
+                            "avctl: timed out waiting for avd response "
+                            "(>%ds, is avd wedged?)\n",
+                            AVCTL_RECV_TIMEOUT_SECS);
+            }
             else
                 fprintf(stderr, "avctl: read from control socket failed: %s\n",
                         strerror(read_err));
