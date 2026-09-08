@@ -40,6 +40,10 @@ on:
 
 permissions:
   contents: read
+  # upload-artifact's FinalizeArtifact (and download-artifact) API
+  # calls fail with 403 without this (bytes upload first, then
+  # finalize 403s).
+  actions: write
 
 jobs:
   # Reuses build-deb/build-arch/build-rpm as-is (see the header
