@@ -1965,12 +1965,40 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
    * replaces the previous design's lstat-baseline-then-re-check-at-
    * rename-time approach, which could only narrow that window, not
    * close it. */
-  fd = open(path, O_RDONLY);
+  /* O_NONBLOCK + fstat() + S_ISREG + clear-flag: same pattern as cmd_scan()
+   * below. Without O_NONBLOCK, opening a FIFO with no writer blocks this
+   * worker thread indefinitely - and unlike cmd_scan()'s per-connection
+   * threads (bounded by AVD_CONTROL_MAX_SCAN_CONNS), these workers are the
+   * shared pool every kernel-triggered scan funnels through, so one hung
+   * worker is a direct step toward starving the whole pool. With O_NONBLOCK
+   * the open succeeds immediately regardless, and the S_ISREG check rejects
+   * FIFOs and every other non-regular file before perform_scan() touches it. */
+  fd = open(path, O_RDONLY | O_NONBLOCK);
   if (fd < 0) {
     fprintf(stderr, "avd: could not open \"%s\" for scanning: %s\n", path,
             strerror(errno));
     send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
     return;
+  }
+
+  {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+      fprintf(stderr, "avd: skipping scan of non-regular file \"%s\"\n", path);
+      close(fd);
+      send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+      return;
+    }
+    /* Clear O_NONBLOCK now that the file is known-regular (where the flag
+     * has no read() effect anyway) - keeps this fd behaving identically to
+     * every other scan path's plain O_RDONLY open from here on. */
+    if (fcntl(fd, F_SETFL, O_RDONLY) != 0) {
+      fprintf(stderr, "avd: could not prepare \"%s\" for scanning: %s\n", path,
+              strerror(errno));
+      close(fd);
+      send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+      return;
+    }
   }
 
   perform_scan(fd, path, sha256_hex, pid, false, &result);

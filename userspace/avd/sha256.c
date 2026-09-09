@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static const uint32_t k[64] = {
@@ -153,7 +154,26 @@ int sha256_fd(int fd, char hex_out[65]) {
   int dup_fd;
   FILE *fp;
   size_t n;
+  uint64_t total = 0;
   int i;
+
+  /* Reject-only early gate: avoids reading 256MB just to fail, mirroring
+   * fuzzy_tlsh_size_ok()'s role for the fuzzy/TLSH pass in avd.c. Fails
+   * open (returns -1, caller proceeds without a hash) on fstat() failure
+   * too - a stat error alone must not disable hashing for normal files,
+   * same stance as that gate. The bounded loop below remains the real
+   * guard against a file that grows past the cap between here and the
+   * read. */
+  {
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        (uint64_t)st.st_size > (uint64_t)SHA256_FD_MAX_BYTES) {
+      fprintf(stderr,
+              "sha256: skipping hash - file is %lld bytes, over the %d cap\n",
+              (long long)st.st_size, SHA256_FD_MAX_BYTES);
+      return -1;
+    }
+  }
 
   dup_fd = dup(fd);
   if (dup_fd < 0)
@@ -171,8 +191,22 @@ int sha256_fd(int fd, char hex_out[65]) {
   }
 
   sha256_init(&ctx);
-  while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
+  /* Bounded like check_fuzzy_corpus()'s read-to-EOF-or-cap loop: a file
+   * that grows concurrently past the fstat gate above still stops here
+   * instead of hashing unboundedly on a worker thread. Oversize is -1,
+   * same as any I/O error - perform_scan() already fails open to
+   * hash="" on exactly this return. */
+  while (total <= (uint64_t)SHA256_FD_MAX_BYTES &&
+         (n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+    total += (uint64_t)n;
+    if (total > (uint64_t)SHA256_FD_MAX_BYTES) {
+      fprintf(stderr, "sha256: file grew past the %d cap during hashing\n",
+              SHA256_FD_MAX_BYTES);
+      fclose(fp);
+      return -1;
+    }
     sha256_update(&ctx, buf, n);
+  }
 
   if (ferror(fp)) {
     fclose(fp);
