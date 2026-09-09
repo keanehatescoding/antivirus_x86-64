@@ -114,10 +114,9 @@ not a path, must not contain `/`.
 ## Authorization
 
 Gated **per command, not per connection** - matches this codebase's
-existing precedent of restricted `/proc` state (e.g.
-`/proc/kernel_av_signatures` is `0640`, with writes checked
-separately via `CAP_SYS_ADMIN`), rather than two sockets with two
-different modes. Right
+existing precedent of world-readable `/proc` state (e.g.
+`/proc/kernel_av_signatures` is `0644`) with writes checked
+separately, rather than two sockets with two different modes. Right
 after `accept()`, `avd` reads the connecting process's credentials via
 `SO_PEERCRED` (kernel-populated at `connect()` time from the actual
 peer process - not attacker-writable, same trust boundary as
