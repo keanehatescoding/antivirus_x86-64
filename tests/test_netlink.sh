@@ -83,6 +83,13 @@ pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 section() { echo; echo "== $1 =="; }
 
+# Scoped dmesg reads without clearing the host ring buffer: `dmesg -C`
+# would wipe unrelated diagnostics and audit-relevant evidence, so
+# snapshot the line count first and inspect only lines appended after
+# it (usage: MARK=$(dmesg_mark); ...; dmesg_since "$MARK" | grep ...).
+dmesg_mark() { dmesg | wc -l; }
+dmesg_since() { dmesg | tail -n "+$(( $1 + 1 ))"; }
+
 # Same toolchain-detection rationale as the other integration tests -
 # sudo strips any CC=clang LLVM=1 the caller's shell had exported.
 MAKE_ARGS=()
@@ -224,7 +231,7 @@ else
 fi
 
 section "portid pinning: only the registered daemon's portid is honored"
-dmesg -C
+PIN_MARK="$(dmesg_mark)"
 REGISTER_A="$("$HELPER" register 2>&1)"
 if echo "$REGISTER_A" | grep -q '^OK'; then
     pass "first AV_C_REGISTER (fake daemon A) accepted"
@@ -240,11 +247,11 @@ if echo "$VERDICT_B" | grep -qi 'permitted'; then
 else
     fail "AV_C_VERDICT from a non-registered portid not rejected as expected: $VERDICT_B"
 fi
-if dmesg | grep -q 'AV_C_VERDICT from portid .* ignored (not the registered daemon)'; then
+if dmesg_since "$PIN_MARK" | grep -q 'AV_C_VERDICT from portid .* ignored (not the registered daemon)'; then
     pass "kernel logged the portid-mismatch rejection"
 else
     fail "expected portid-mismatch log line not found in dmesg"
-    dmesg | tail -10
+    dmesg_since "$PIN_MARK" | tail -10
 fi
 
 section "daemon re-registration: a second AV_C_REGISTER is rejected (no hijack)"
@@ -314,7 +321,7 @@ coproc DAEMON_Y { "$HELPER" batch 2>&1; }
 # resource busy" via nl_geterror), reported as an ERR line on the
 # coproc's merged 2>&1 stream.
 DAEMON_Y_REG=""
-dmesg -C
+HIJACK_MARK="$(dmesg_mark)"
 drain_batch "${DAEMON_Y[1]}" "${DAEMON_Y[0]}" || fail "drain of Y before register failed"
 printf 'register\n' >&"${DAEMON_Y[1]}"
 read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_REG
@@ -323,11 +330,11 @@ if [[ ${DAEMON_Y_REG,,} == *busy* ]]; then
 else
     fail "daemon Y's AV_C_REGISTER unexpectedly accepted (hijack not rejected): $DAEMON_Y_REG"
 fi
-if dmesg | grep -q 'AV_C_REGISTER from portid .* rejected'; then
+if dmesg_since "$HIJACK_MARK" | grep -q 'AV_C_REGISTER from portid .* rejected'; then
     pass "kernel logged the REGISTER hijack rejection at pr_alert"
 else
     fail "expected REGISTER-rejection log line not found in dmesg"
-    dmesg | tail -10
+    dmesg_since "$HIJACK_MARK" | tail -10
 fi
 
 # The actual proof of non-replacement: X's portid, which was accepted
@@ -379,7 +386,7 @@ section "start avd (throwaway quarantine dir + control socket)"
 mkdir -p "$TEST_QUARANTINE_DIR" "$TEST_RULES_DIR"
 cp "$REPO_ROOT"/rules/*.yar "$TEST_RULES_DIR"/
 cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
-dmesg -C
+AVD_MARK="$(dmesg_mark)"
 (
     cd "$REPO_ROOT" || exit 1
     exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
@@ -402,7 +409,7 @@ fi
 # both fake daemons exited above, so NETLINK_URELEASE already cleared
 # the slot (a live second REGISTER would be rejected with -EBUSY).
 sleep 1
-if dmesg | grep -q 'kernel-av: netlink daemon registered'; then
+if dmesg_since "$AVD_MARK" | grep -q 'kernel-av: netlink daemon registered'; then
     pass "avd re-registered itself as the pinned daemon"
 else
     fail "expected avd's own AV_C_REGISTER log line not found in dmesg"
@@ -423,10 +430,10 @@ chmod +x "$CLEAN_PATH"
 # retry a few times rather than treating that as a real failure.
 CLEAN_OK=0
 for _ in 1 2 3; do
-    dmesg -C
+    CLEAN_MARK="$(dmesg_mark)"
     "$CLEAN_PATH" >/dev/null 2>&1
     sleep 1
-    if dmesg | grep -q "event=clean type=daemon path=\"$CLEAN_PATH\""; then
+    if dmesg_since "$CLEAN_MARK" | grep -q "event=clean type=daemon path=\"$CLEAN_PATH\""; then
         CLEAN_OK=1
         break
     fi
@@ -452,7 +459,7 @@ cat > "$MALICIOUS_PATH" <<'EOF'
 echo "/bin/sh -i"
 EOF
 chmod +x "$MALICIOUS_PATH"
-dmesg -C
+KILL_MARK="$(dmesg_mark)"
 "$MALICIOUS_PATH" >/dev/null 2>&1
 sleep 1
 # avd comma-joins every rule name that crossed the score threshold
@@ -460,7 +467,7 @@ sleep 1
 # this test cares about - some other rule (e.g. an ELF/entry-point
 # heuristic) may also fire on this file, so match the rule name as a
 # substring of `reason`, not the whole field.
-if dmesg | grep -qi "event=detected action=kill type=daemon path=\"$MALICIOUS_PATH\".*reason=\"daemon:[^\"]*Suspicious_Shell_Reverse_Shell_String"; then
+if dmesg_since "$KILL_MARK" | grep -qi "event=detected action=kill type=daemon path=\"$MALICIOUS_PATH\".*reason=\"daemon:[^\"]*Suspicious_Shell_Reverse_Shell_String"; then
     pass "malicious exec round-tripped through avd/YARA and was killed"
 else
     fail "expected daemon-path detected/kill log line not found in dmesg"
