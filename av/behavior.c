@@ -606,8 +606,12 @@ static const struct proc_ops trust_proc_ops = {
 static struct proc_dir_entry *trust_proc_entry;
 
 int av_behavior_trust_proc_init(void) {
+  /* 0640, not 0644: same IOC-enumeration rationale as
+   * av_sigtable_proc_init() - unprivileged reads would leak the trust
+   * list for evasion tuning. Writes stay gated on CAP_SYS_ADMIN in
+   * trust_proc_write(). */
   trust_proc_entry =
-      proc_create("kernel_av_trusted", 0644, NULL, &trust_proc_ops);
+      proc_create("kernel_av_trusted", 0640, NULL, &trust_proc_ops);
   if (!trust_proc_entry)
     return -ENOMEM;
   return 0;
@@ -980,8 +984,11 @@ static const struct proc_ops protected_proc_ops = {
 static struct proc_dir_entry *protected_proc_entry;
 
 int av_behavior_protect_proc_init(void) {
+  /* 0640, not 0644: the protected-path list is evasion-relevant the
+   * same way the signature/trust lists are. Writes stay gated on
+   * CAP_SYS_ADMIN in protected_proc_write(). */
   protected_proc_entry =
-      proc_create("kernel_av_protected", 0644, NULL, &protected_proc_ops);
+      proc_create("kernel_av_protected", 0640, NULL, &protected_proc_ops);
   if (!protected_proc_entry)
     return -ENOMEM;
   return 0;

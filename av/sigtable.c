@@ -320,8 +320,12 @@ static const struct proc_ops sig_proc_ops = {
 static struct proc_dir_entry *sig_proc_entry;
 
 int av_sigtable_proc_init(void) {
+  /* 0640, not 0644: this lists every signature hash - world-readable
+   * would let any local unprivileged user enumerate the full IOC list
+   * to tune evasion. Writes stay gated on CAP_SYS_ADMIN in
+   * sig_proc_write() regardless of mode. */
   sig_proc_entry =
-      proc_create("kernel_av_signatures", 0644, NULL, &sig_proc_ops);
+      proc_create("kernel_av_signatures", 0640, NULL, &sig_proc_ops);
   if (!sig_proc_entry)
     return -ENOMEM;
   return 0;
