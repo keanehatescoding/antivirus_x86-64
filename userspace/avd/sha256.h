@@ -15,6 +15,14 @@
 
 #define SHA256_DIGEST_SIZE 32
 
+/* Cap on how much sha256_fd() will hash. The fuzzy/TLSH pass already stops
+ * at MAX_FUZZY_TLSH_FILE_SIZE (avd.c) - same 256MB value as the kernel
+ * side's MAX_HASH_FILE_SIZE - while this streamed the whole file with no
+ * bound, so one very large file tied up a scan worker for the full read.
+ * Oversize input returns -1 and callers proceed without a hash (their
+ * existing fail-open stance), exactly like any other hashing I/O error. */
+#define SHA256_FD_MAX_BYTES (256 * 1024 * 1024)
+
 struct sha256_ctx {
   uint32_t state[8];
   uint64_t bitlen;
