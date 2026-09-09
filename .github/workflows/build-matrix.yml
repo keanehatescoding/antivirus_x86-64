@@ -245,7 +245,7 @@ jobs:
           printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com
           yara tests/fixtures/test.yar /tmp/eicar.com | grep -q EICAR_Test_String
 
-      - name: Smoke-test heuristics.yar against a real ptrace-importing binary
+      - name: Smoke-test heuristics.yar against real import-based binaries
         run: |
           set -euxo pipefail
           cat > /tmp/ptrace_test.c << 'EOF'
@@ -254,7 +254,23 @@ jobs:
           int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
           EOF
           gcc -o /tmp/ptrace_test /tmp/ptrace_test.c
-          yara rules/heuristics.yar /tmp/ptrace_test | grep -q Imports_Ptrace
+          # Single-import constituents are private: a ptrace-only binary
+          # reports no singleton line (only the combo rule below is public).
+          ! yara rules/heuristics.yar /tmp/ptrace_test | grep -q Imports_Ptrace
+          ! yara rules/heuristics.yar /tmp/ptrace_test | grep -q Imports_Memfd_Create
+          # A binary importing BOTH fires the combo once, with no
+          # double-counted singleton lines alongside it.
+          cat > /tmp/dual_import_test.c << 'EOF'
+          #define _GNU_SOURCE
+          #include <sys/ptrace.h>
+          #include <sys/mman.h>
+          #include <stddef.h>
+          int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); memfd_create("t", 0); return 0; }
+          EOF
+          gcc -o /tmp/dual_import_test /tmp/dual_import_test.c
+          yara rules/heuristics.yar /tmp/dual_import_test | grep -q Multiple_Suspicious_Imports
+          ! yara rules/heuristics.yar /tmp/dual_import_test | grep -q Imports_Ptrace
+          ! yara rules/heuristics.yar /tmp/dual_import_test | grep -q Imports_Memfd_Create
           # a genuinely clean binary should NOT match
           ! yara rules/heuristics.yar /bin/ls | grep -q Imports_Ptrace
 
