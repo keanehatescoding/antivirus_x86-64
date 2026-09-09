@@ -93,6 +93,40 @@ for f in "${STAGED[@]}"; do
                 # just validate compilation - /bin/true is a harmless
                 # always-present stand-in file.
                 yara "$f" /bin/true >/dev/null || FAIL=1
+                # Weight lint (#99): every non-private rule must declare
+                # an integer `weight` meta in 1..100 - avd sums weights
+                # toward MALICIOUS_SCORE_THRESHOLD, so a missing weight
+                # silently contributes 0 while an out-of-range one can
+                # convict alone or never. Private rules are exempt: YARA
+                # never reports them, so avd never scores them.
+                echo "  - yara weight-meta check: $f"
+                if ! awk '
+                    /^[[:space:]]*(private[[:space:]]+)?rule[[:space:]]+/ {
+                        if (NR_RULE != "") {
+                            if (!IS_PRIVATE && (!HAS_WEIGHT || WEIGHT < 1 || WEIGHT > 100)) {
+                                printf "  ! rule %s in %s: missing or out-of-range weight meta (want 1..100)\n", NR_RULE, FILENAME > "/dev/stderr"
+                                BAD = 1
+                            }
+                        }
+                        IS_PRIVATE = ($0 ~ /^[[:space:]]*private[[:space:]]+rule/)
+                        NR_RULE = $0; sub(/^.*rule[[:space:]]+/, "", NR_RULE); sub(/[^A-Za-z0-9_].*$/, "", NR_RULE)
+                        HAS_WEIGHT = 0; WEIGHT = 0
+                        next
+                    }
+                    HAS_WEIGHT == 0 && $0 ~ /weight[[:space:]]*=[[:space:]]*[0-9]+/ {
+                        W = $0; sub(/^.*weight[[:space:]]*=[[:space:]]*/, "", W); sub(/[^0-9].*$/, "", W)
+                        HAS_WEIGHT = 1; WEIGHT = W + 0
+                    }
+                    END {
+                        if (NR_RULE != "" && !IS_PRIVATE && (!HAS_WEIGHT || WEIGHT < 1 || WEIGHT > 100)) {
+                            printf "  ! rule %s in %s: missing or out-of-range weight meta (want 1..100)\n", NR_RULE, FILENAME > "/dev/stderr"
+                            BAD = 1
+                        }
+                        exit (BAD ? 1 : 0)
+                    }
+                ' "$f"; then
+                    FAIL=1
+                fi
             else
                 echo "  ! yara CLI not installed - skipping rule syntax check for $f"
                 echo "    (sudo pacman -S yara  /  apt install yara)"

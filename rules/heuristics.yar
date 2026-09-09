@@ -29,11 +29,20 @@
  * happened to import one flagged API each. The weights below are a
  * direct numeric translation of the `confidence` strings already in
  * each rule; keep the two in sync if you tune one.
+ *
+ * DOUBLE-COUNTING NOTE (#131): Imports_Ptrace and Imports_Memfd_Create
+ * are `private` so they never contribute to that sum directly - only
+ * Multiple_Suspicious_Imports' combined weight counts when both fire.
+ * Without `private`, a sample matching both would score 15 + 15 + 40 =
+ * 70 instead of the intended 40, inflating it toward the threshold on
+ * top of any structural-rule corroboration. Imports_Dlopen and
+ * Imports_Mprotect stay public on purpose: neither is referenced by
+ * the combo rule, so there is nothing to double-count for them, and
+ * their standalone weights remain visible in avd's score/log output.
  */
-
 import "elf"
 
-rule Imports_Ptrace
+private rule Imports_Ptrace
 {
     meta:
         description = "Imports ptrace() - used legitimately by debuggers, but also for anti-debugging tricks and process injection"
@@ -43,7 +52,7 @@ rule Imports_Ptrace
         for any sym in elf.dynsym : (sym.name == "ptrace")
 }
 
-rule Imports_Memfd_Create
+private rule Imports_Memfd_Create
 {
     meta:
         description = "Imports memfd_create() - creates an anonymous, RAM-only file; used legitimately (e.g. systemd, some package managers) but also for fileless execution (loading and exec'ing a payload that never touches disk)"
