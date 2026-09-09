@@ -89,6 +89,8 @@ jobs:
           set -euxo pipefail
           MAJOR="$(echo "${{ matrix.kernel_version }}" | cut -d. -f1)"
           SRCDIR="linux-${{ matrix.kernel_version }}-qemu-boot"
+          TARBALL="linux-${{ matrix.kernel_version }}.tar.xz"
+          KERNEL_BASE="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x"
           # --retry/--retry-all-errors: kernel.org's CDN occasionally
           # resets the connection mid-transfer (curl exit 92, "HTTP/2
           # stream ... PROTOCOL_ERROR") - observed directly on this
@@ -96,11 +98,17 @@ jobs:
           # the HTTP/2-specific reset entirely on retry rather than
           # just hoping a same-protocol retry doesn't hit it again.
           curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
-            --connect-timeout 20 -o linux.tar.xz \
-            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${{ matrix.kernel_version }}.tar.xz"
+            --connect-timeout 20 -o "$TARBALL" "$KERNEL_BASE/$TARBALL"
+          # Verify against kernel.org's signed sha256sums before
+          # extracting (see build-matrix.yml for the full rationale).
+          curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 20 -o sha256sums.asc "$KERNEL_BASE/sha256sums.asc"
+          awk -v f="$TARBALL" '$2 == f' sha256sums.asc > "$TARBALL.sha256"
+          [ -s "$TARBALL.sha256" ] || { echo "no checksum entry for $TARBALL" >&2; exit 1; }
+          sha256sum -c "$TARBALL.sha256"
           mkdir -p "$SRCDIR"
-          tar -xf linux.tar.xz -C "$SRCDIR" --strip-components=1
-          rm linux.tar.xz
+          tar -xf "$TARBALL" -C "$SRCDIR" --strip-components=1
+          rm "$TARBALL" "$TARBALL.sha256" sha256sums.asc
           cd "$SRCDIR"
           make tinyconfig
           # Same base set build-matrix.yml uses (see that file's

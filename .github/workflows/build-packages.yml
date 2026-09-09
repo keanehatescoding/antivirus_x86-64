@@ -39,7 +39,12 @@ jobs:
     # confirmed against a real Debian 13 (trixie) box (see
     # debian/control's own comment) - Ubuntu's repos aren't guaranteed
     # to carry the same names/versions.
-    container: debian:trixie
+    # Pinned to a digest: trixie is a rolling tag, so an unpinned
+    # reference silently follows each registry push with no diff here.
+    # Re-pin with: docker pull debian:trixie && docker inspect
+    # --format '{{index .RepoDigests 0}}' debian:trixie (tag kept for
+    # readability; digest wins when both are present).
+    container: debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
@@ -97,7 +102,9 @@ jobs:
 
   build-arch:
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    # Pinned digest, same rolling-tag reasoning as build-deb above
+    # (base-devel tracks latest Arch toolchain daily).
+    container: archlinux:base-devel@sha256:61f7de2dd88cc4ba1fe36c24cfe1a503c3936984492d6405eeab013ce6ac68c5
     steps:
       # git must exist BEFORE actions/checkout runs, not after - a
       # real CI run showed that without it, checkout silently falls
@@ -202,7 +209,8 @@ jobs:
 
   build-rpm:
     runs-on: ubuntu-latest
-    container: fedora:latest
+    # Pinned digest, same rolling-tag reasoning as build-deb above.
+    container: fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
     # No longer continue-on-error: this job used to have two stacked
     # bugs - BuildRequires: tlsh-devel never resolving on any shipping
     # Fedora release (fixed by vendoring TLSH as pure C, see

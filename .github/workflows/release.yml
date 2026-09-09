@@ -120,6 +120,11 @@ jobs:
         # build-appimage.sh tries to execute it. --retry/--retry-all-errors
         # covers a transient GitHub Releases hiccup instead of failing
         # the whole job on the first blip.
+        # No checksum step here, deliberately: the continuous artifact
+        # has no upstream-published checksum to check against (only
+        # adjacent .zsync block hashes), and a hardcoded hash would
+        # break on every upstream rebuild. Revisit if AppImageKit
+        # starts publishing one.
         run: |
           curl -fsSL --retry 3 --retry-all-errors \
             -o /usr/local/bin/appimagetool \
