@@ -104,7 +104,7 @@ the flip, never ones already in flight.
 
 | Command | Direction | Purpose |
 |---|---|---|
-| `AV_C_REGISTER` | daemon → kernel | Daemon announces itself; kernel stores its netlink port ID for future unicasts. **Only one daemon connection is supported right now** — a second `REGISTER` overwrites the stored portid. |
+| `AV_C_REGISTER` | daemon → kernel | Daemon announces itself; kernel stores its netlink port ID for future unicasts. **Only one daemon connection is supported right now** — a second `REGISTER` from a different portid while one is live is rejected with `-EBUSY` (re-`REGISTER` from the already-pinned portid stays idempotent). |
 | `AV_C_SCAN_REQUEST` | kernel → daemon | Kernel asks the daemon to analyze a file. |
 | `AV_C_VERDICT` | daemon → kernel | Daemon's answer, correlated by `REQID`. |
 
@@ -122,12 +122,18 @@ the flip, never ones already in flight.
 ## Known limitations (document these in your report)
 
 - **Single daemon only.** No multi-client support - only one daemon can
-  be registered at a time, and a second `REGISTER` silently replaces
-  the first. **Fixed:** `REGISTER` and `VERDICT` now require
-  `GENL_ADMIN_PERM` (CAP_NET_ADMIN), and `VERDICT` is additionally
-  checked against the currently-registered daemon's portid, so an
+  be registered at a time, and a second `REGISTER` from a different
+  portid while one is live is rejected with `-EBUSY` (logged at
+  `pr_alert`; a re-`REGISTER` from the already-pinned portid is
+  idempotent). A replacement daemon after a crash is unaffected:
+  `NETLINK_URELEASE` clears the slot when the old socket closes.
+  **Fixed:** `REGISTER` and `VERDICT` now require
+  `GENL_ADMIN_PERM` (CAP_NET_ADMIN), `VERDICT` is additionally
+  checked against the currently-registered daemon's portid, and a live
+  `REGISTER` can no longer be silently overwritten, so an
   unprivileged local process can no longer impersonate the daemon or
-  answer someone else's scan request. `avd` already runs under `sudo`
+  answer someone else's scan request, and neither can a second
+  privileged one while a daemon is live. `avd` already runs under `sudo`
   in every documented workflow, so this doesn't change how you run it -
   it just closes a gap where anything unprivileged previously could
   have disabled detection entirely by registering first.

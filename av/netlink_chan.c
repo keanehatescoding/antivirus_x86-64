@@ -102,14 +102,40 @@ static const struct nla_policy av_genl_policy[AV_A_MAX + 1] = {
 
 /* ---- AV_C_REGISTER: daemon announces itself ---- */
 
+/**
+ * av_nl_register_doit() - Pin the Generic Netlink sender as the live daemon.
+ * @skb: Netlink request buffer (unused).
+ * @info: Request metadata containing the sender's port ID.
+ *
+ * Return: 0 for a new or idempotent registration, or -EBUSY when another
+ * daemon is already registered.
+ */
 static int av_nl_register_doit(struct sk_buff *skb, struct genl_info *info)
 {
     /* GENL_ADMIN_PERM on this op (see av_genl_ops below) already
      * requires CAP_NET_ADMIN, so any caller that reaches this point is
-     * privileged - but log the portid either way so a legitimate
-     * daemon restart (or an attempted hijack from a privileged
-     * process) is visible in dmesg. */
+     * privileged - but a second privileged process could still hijack
+     * the scan channel by overwriting daemon_portid, redirecting all
+     * future SCAN_REQUEST unicasts (and the power to answer them) to
+     * itself. Reject a second REGISTER while one is live with -EBUSY
+     * and log the attempt at pr_alert level. A re-REGISTER from the
+     * already-pinned portid stays idempotent (returns 0): avd
+     * restarting on the same socket, or a duplicate REGISTER, is not
+     * a hijack. A genuinely new daemon after a crash is also safe:
+     * av_netlink_notify() clears daemon_registered on NETLINK_URELEASE
+     * when the old socket closes, so by the time its replacement
+     * registers the slot is already free. */
     spin_lock(&daemon_lock);
+    if (daemon_registered && info->snd_portid != daemon_portid) {
+        u32 old_portid = daemon_portid;
+        u32 new_portid = info->snd_portid;
+
+        spin_unlock(&daemon_lock);
+        pr_alert("kernel-av: AV_C_REGISTER from portid %u rejected "
+                 "(daemon %u already registered)\n",
+                 new_portid, old_portid);
+        return -EBUSY;
+    }
     daemon_portid = info->snd_portid;
     daemon_registered = true;
     spin_unlock(&daemon_lock);

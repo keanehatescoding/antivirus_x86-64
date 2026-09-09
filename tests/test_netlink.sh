@@ -13,8 +13,9 @@
 #     AV_C_VERDICT is rejected without wedging the module
 #   - only the currently-registered daemon's portid is honored for
 #     AV_C_VERDICT ("portid pinning")
-#   - a second AV_C_REGISTER silently replaces the first (documented,
-#     known "single daemon only" behavior - see docs/netlink-protocol.md)
+#   - a second AV_C_REGISTER from a different portid while one is live
+#     is rejected with -EBUSY (no silent replacement - see
+#     docs/netlink-protocol.md)
 #   - a real end-to-end AV_C_SCAN_REQUEST/AV_C_VERDICT round trip via
 #     the real avd binary, for both a clean and a malicious (YARA-only,
 #     not signature-table) exec
@@ -81,6 +82,15 @@ FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 section() { echo; echo "== $1 =="; }
+
+# Scoped dmesg reads without clearing the host ring buffer: `dmesg -C`
+# would wipe unrelated diagnostics and audit-relevant evidence, so
+# snapshot the line count first and inspect only lines appended after
+# it (usage: MARK=$(dmesg_mark); ...; dmesg_since "$MARK" | grep ...).
+# Return the current kernel ring-buffer line count for use as a marker.
+dmesg_mark() { dmesg | wc -l; }
+# Print kernel ring-buffer lines appended after the line-count marker $1.
+dmesg_since() { dmesg | tail -n "+$(( $1 + 1 ))"; }
 
 # Same toolchain-detection rationale as the other integration tests -
 # sudo strips any CC=clang LLVM=1 the caller's shell had exported.
@@ -223,7 +233,7 @@ else
 fi
 
 section "portid pinning: only the registered daemon's portid is honored"
-dmesg -C
+PIN_MARK="$(dmesg_mark)"
 REGISTER_A="$("$HELPER" register 2>&1)"
 if echo "$REGISTER_A" | grep -q '^OK'; then
     pass "first AV_C_REGISTER (fake daemon A) accepted"
@@ -239,29 +249,23 @@ if echo "$VERDICT_B" | grep -qi 'permitted'; then
 else
     fail "AV_C_VERDICT from a non-registered portid not rejected as expected: $VERDICT_B"
 fi
-if dmesg | grep -q 'AV_C_VERDICT from portid .* ignored (not the registered daemon)'; then
+if dmesg_since "$PIN_MARK" | grep -q 'AV_C_VERDICT from portid .* ignored (not the registered daemon)'; then
     pass "kernel logged the portid-mismatch rejection"
 else
     fail "expected portid-mismatch log line not found in dmesg"
-    dmesg | tail -10
+    dmesg_since "$PIN_MARK" | tail -10
 fi
 
-section "daemon re-registration: a second AV_C_REGISTER replaces the first"
-# The single-shot "$HELPER register" used elsewhere in this script
-# can't prove *replacement* - each invocation is a fresh process, so
-# its socket (and portid) is already gone by the time a second
-# daemon registers, and dmesg alone can't tell "a second REGISTER
-# happened" apart from "a second REGISTER happened and actually
-# overwrote the first". `"$HELPER" batch` keeps one connection (and
-# therefore one stable portid) open across multiple commands via a
-# bash coproc, so daemon X's portid can be re-tested for real *after*
-# daemon Y registers - proving the kernel stopped honoring X, not just
-# that Y was accepted.
+section "daemon re-registration: a second AV_C_REGISTER is rejected (no hijack)"
+# `"$HELPER" batch` keeps one connection (and therefore one stable
+# portid) open across multiple commands via a bash coproc, so daemon
+# X's portid can be re-tested for real *after* daemon Y attempts to
+# register - proving X stays pinned and Y is rejected, not overwritten.
 # 2>&1 here, not just on the single-shot invocations elsewhere in this
 # script: send_and_report() in netlink_test_helper.c prints "OK" to
 # stdout but "ERR ..." to stderr, and a coproc's pipe only carries its
 # stdout by default - without this, the rejection replies this section
-# most needs to observe (DAEMON_X_VERDICT_AFTER, below) would never
+# most needs to observe (DAEMON_Y_REG, DAEMON_Y_VERDICT) would never
 # reach the read end, and `read -u` would hang forever instead of
 # failing loudly.
 coproc DAEMON_X { "$HELPER" batch 2>&1; }
@@ -314,36 +318,47 @@ fi
 
 coproc DAEMON_Y { "$HELPER" batch 2>&1; }
 
+# A second REGISTER from a live second portid must NOT overwrite the
+# first (see docs/netlink-protocol.md): expect -EBUSY ("Device or
+# resource busy" via nl_geterror), reported as an ERR line on the
+# coproc's merged 2>&1 stream.
 DAEMON_Y_REG=""
+HIJACK_MARK="$(dmesg_mark)"
 drain_batch "${DAEMON_Y[1]}" "${DAEMON_Y[0]}" || fail "drain of Y before register failed"
 printf 'register\n' >&"${DAEMON_Y[1]}"
 read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_REG
-if [[ $DAEMON_Y_REG == OK ]]; then
-    pass "daemon Y's AV_C_REGISTER (second registration) accepted"
+if [[ ${DAEMON_Y_REG,,} == *busy* ]]; then
+    pass "daemon Y's AV_C_REGISTER (second registration) rejected with EBUSY"
 else
-    fail "daemon Y's AV_C_REGISTER unexpectedly rejected: $DAEMON_Y_REG"
+    fail "daemon Y's AV_C_REGISTER unexpectedly accepted (hijack not rejected): $DAEMON_Y_REG"
+fi
+if dmesg_since "$HIJACK_MARK" | grep -q 'AV_C_REGISTER from portid .* rejected'; then
+    pass "kernel logged the REGISTER hijack rejection at pr_alert"
+else
+    fail "expected REGISTER-rejection log line not found in dmesg"
+    dmesg_since "$HIJACK_MARK" | tail -10
 fi
 
-# The actual proof of replacement: X's portid, which was just accepted
-# above, must now be rejected, and Y's must now be accepted.
+# The actual proof of non-replacement: X's portid, which was accepted
+# above, must still be accepted, and Y's must be rejected.
 DAEMON_X_VERDICT_AFTER=""
 drain_batch "${DAEMON_X[1]}" "${DAEMON_X[0]}" || fail "drain of X before re-verdict failed"
 printf 'verdict 1 0\n' >&"${DAEMON_X[1]}"
 read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_AFTER
-if [[ ${DAEMON_X_VERDICT_AFTER,,} == *permitted* ]]; then
-    pass "AV_C_VERDICT from X (old daemon) rejected after Y registered - portid was replaced, not just added"
+if [[ $DAEMON_X_VERDICT_AFTER == OK ]]; then
+    pass "AV_C_VERDICT from X (original daemon) still accepted after Y rejected - portid was not replaced"
 else
-    fail "AV_C_VERDICT from X still accepted after Y registered - portid was NOT replaced: $DAEMON_X_VERDICT_AFTER"
+    fail "AV_C_VERDICT from X rejected after Y attempt - pinning was lost: $DAEMON_X_VERDICT_AFTER"
 fi
 
 DAEMON_Y_VERDICT=""
 drain_batch "${DAEMON_Y[1]}" "${DAEMON_Y[0]}" || fail "drain of Y before verdict failed"
 printf 'verdict 1 0\n' >&"${DAEMON_Y[1]}"
 read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_VERDICT
-if [[ $DAEMON_Y_VERDICT == OK ]]; then
-    pass "AV_C_VERDICT from Y (new daemon) accepted"
+if [[ ${DAEMON_Y_VERDICT,,} == *permitted* ]]; then
+    pass "AV_C_VERDICT from Y (rejected daemon) rejected - never pinned"
 else
-    fail "AV_C_VERDICT from Y unexpectedly rejected: $DAEMON_Y_VERDICT"
+    fail "AV_C_VERDICT from Y unexpectedly accepted: $DAEMON_Y_VERDICT"
 fi
 
 # Capture both PIDs before waiting on either - empirically, once the
@@ -373,7 +388,7 @@ section "start avd (throwaway quarantine dir + control socket)"
 mkdir -p "$TEST_QUARANTINE_DIR" "$TEST_RULES_DIR"
 cp "$REPO_ROOT"/rules/*.yar "$TEST_RULES_DIR"/
 cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
-dmesg -C
+AVD_MARK="$(dmesg_mark)"
 (
     cd "$REPO_ROOT" || exit 1
     exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
@@ -392,10 +407,11 @@ else
     cat "$AVD_LOG"
     exit 1
 fi
-# avd's own AV_C_REGISTER on startup should now be the pinned daemon,
-# overwriting fake daemon Y from the section above.
+# avd's own AV_C_REGISTER on startup should now be the pinned daemon -
+# both fake daemons exited above, so NETLINK_URELEASE already cleared
+# the slot (a live second REGISTER would be rejected with -EBUSY).
 sleep 1
-if dmesg | grep -q 'kernel-av: netlink daemon registered'; then
+if dmesg_since "$AVD_MARK" | grep -q 'kernel-av: netlink daemon registered'; then
     pass "avd re-registered itself as the pinned daemon"
 else
     fail "expected avd's own AV_C_REGISTER log line not found in dmesg"
@@ -416,10 +432,10 @@ chmod +x "$CLEAN_PATH"
 # retry a few times rather than treating that as a real failure.
 CLEAN_OK=0
 for _ in 1 2 3; do
-    dmesg -C
+    CLEAN_MARK="$(dmesg_mark)"
     "$CLEAN_PATH" >/dev/null 2>&1
     sleep 1
-    if dmesg | grep -q "event=clean type=daemon path=\"$CLEAN_PATH\""; then
+    if dmesg_since "$CLEAN_MARK" | grep -q "event=clean type=daemon path=\"$CLEAN_PATH\""; then
         CLEAN_OK=1
         break
     fi
@@ -445,7 +461,7 @@ cat > "$MALICIOUS_PATH" <<'EOF'
 echo "/bin/sh -i"
 EOF
 chmod +x "$MALICIOUS_PATH"
-dmesg -C
+KILL_MARK="$(dmesg_mark)"
 "$MALICIOUS_PATH" >/dev/null 2>&1
 sleep 1
 # avd comma-joins every rule name that crossed the score threshold
@@ -453,7 +469,7 @@ sleep 1
 # this test cares about - some other rule (e.g. an ELF/entry-point
 # heuristic) may also fire on this file, so match the rule name as a
 # substring of `reason`, not the whole field.
-if dmesg | grep -qi "event=detected action=kill type=daemon path=\"$MALICIOUS_PATH\".*reason=\"daemon:[^\"]*Suspicious_Shell_Reverse_Shell_String"; then
+if dmesg_since "$KILL_MARK" | grep -qi "event=detected action=kill type=daemon path=\"$MALICIOUS_PATH\".*reason=\"daemon:[^\"]*Suspicious_Shell_Reverse_Shell_String"; then
     pass "malicious exec round-tripped through avd/YARA and was killed"
 else
     fail "expected daemon-path detected/kill log line not found in dmesg"
