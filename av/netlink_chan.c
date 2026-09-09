@@ -102,6 +102,14 @@ static const struct nla_policy av_genl_policy[AV_A_MAX + 1] = {
 
 /* ---- AV_C_REGISTER: daemon announces itself ---- */
 
+/**
+ * av_nl_register_doit() - Pin the Generic Netlink sender as the live daemon.
+ * @skb: Netlink request buffer (unused).
+ * @info: Request metadata containing the sender's port ID.
+ *
+ * Return: 0 for a new or idempotent registration, or -EBUSY when another
+ * daemon is already registered.
+ */
 static int av_nl_register_doit(struct sk_buff *skb, struct genl_info *info)
 {
     /* GENL_ADMIN_PERM on this op (see av_genl_ops below) already

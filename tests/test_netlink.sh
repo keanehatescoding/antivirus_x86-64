@@ -87,7 +87,9 @@ section() { echo; echo "== $1 =="; }
 # would wipe unrelated diagnostics and audit-relevant evidence, so
 # snapshot the line count first and inspect only lines appended after
 # it (usage: MARK=$(dmesg_mark); ...; dmesg_since "$MARK" | grep ...).
+# Return the current kernel ring-buffer line count for use as a marker.
 dmesg_mark() { dmesg | wc -l; }
+# Print kernel ring-buffer lines appended after the line-count marker $1.
 dmesg_since() { dmesg | tail -n "+$(( $1 + 1 ))"; }
 
 # Same toolchain-detection rationale as the other integration tests -
