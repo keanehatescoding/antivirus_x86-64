@@ -26,8 +26,11 @@ set -eu
 # build-appimage job, which runs this exact script in CI on every
 # tagged release.
 #
-# Needs appimagetool on PATH (or $APPIMAGETOOL) -
-# https://github.com/AppImage/AppImageKit/releases
+# Needs appimagetool on PATH (or $APPIMAGETOOL) - a pinned versioned
+# release from https://github.com/AppImage/appimagetool/releases
+# (CI pins the exact version + sha256 in .github/workflows/release.yml;
+# the old AppImageKit `continuous` build is mutable and unverifiable,
+# so don't point anyone back at it).
 #
 # Usage: packaging/appimage/build-appimage.sh [version]
 
@@ -38,7 +41,7 @@ APPIMAGETOOL="${APPIMAGETOOL:-appimagetool}"
 
 if ! command -v "$APPIMAGETOOL" >/dev/null 2>&1; then
     echo "ERROR: $APPIMAGETOOL not found on PATH." >&2
-    echo "Download from https://github.com/AppImage/AppImageKit/releases" >&2
+    echo "Download a versioned release from https://github.com/AppImage/appimagetool/releases" >&2
     echo "and either put it on PATH as appimagetool or set \$APPIMAGETOOL." >&2
     exit 1
 fi
@@ -70,5 +73,14 @@ install -m 0644 "$ROOT/packaging/icons/org.hyprav.avgui.svg" "$APPDIR/usr/share/
 VERSION="${1:-$(cd "$ROOT" && git describe --tags --always 2>/dev/null || echo dev)}"
 OUTPUT="$HERE/HyprAV-avgui-${VERSION}-x86_64.AppImage"
 
-ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+# --runtime-file pins the exact type2 runtime embedded in the output.
+# Without it appimagetool downloads the *latest* runtime itself at
+# build time, which no checksum covers (CI sets this to its verified
+# copy - see .github/workflows/release.yml). Left unset for local
+# builds, where appimagetool's default behavior is unchanged.
+if [ -n "${APPIMAGE_RUNTIME_FILE:-}" ]; then
+    ARCH=x86_64 "$APPIMAGETOOL" --runtime-file "$APPIMAGE_RUNTIME_FILE" "$APPDIR" "$OUTPUT"
+else
+    ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+fi
 echo "Built: $OUTPUT"
