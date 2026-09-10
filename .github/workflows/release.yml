@@ -109,21 +109,23 @@ jobs:
         with:
           persist-credentials: false
 
-      # Pinned to appimagetool 1.9.1 from its own versioned releases
-      # (AppImage/appimagetool), NOT AppImageKit's `continuous` build:
-      # continuous is a mutable tag rebuilt on every upstream commit,
-      # so it has no stable published checksum to verify against -
-      # any hardcoded hash would break on each upstream rebuild, and
-      # an unpinned download trusts whatever bytes the CDN serves at
-      # build time. A tagged release is immutable, so its sha256 (from
-      # the release's own asset digest, confirmed by direct download)
-      # is a stable integrity check: a compromised mirror or poisoned
-      # cache can't feed a tampered binary into the release build.
-      # To bump: update APPIMAGETOOL_VERSION + EXPECTED_SHA256 below
-      # together (get the digest via `gh release view <ver> --repo
-      # AppImage/appimagetool --json assets --jq '.assets[] | ...' and
-      # confirm with a local `sha256sum` of the downloaded file).
-      - name: Download appimagetool
+      # appimagetool AND its type2 runtime are both pinned to immutable
+      # versioned releases with sha256 verification, NOT anything
+      # `continuous`: continuous tags are rebuilt on every upstream
+      # commit, so they have no stable published checksum - any
+      # hardcoded hash would break on each upstream rebuild, and an
+      # unpinned download trusts whatever bytes the CDN serves at
+      # build time. Tagged releases are immutable, so their sha256s
+      # (from each release's own asset digest, confirmed by direct
+      # download) are stable integrity checks: a compromised mirror or
+      # poisoned cache can't feed a tampered binary into the release
+      # build. Both halves matter: without --runtime-file below,
+      # appimagetool fetches the *latest* runtime itself at build time,
+      # which the tool checksum alone would not cover.
+      # To bump: update each *_VERSION + *_SHA256 pair together (get
+      # the digest via `gh release view <ver> --repo <owner/repo>
+      # --json assets` and confirm with a local `sha256sum`).
+      - name: Download appimagetool and runtime
         # -f: a 4xx/5xx response otherwise still exits 0 with the error
         # page saved as the "binary", which chmod +x happily accepts -
         # the failure only surfaces later, confusingly, when
@@ -133,13 +135,22 @@ jobs:
         run: |
           set -euxo pipefail
           APPIMAGETOOL_VERSION="1.9.1"
-          EXPECTED_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
           curl -fsSL --retry 3 --retry-all-errors \
             -o /tmp/appimagetool.AppImage \
             "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
-          echo "${EXPECTED_SHA256}  /tmp/appimagetool.AppImage" | sha256sum -c -
+          echo "${APPIMAGETOOL_SHA256}  /tmp/appimagetool.AppImage" | sha256sum -c -
           install -m 0755 /tmp/appimagetool.AppImage /usr/local/bin/appimagetool
           rm -f /tmp/appimagetool.AppImage
+          RUNTIME_VERSION="20251108"
+          RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+          sudo mkdir -p /usr/local/share/appimagetool-runtime
+          curl -fsSL --retry 3 --retry-all-errors \
+            -o /tmp/runtime-x86_64 \
+            "https://github.com/AppImage/type2-runtime/releases/download/${RUNTIME_VERSION}/runtime-x86_64"
+          echo "${RUNTIME_SHA256}  /tmp/runtime-x86_64" | sha256sum -c -
+          sudo install -m 0644 /tmp/runtime-x86_64 /usr/local/share/appimagetool-runtime/runtime-x86_64
+          rm -f /tmp/runtime-x86_64
 
       # appimagetool is itself packaged as a (type-2 runtime) AppImage,
       # which normally needs FUSE to mount itself - GitHub-hosted
@@ -150,6 +161,7 @@ jobs:
       - name: Build AppImage
         env:
           APPIMAGETOOL: /usr/local/bin/appimagetool
+          APPIMAGE_RUNTIME_FILE: /usr/local/share/appimagetool-runtime/runtime-x86_64
           APPIMAGE_EXTRACT_AND_RUN: '1'
         run: |
           set -euxo pipefail

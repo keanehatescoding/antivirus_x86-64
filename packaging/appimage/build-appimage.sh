@@ -73,5 +73,14 @@ install -m 0644 "$ROOT/packaging/icons/org.hyprav.avgui.svg" "$APPDIR/usr/share/
 VERSION="${1:-$(cd "$ROOT" && git describe --tags --always 2>/dev/null || echo dev)}"
 OUTPUT="$HERE/HyprAV-avgui-${VERSION}-x86_64.AppImage"
 
-ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+# --runtime-file pins the exact type2 runtime embedded in the output.
+# Without it appimagetool downloads the *latest* runtime itself at
+# build time, which no checksum covers (CI sets this to its verified
+# copy - see .github/workflows/release.yml). Left unset for local
+# builds, where appimagetool's default behavior is unchanged.
+if [ -n "${APPIMAGE_RUNTIME_FILE:-}" ]; then
+    ARCH=x86_64 "$APPIMAGETOOL" --runtime-file "$APPIMAGE_RUNTIME_FILE" "$APPDIR" "$OUTPUT"
+else
+    ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+fi
 echo "Built: $OUTPUT"
