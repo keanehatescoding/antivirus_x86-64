@@ -8,7 +8,7 @@
 Source: hyprav
 Section: admin
 Priority: optional
-Maintainer: Your Name <you@example.com>
+Maintainer: keanehatescoding <keane@archlinux>
 # python3-gi/gir1.2-gtk-4.0 are needed at build time, not just runtime:
 # userspace/av-gui/Makefile's `install` target depends on `checkdeps`
 # (imports gi, loads GTK4). Missing on a clean builder, this fails the
