@@ -109,10 +109,20 @@ jobs:
         with:
           persist-credentials: false
 
-      # The "continuous" release build, same one used to confirm this
-      # script locally - AppImage/AppImageKit doesn't tag stable
-      # releases of appimagetool itself, continuous is the one every
-      # AppImage build guide points at.
+      # Pinned to appimagetool 1.9.1 from its own versioned releases
+      # (AppImage/appimagetool), NOT AppImageKit's `continuous` build:
+      # continuous is a mutable tag rebuilt on every upstream commit,
+      # so it has no stable published checksum to verify against -
+      # any hardcoded hash would break on each upstream rebuild, and
+      # an unpinned download trusts whatever bytes the CDN serves at
+      # build time. A tagged release is immutable, so its sha256 (from
+      # the release's own asset digest, confirmed by direct download)
+      # is a stable integrity check: a compromised mirror or poisoned
+      # cache can't feed a tampered binary into the release build.
+      # To bump: update APPIMAGETOOL_VERSION + EXPECTED_SHA256 below
+      # together (get the digest via `gh release view <ver> --repo
+      # AppImage/appimagetool --json assets --jq '.assets[] | ...' and
+      # confirm with a local `sha256sum` of the downloaded file).
       - name: Download appimagetool
         # -f: a 4xx/5xx response otherwise still exits 0 with the error
         # page saved as the "binary", which chmod +x happily accepts -
@@ -120,16 +130,16 @@ jobs:
         # build-appimage.sh tries to execute it. --retry/--retry-all-errors
         # covers a transient GitHub Releases hiccup instead of failing
         # the whole job on the first blip.
-        # No checksum step here, deliberately: the continuous artifact
-        # has no upstream-published checksum to check against (only
-        # adjacent .zsync block hashes), and a hardcoded hash would
-        # break on every upstream rebuild. Revisit if AppImageKit
-        # starts publishing one.
         run: |
+          set -euxo pipefail
+          APPIMAGETOOL_VERSION="1.9.1"
+          EXPECTED_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
           curl -fsSL --retry 3 --retry-all-errors \
-            -o /usr/local/bin/appimagetool \
-            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x /usr/local/bin/appimagetool
+            -o /tmp/appimagetool.AppImage \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          echo "${EXPECTED_SHA256}  /tmp/appimagetool.AppImage" | sha256sum -c -
+          install -m 0755 /tmp/appimagetool.AppImage /usr/local/bin/appimagetool
+          rm -f /tmp/appimagetool.AppImage
 
       # appimagetool is itself packaged as a (type-2 runtime) AppImage,
       # which normally needs FUSE to mount itself - GitHub-hosted

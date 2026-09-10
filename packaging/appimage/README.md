@@ -41,9 +41,10 @@ Build-tested end-to-end: `appimagetool` produced a working AppImage
 and running it (`APPIMAGE_EXTRACT_AND_RUN=1 ./HyprAV-avgui-*.AppImage`,
 needed where FUSE isn't available - see `.github/workflows/release.yml`)
 actually launched av-gui against the host's GTK4. Also built on every
-tagged release by that workflow's `build-appimage` job. Needs
-`appimagetool` on `PATH` (or `$APPIMAGETOOL`):
-<https://github.com/AppImage/AppImageKit/releases>
+`appimagetool` on `PATH` (or `$APPIMAGETOOL`) — use a versioned release
+from <https://github.com/AppImage/appimagetool/releases> (CI pins 1.9.1
+plus its sha256 in `.github/workflows/release.yml`; avoid AppImageKit's
+mutable `continuous` build — it has no stable checksum to verify).
 
 ```bash
 packaging/appimage/build-appimage.sh          # version defaults to `git describe`
