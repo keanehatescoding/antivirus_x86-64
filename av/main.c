@@ -975,10 +975,15 @@ static void av_work_fn(struct work_struct *w) {
      * executables unscanned. pr_warn_ratelimited, not pr_info: an
      * unscanned exec is worth a warning, and _ratelimited caps the
      * flood if this ever fires per-exec under memory pressure.
+     * Path goes through %*pE, not %s: a filename can contain quotes
+     * or newlines, which would otherwise forge extra fields or whole
+     * log lines in this quoted key=value record. Ordinary paths
+     * render identically, so nothing greppable changes for them.
      * No behavior change - still skips to out. */
-    pr_warn_ratelimited("kernel-av: event=skip reason=hash-error path=\"%s\" "
+    pr_warn_ratelimited("kernel-av: event=skip reason=hash-error path=\"%*pE\" "
                         "pid=%d err=%d\n",
-                        abs_path, pid_nr(aw->target_pid), ret);
+                        (int)strnlen(abs_path, PATH_MAX), abs_path,
+                        pid_nr(aw->target_pid), ret);
     goto out;
   }
 
