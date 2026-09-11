@@ -173,6 +173,14 @@ EOF
 
 make -C userspace/av-gui install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
+%check
+# Known-answer suites for the vendored hashing code - pure userspace, no
+# root or kernel module needed (see the headers of tests/test_sha256.sh
+# and tests/test_tlsh_core.sh), so they are safe to run under rpmbuild.
+# Covers #130's request for a minimal spec %check section.
+./tests/test_sha256.sh
+./tests/test_tlsh_core.sh
+
 %post
 %systemd_post avd.service
 
@@ -214,6 +222,6 @@ dkms remove -m hyprav-av -v %{version} --all || :
 %{_datadir}/applications/av-gui.desktop
 
 %changelog
-* Tue Aug 25 2026 Your Name <you@example.com> - 0.9.0.129.g32d9af8-1
+* Tue Aug 25 2026 keanehatescoding <keane@archlinux> - 0.9.0.129.g32d9af8-1
 - Initial packaging: hyprav-dkms (av.ko kernel module), hyprav
   (avd daemon + avctl CLI), hyprav-gui (GTK4 console).

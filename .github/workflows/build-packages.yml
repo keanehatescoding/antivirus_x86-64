@@ -54,7 +54,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            build-essential dpkg-dev debhelper \
+            build-essential dpkg-dev debhelper lintian \
             pkg-config libnl-genl-3-dev libyara-dev libfuzzy-dev \
             python3-gi gir1.2-gtk-4.0
 
@@ -92,6 +92,14 @@ jobs:
         run: |
           mkdir -p dist
           mv ../*.deb ../*.buildinfo ../*.changes dist/
+
+      # lintian is advisory for now (continue-on-error): #130 asks for
+      # distro-linter enforcement, but failing the whole packaging job on
+      # pre-existing warnings would block unrelated work - surface the
+      # findings first, promote to blocking once the baseline is clean.
+      - name: lintian (non-blocking)
+        continue-on-error: true
+        run: lintian --no-tag-display-limit dist/*.changes
 
       - name: Upload .deb packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
@@ -133,7 +141,9 @@ jobs:
         # python-gobject/gtk4/...) straight from PKGBUILD itself, so
         # duplicating that list here would just be a second place it
         # could silently drift out of sync.
-        run: pacman -S --noconfirm --needed --quiet sudo
+        # namcap rides along here for the non-blocking lint step below
+        # (see #130) - it only ever inspects files, never installs them.
+        run: pacman -S --noconfirm --needed --quiet sudo namcap
 
       - name: makepkg (as a non-root builder user)
         run: |
@@ -200,6 +210,12 @@ jobs:
           cp /home/builder/hyprav-ci-src/packaging/arch/*.pkg.tar.zst \
             packaging/arch/
 
+      # namcap is advisory for now (continue-on-error) - same reasoning
+      # as the lintian step in build-deb (see #130).
+      - name: namcap (non-blocking)
+        continue-on-error: true
+        run: namcap packaging/arch/PKGBUILD packaging/arch/*.pkg.tar.zst
+
       - name: Upload .pkg.tar.zst packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
@@ -244,7 +260,7 @@ jobs:
 
       - name: Install rpmbuild tooling
         run: |
-          dnf install -y -q rpm-build rpmdevtools dnf-plugins-core
+          dnf install -y -q rpm-build rpmdevtools dnf-plugins-core rpmlint
           # actions/checkout's own dubious-ownership fix (its "Post Run"
           # step logs "Adding repository directory to the temporary git
           # global config as a safe directory") is scoped to a
@@ -307,6 +323,13 @@ jobs:
             --define "_sourcedir $GITHUB_WORKSPACE/rpmbuild-sources" \
             --define "_rpmdir $GITHUB_WORKSPACE/rpmbuild-out" \
             packaging/fedora/hyprav.spec
+
+      # rpmlint is advisory for now (continue-on-error) - same reasoning
+      # as the lintian step in build-deb (see #130).
+      - name: rpmlint (non-blocking)
+        continue-on-error: true
+        run: |
+          rpmlint packaging/fedora/hyprav.spec $(find rpmbuild-out -name '*.rpm')
 
       - name: Upload .rpm packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7

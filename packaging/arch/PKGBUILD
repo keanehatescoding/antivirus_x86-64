@@ -1,4 +1,4 @@
-# Maintainer: Your Name <you@example.com>
+# Maintainer: keanehatescoding <keane@archlinux>
 #
 # Split package: the av.ko kernel module is version-pinned to whatever
 # kernel it's built against, so it ships separately via DKMS
