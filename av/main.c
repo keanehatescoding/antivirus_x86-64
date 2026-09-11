@@ -965,8 +965,20 @@ static void av_work_fn(struct work_struct *w) {
 
   ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
   if (ret) {
-    /* Couldn't open/hash it (permissions, already gone, etc.) -
-     * not the job of the signature path, just skip. */
+    /* A hash failure skips both the signature match and the daemon
+     * scan below, i.e. the exec is allowed without any verdict -
+     * fail-open. Log it distinctly (with the errno) instead of
+     * silently folding it into a clean skip: the errno tells a
+     * benign race (-ENOENT, target already gone) apart from a
+     * resource failure (-ENOMEM from crypto_alloc_shash()/kmalloc,
+     * crypto_shash_init/update/final errors) that left real
+     * executables unscanned. pr_warn_ratelimited, not pr_info: an
+     * unscanned exec is worth a warning, and _ratelimited caps the
+     * flood if this ever fires per-exec under memory pressure.
+     * No behavior change - still skips to out. */
+    pr_warn_ratelimited("kernel-av: event=skip reason=hash-error path=\"%s\" "
+                        "pid=%d err=%d\n",
+                        abs_path, pid_nr(aw->target_pid), ret);
     goto out;
   }
 
