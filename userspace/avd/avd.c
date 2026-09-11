@@ -616,6 +616,20 @@ static int load_fuzzy_corpus(const char *path) {
 
     if (!parse_corpus_line(line, &hash_part, &name_part, "fuzzy"))
       continue;
+    /* Accept exactly what the scan path accepts: check_fuzzy_corpus()
+     * scores entries with fuzzy_compare(), which returns -1 for a hash
+     * it cannot parse (verified: garbage self-compares to -1 while a
+     * valid "blocksize:part1:part2" signature self-compares to 100).
+     * A stored unparseable entry could therefore never match anything
+     * - it would just sit in the corpus silently matching nothing on
+     * every scan. Reject it once, loudly, here instead. */
+    if (fuzzy_compare(hash_part, hash_part) != 100) {
+      fprintf(stderr,
+              "avd: skipping malformed fuzzy corpus line "
+              "(hash fails to parse): %s\n",
+              name_part);
+      continue;
+    }
 
     if (fuzzy_corpus_count == capacity) {
       struct fuzzy_corpus_entry *grown;
@@ -943,18 +957,19 @@ static int load_tlsh_corpus(const char *path) {
     if (!parse_corpus_line(line, &hash_part, &name_part, "TLSH"))
       continue;
 
-    /* sizeof(tlsh_corpus[...].hash) is a fixed AV_TLSH_HASH_BUFSZ
-     * (200) byte array (see struct tlsh_corpus_entry's comment);
-     * hash_maxlen is libtlsh's actual reported max length, queried
-     * once above via the shim.
-     * If some future libtlsh build ever needs more than that, this
-     * skip-with-a-warning is a clear failure mode rather than a
-     * silent truncated-hash corruption. */
-    if (strlen(hash_part) > hash_maxlen) {
+    /* Accept exactly what the scan path accepts: av_tlsh_diff() parses
+     * via tlsh_from_hex() (exactly av_tlsh_hash_maxlen() hex chars,
+     * case-insensitive, no "T1" prefix) and returns -1 on anything
+     * else, while a self-diff of a well-formed hash is always 0.
+     * Gating here rejects a typo'd entry once, loudly at startup,
+     * instead of storing it and having check_tlsh_corpus() silently
+     * skip it on every scan. This subsumes the old oversized-only
+     * length check - an overlong hash fails the parse the same way. */
+    if (av_tlsh_diff(hash_part, hash_part) != 0) {
       fprintf(stderr,
-              "avd: skipping TLSH corpus line with an oversized hash "
-              "(%zu chars, max %zu): %s\n",
-              strlen(hash_part), hash_maxlen, name_part);
+              "avd: skipping malformed TLSH corpus line "
+              "(hash is not a %zu-char hex digest): %s\n",
+              hash_maxlen, name_part);
       continue;
     }
 
