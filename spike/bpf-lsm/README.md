@@ -16,25 +16,44 @@ Before designing around that, three things needed confirming:
 
 1. Is `bprm_check_security` actually **sleepable** under BPF LSM? If not,
    the route closes #88 but leaves #87 open.
-2. Can such a program **block** an exec, or only observe it?
+2. Is a **denying return value** (`-EPERM`) even legal on this hook, or
+   is it clamped so the program could only ever observe?
 3. Does it see the kernel's **own resolved file**, rather than a path
    string it has to re-open?
 
-## Result: yes to all three
+## Result
 
 ```
-== TEST: lsm.s/bprm_check_security (expect: LOADS) ==
-RESULT: LOADED -> hook IS sleepable, and -EPERM verified
+== TEST: lsm.s/bprm_check_security (expect: verifier ACCEPTS) ==
+RESULT: ACCEPTED -> hook is sleepable; -EPERM is within the
+        verifier's permitted return range (enforcement untested)
 
 == CONTROL: lsm.s/task_kill, not sleepable (expect: REJECTED) ==
-RESULT: REJECTED as expected
+RESULT: REJECTED for the expected reason
 bpf_lsm_task_kill is not sleepable
 ```
 
 The control carries the weight: it requests `lsm.s/` (sleepable) on a hook
 absent from `sleepable_lsm_hooks` and is rejected by the verifier's own
 message. Without it, a load that "just worked" would not prove `lsm.s`
-was enforced at all.
+was enforced at all. The control is matched against that exact diagnostic,
+not merely against a non-zero exit, so an unrelated failure (missing
+object, no privileges, bad pin path) fails the run instead of silently
+passing it.
+
+### What this does NOT prove
+
+`bpftool prog load` runs the **verifier**. It does not attach anything and
+does not exec anything, so **runtime enforcement is untested**: this spike
+has never actually denied an exec. Question 2 above is answered only in
+the narrow sense that `bpf_lsm_get_retval_range()` permits a negative
+return on this hook, so `-EPERM` survives verification — not that the
+kernel was observed refusing an exec.
+
+Closing that gap needs an attach-and-exec test in a throwaway VM
+(`tests/qemu-boot/` is the natural home). That is deliberately not done
+here: attaching a program to this hook on a live machine can deny every
+exec on the system if the program is wrong.
 
 Corroborated in the kernel source for both versions CI builds: `v6.12`
 and `v6.18` `kernel/bpf/bpf_lsm.c` both list

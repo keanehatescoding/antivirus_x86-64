@@ -28,20 +28,31 @@ struct {
 	__uint(max_entries, 1 << 16);
 } events SEC(".maps");
 
+/* Inode identity. dev is part of the key, not just ino: inode numbers
+ * are only unique within a filesystem, so keying on ino alone would let
+ * a block on inode N for one device deny an unrelated executable that
+ * happens to be inode N on another. */
+struct file_id {
+	__u64 ino;
+	__u32 dev;
+	__u32 __pad; /* explicit, so the key has no uninitialised padding */
+};
+
 /* Verdict cache keyed by inode identity - the "fast path in BPF" shape.
  * Empty here, so this spike allows everything. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
-	__type(key, __u64);
+	__type(key, struct file_id);
 	__type(value, __u8);
-} blocked_ino SEC(".maps");
+} blocked_files SEC(".maps");
 
 SEC("lsm.s/bprm_check_security")
 int BPF_PROG(av_bprm_check, struct linux_binprm *bprm, int ret)
 {
 	struct exec_event *e;
 	struct file *f;
+	struct file_id key = {};
 	__u64 ino;
 	__u32 dev;
 	__u8 *blocked;
@@ -66,7 +77,9 @@ int BPF_PROG(av_bprm_check, struct linux_binprm *bprm, int ret)
 	 * getname(), so there is no strncpy_from_user() to fail on a cold
 	 * page. The bypass is structurally absent, not merely survivable. */
 
-	blocked = bpf_map_lookup_elem(&blocked_ino, &ino);
+	key.ino = ino;
+	key.dev = dev;
+	blocked = bpf_map_lookup_elem(&blocked_files, &key);
 
 	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
