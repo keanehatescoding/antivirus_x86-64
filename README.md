@@ -117,5 +117,5 @@ a QEMU boot test with real runtime detection, and a packaging build
 ## Security
 
 See [SECURITY.md](SECURITY.md) for scope, already-accepted tradeoffs
-(fail-open by default, a documented kernel TOCTOU gap, x86_64-only), and how
-to report a vulnerability privately.
+(fail-open by default, two documented kernel exec-interception gaps,
+x86_64-only), and how to report a vulnerability privately.
