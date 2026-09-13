@@ -36,6 +36,12 @@
 #define TARGET_ALLOWED "/target_allowed"
 #define TARGET_BLOCKED "/target_blocked"
 
+/* Must match the exit status in target.c. */
+#define TARGET_OK 7
+/* The child's status when execv itself failed; the real errno arrives
+ * over the pipe, so this value only has to differ from TARGET_OK. */
+#define TARGET_EXEC_FAILED 127
+
 /* Must match struct file_id in av_lsm_spike.bpf.c exactly. */
 struct file_id {
 	unsigned long long ino;
@@ -100,28 +106,64 @@ static unsigned int kernel_dev(dev_t st_dev)
 	return (unsigned int)((major(st_dev) << 20) | minor(st_dev));
 }
 
-/* Returns: 0 exec succeeded, >0 the errno execv failed with, -1 internal. */
+/* Run PATH in a child and report whether the exec itself was allowed.
+ *
+ * Returns: 0 the target ran, >0 the errno execv failed with,
+ *          -1 internal error / inconclusive.
+ *
+ * The exec errno comes back over a CLOEXEC pipe rather than through the
+ * child's exit status. Exit status cannot carry both meanings at once:
+ * errno 7 is E2BIG, which collides exactly with TARGET_OK, so a failed
+ * exec would be indistinguishable from a successful run - and it would
+ * fail in the direction that produces a false PASS. With the pipe there
+ * is nothing to disambiguate: the close-on-exec is itself the signal, so
+ * data means exec failed and EOF means it succeeded, for every errno. */
 static int try_exec(const char *path)
 {
-	pid_t pid = fork();
+	int pfd[2];
+	pid_t pid;
 	int status;
+	int err = 0;
+	ssize_t n;
 
-	if (pid < 0)
+	if (pipe2(pfd, O_CLOEXEC) < 0)
 		return -1;
+
+	pid = fork();
+	if (pid < 0) {
+		close(pfd[0]);
+		close(pfd[1]);
+		return -1;
+	}
 
 	if (pid == 0) {
 		char *const argv[] = { (char *)path, NULL };
 
+		close(pfd[0]);
 		execv(path, argv);
-		_exit(errno); /* hand the exec errno back as the exit code */
+		/* Only reached if the exec was refused. */
+		err = errno;
+		(void)!write(pfd[1], &err, sizeof(err));
+		_exit(TARGET_EXEC_FAILED);
 	}
+
+	close(pfd[1]);
+	n = read(pfd[0], &err, sizeof(err));
+	close(pfd[0]);
 
 	if (waitpid(pid, &status, 0) < 0)
 		return -1;
-	if (!WIFEXITED(status))
+
+	if (n == (ssize_t)sizeof(err))
+		return err > 0 ? err : -1; /* exec refused, errno on the pipe */
+	if (n != 0)
+		return -1; /* short or failed read - don't guess */
+
+	/* Pipe hit EOF with nothing written, so the exec succeeded. Confirm
+	 * the target then ran to completion rather than dying on a signal. */
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != TARGET_OK)
 		return -1;
-	/* target_*.c exits 7 on success, so anything else is an exec errno. */
-	return WEXITSTATUS(status) == 7 ? 0 : WEXITSTATUS(status);
+	return 0;
 }
 
 int main(void)
@@ -171,9 +213,14 @@ int main(void)
 	/* CONTROL: map is still empty, so this must run normally. If exec is
 	 * broken outright, this catches it before the real assertion. */
 	rc = try_exec(TARGET_ALLOWED);
-	if (rc != 0) {
-		outmsg("ENFORCE_TEST: control exec FAILED (rc=%d, %s) - "
-		       "attaching broke exec generally\n", rc, strerror(rc));
+	if (rc < 0) {
+		outmsg("ENFORCE_TEST: control exec inconclusive - could not "
+		       "determine whether the target ran\n");
+		finish(0);
+	}
+	if (rc > 0) {
+		outmsg("ENFORCE_TEST: control exec REFUSED (%s) - attaching "
+		       "broke exec generally\n", strerror(rc));
 		finish(0);
 	}
 	outmsg("ENFORCE_TEST: control exec succeeded (unblocked file runs)\n");
@@ -199,9 +246,14 @@ int main(void)
 		outmsg("ENFORCE_TEST: blocked target RAN - not enforced\n");
 		finish(0);
 	}
+	if (rc < 0) {
+		outmsg("ENFORCE_TEST: blocked target inconclusive - the exec "
+		       "did not clearly succeed or fail\n");
+		finish(0);
+	}
 	if (rc != EPERM) {
-		outmsg("ENFORCE_TEST: blocked target failed with %d (%s), "
-		       "expected EPERM\n", rc, strerror(rc));
+		outmsg("ENFORCE_TEST: blocked target refused with %s, "
+		       "expected EPERM\n", strerror(rc));
 		finish(0);
 	}
 	outmsg("ENFORCE_TEST: blocked target denied with EPERM\n");
