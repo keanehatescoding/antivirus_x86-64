@@ -50,6 +50,11 @@ echo "### test_sigtable.sh (avctl/proc protocol) ###"
 # reload it here for the sigtable protocol tests.
 insmod "$REPO_ROOT/av/av.ko" 2>/dev/null || true
 "$REPO_ROOT/tests/test_sigtable.sh" || FAIL=1
+echo
+echo "### test_trust_protect.sh (avctl trust/protect protocol) ###"
+# Same reasoning as test_sigtable.sh above - the module is still loaded
+# here for the sigtable protocol tests.
+"$REPO_ROOT/tests/test_trust_protect.sh" || FAIL=1
 rmmod av 2>/dev/null || true
 
 echo
