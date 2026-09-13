@@ -166,6 +166,24 @@ static int try_exec(const char *path)
 	return 0;
 }
 
+/* Require PATH to execute and run to completion. Returns 1 on success,
+ * or 0 after reporting why not. WHAT names the step, so a failure says
+ * which of the four execs below went wrong. */
+static int expect_runs(const char *path, const char *what)
+{
+	int rc = try_exec(path);
+
+	if (rc == 0)
+		return 1;
+	if (rc < 0)
+		outmsg("ENFORCE_TEST: %s inconclusive - could not determine "
+		       "whether %s ran\n", what, path);
+	else
+		outmsg("ENFORCE_TEST: %s - %s was refused (%s)\n", what, path,
+		       strerror(rc));
+	return 0;
+}
+
 int main(void)
 {
 	struct bpf_object *obj;
@@ -210,20 +228,23 @@ int main(void)
 	}
 	outmsg("ENFORCE_TEST: attached to bprm_check_security\n");
 
-	/* CONTROL: map is still empty, so this must run normally. If exec is
-	 * broken outright, this catches it before the real assertion. */
-	rc = try_exec(TARGET_ALLOWED);
-	if (rc < 0) {
-		outmsg("ENFORCE_TEST: control exec inconclusive - could not "
-		       "determine whether the target ran\n");
+	/* BASELINE: the file about to be blocked must run RIGHT NOW, with
+	 * the program attached and the map empty. This is the control that
+	 * matters, and it has to be this file: TARGET_ALLOWED succeeding
+	 * says nothing about whether a different file was ever executable.
+	 * Without this, a TARGET_BLOCKED that could not run for some
+	 * unrelated reason would be refused after the map update too, and
+	 * that refusal would be credited to enforcement it did not cause. */
+	if (!expect_runs(TARGET_BLOCKED, "baseline (pre-block)"))
 		finish(0);
-	}
-	if (rc > 0) {
-		outmsg("ENFORCE_TEST: control exec REFUSED (%s) - attaching "
-		       "broke exec generally\n", strerror(rc));
+	outmsg("ENFORCE_TEST: baseline - target_blocked runs before the "
+	       "map update\n");
+
+	/* CONTROL: an unrelated file also runs while the map is empty, so a
+	 * program that broke exec outright is caught before the assertion. */
+	if (!expect_runs(TARGET_ALLOWED, "control (pre-block)"))
 		finish(0);
-	}
-	outmsg("ENFORCE_TEST: control exec succeeded (unblocked file runs)\n");
+	outmsg("ENFORCE_TEST: control - target_allowed runs\n");
 
 	if (stat(TARGET_BLOCKED, &st) < 0) {
 		outmsg("ENFORCE_TEST: stat failed: %s\n", strerror(errno));
@@ -240,7 +261,8 @@ int main(void)
 		finish(0);
 	}
 
-	/* THE ASSERTION: this exec must be refused with EPERM. */
+	/* THE ASSERTION: the SAME file that just ran must now be refused
+	 * with EPERM. The only thing that changed is the map entry. */
 	rc = try_exec(TARGET_BLOCKED);
 	if (rc == 0) {
 		outmsg("ENFORCE_TEST: blocked target RAN - not enforced\n");
@@ -257,6 +279,14 @@ int main(void)
 		finish(0);
 	}
 	outmsg("ENFORCE_TEST: blocked target denied with EPERM\n");
+
+	/* SELECTIVITY: the unblocked file must STILL run. Without this, a
+	 * program that started denying everything the moment the map became
+	 * non-empty would satisfy the assertion above and pass. */
+	if (!expect_runs(TARGET_ALLOWED, "selectivity (post-block)"))
+		finish(0);
+	outmsg("ENFORCE_TEST: selectivity - target_allowed still runs, so "
+	       "the denial is keyed on identity\n");
 
 	bpf_link__destroy(link);
 	bpf_object__close(obj);

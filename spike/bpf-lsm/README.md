@@ -87,24 +87,41 @@ resolved, already-open file, so there is no second open for #88 to race.
 proves it actually denies an exec:
 
 ```
-ENFORCE_TEST: program loaded
 ENFORCE_TEST: attached to bprm_check_security
-ENFORCE_TEST: control exec succeeded (unblocked file runs)
+ENFORCE_TEST: baseline - target_blocked runs before the map update
+ENFORCE_TEST: control - target_allowed runs
 ENFORCE_TEST: blocking dev=0x3 ino=18
 ENFORCE_TEST: blocked target denied with EPERM
+ENFORCE_TEST: selectivity - target_allowed still runs, so the denial is keyed on identity
 ENFORCE_TEST: PASS
 ```
 
-The guest's PID 1 is `enforce_test.c`: it loads the object, attaches an
-LSM link, execs an unblocked file, inserts a second file's `{dev, ino}`
-into `blocked_files`, and execs that one. The run passes only if the
-first exec succeeds and the second fails with `EPERM`.
+The guest's PID 1 is `enforce_test.c`. It attaches an LSM link, then
+runs four execs around a single map update, and passes only if all four
+behave:
 
-The control exec is not decoration. A program that broke exec outright
-would deny the blocked target too, and without the control that failure
-would read as a pass. The assertion has also been checked in the failing
-direction: with the map insertion removed, the blocked target runs and
-the script reports `FAIL`.
+| # | exec | map state | required |
+|---|------|-----------|----------|
+| 1 | `target_blocked` | empty | **runs** — baseline |
+| 2 | `target_allowed` | empty | **runs** — control |
+| 3 | `target_blocked` | key present | **`EPERM`** — the assertion |
+| 4 | `target_allowed` | key present | **runs** — selectivity |
+
+The structure matters more than the assertion. 1 and 3 are the same
+file, so the map entry is the only thing that differs between them —
+without 1, a `target_blocked` that could not run for some unrelated
+reason would be refused at 3 as well, and that refusal would be credited
+to enforcement it did not cause. 4 rules out the opposite failure: a
+program that denied everything once the map became non-empty would
+satisfy 3 and look like a pass.
+
+Each check has been verified in its failing direction, since a check
+that cannot fail proves nothing:
+
+- map insertion removed → step 3 runs → `FAIL`
+- `target_blocked` installed non-executable → caught at step 1, before
+  the map is touched, rather than misreported at step 3
+- both keys inserted → step 4 refused → `FAIL`
 
 Rather than building a kernel, this boots the **host's own kernel image**.
 BPF LSM attach needs vmlinux BTF (`CONFIG_DEBUG_INFO_BTF=y`) plus
