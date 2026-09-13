@@ -1,4 +1,4 @@
-# Maintainer: keanehatescoding <keane@archlinux>
+# Maintainer: keanehatescoding <159132270+keanehatescoding@users.noreply.github.com>
 #
 # Split package: the av.ko kernel module is version-pinned to whatever
 # kernel it's built against, so it ships separately via DKMS
