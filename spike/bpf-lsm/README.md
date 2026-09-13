@@ -26,7 +26,7 @@ Before designing around that, three things needed confirming:
 ```
 == TEST: lsm.s/bprm_check_security (expect: verifier ACCEPTS) ==
 RESULT: ACCEPTED -> hook is sleepable; -EPERM is within the
-        verifier's permitted return range (enforcement untested)
+        verifier's permitted return range
 
 == CONTROL: lsm.s/task_kill, not sleepable (expect: REJECTED) ==
 RESULT: REJECTED for the expected reason
@@ -41,19 +41,15 @@ not merely against a non-zero exit, so an unrelated failure (missing
 object, no privileges, bad pin path) fails the run instead of silently
 passing it.
 
-### What this does NOT prove
+### What the load-only test does NOT prove
 
 `bpftool prog load` runs the **verifier**. It does not attach anything and
-does not exec anything, so **runtime enforcement is untested**: this spike
-has never actually denied an exec. Question 2 above is answered only in
-the narrow sense that `bpf_lsm_get_retval_range()` permits a negative
-return on this hook, so `-EPERM` survives verification — not that the
-kernel was observed refusing an exec.
+does not exec anything, so on its own it answers question 2 only in the
+narrow sense that `bpf_lsm_get_retval_range()` permits a negative return
+on this hook, so `-EPERM` survives verification — not that the kernel was
+observed refusing an exec.
 
-Closing that gap needs an attach-and-exec test in a throwaway VM
-(`tests/qemu-boot/` is the natural home). That is deliberately not done
-here: attaching a program to this hook on a live machine can deny every
-exec on the system if the program is wrong.
+`run_vm_test.sh` closes that gap; see **Enforcement** below.
 
 Corroborated in the kernel source for both versions CI builds: `v6.12`
 and `v6.18` `kernel/bpf/bpf_lsm.c` both list
@@ -85,18 +81,60 @@ resolved, already-open file, so there is no second open for #88 to race.
   shape is fanotify for enforcement, BPF LSM as an optional fast path for
   cached inode verdicts.
 
+## Enforcement
+
+`run_vm_test.sh` attaches the program inside a throwaway QEMU VM and
+proves it actually denies an exec:
+
+```
+ENFORCE_TEST: program loaded
+ENFORCE_TEST: attached to bprm_check_security
+ENFORCE_TEST: control exec succeeded (unblocked file runs)
+ENFORCE_TEST: blocking dev=0x3 ino=18
+ENFORCE_TEST: blocked target denied with EPERM
+ENFORCE_TEST: PASS
+```
+
+The guest's PID 1 is `enforce_test.c`: it loads the object, attaches an
+LSM link, execs an unblocked file, inserts a second file's `{dev, ino}`
+into `blocked_files`, and execs that one. The run passes only if the
+first exec succeeds and the second fails with `EPERM`.
+
+The control exec is not decoration. A program that broke exec outright
+would deny the blocked target too, and without the control that failure
+would read as a pass. The assertion has also been checked in the failing
+direction: with the map insertion removed, the blocked target runs and
+the script reports `FAIL`.
+
+Rather than building a kernel, this boots the **host's own kernel image**.
+BPF LSM attach needs vmlinux BTF (`CONFIG_DEBUG_INFO_BTF=y`) plus
+`CONFIG_BPF_LSM=y`, and the `tinyconfig` kernel that
+`.github/workflows/qemu-boot-test.yml` builds has neither; adding them
+means `pahole` and a much heavier build. Nothing from the host filesystem
+is mounted — the guest gets only the assembled initramfs. `lsm=` is
+passed explicitly on the guest cmdline so the result does not depend on
+this machine's boot parameters.
+
+This is **not** wired into CI. Doing so needs a BTF-enabled kernel on the
+runner, which is a separate cost decision.
+
 ## Running it
 
 ```sh
 make          # builds both objects (generates vmlinux.h from local BTF)
-make check    # load-only verifier test; needs root
+make check    # load-only verifier test; needs root, attaches nothing
+make enforce  # attach-and-deny test in QEMU; no root, needs qemu + cpio
 ```
 
 `run_spike.sh` **loads and never attaches.** A loaded-but-unattached BPF
 LSM program gates nothing, so no exec on the machine is affected, and
-both programs are freed on exit since nothing is pinned. Do not casually
-turn this into an attaching test on a machine you care about: a buggy
-program on this hook can deny every exec on the system.
+both programs are freed on exit since nothing is pinned.
+
+`run_vm_test.sh` attaches, but only ever inside the VM — it never loads
+anything on the host, which is why it needs no privileges. Keep it that
+way: a buggy program on this hook can deny every exec on the system, and
+once no exec works you cannot run `bpftool` to detach it. That is the
+whole reason the enforcement half runs in a VM.
 
 `vmlinux.h` is generated from the running kernel's BTF and is
 `.gitignore`d — it is machine-specific and ~164k lines.
