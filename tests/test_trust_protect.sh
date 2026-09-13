@@ -18,7 +18,7 @@
 #   cd userspace/avctl && make
 #   ../../tests/test_trust_protect.sh
 #
-set -u
+set -uo pipefail
 
 AVCTL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../userspace/avctl" && pwd)/avctl"
 TRUST_PROC_PATH="/proc/kernel_av_trusted"
@@ -26,6 +26,12 @@ PROTECTED_PROC_PATH="/proc/kernel_av_protected"
 
 PASS=0
 FAIL=0
+
+# Private capture file for avctl output - run_all.sh runs this suite as
+# root, so a fixed /tmp path could follow an attacker-created symlink
+# and truncate an attacker-chosen target.
+TMP_OUT="$(mktemp)" || exit 1
+trap 'rm -f "$TMP_OUT"' EXIT
 
 # A syntactically valid but harmless test hash - all zeros, 64 hex chars.
 TEST_SHA256_VALID="0000000000000000000000000000000000000000000000000000000000000000"
@@ -55,98 +61,101 @@ require_module_loaded() {
 require_module_loaded
 
 section "trust add a valid hash"
-if "$AVCTL" trust add "$TEST_SHA256_VALID" "$TEST_NAME" >/tmp/avctl_out 2>&1; then
+if "$AVCTL" trust add "$TEST_SHA256_VALID" "$TEST_NAME" >"$TMP_OUT" 2>&1; then
     pass "trust add returned success"
 else
-    fail "trust add returned non-zero: $(cat /tmp/avctl_out)"
+    fail "trust add returned non-zero: $(cat "$TMP_OUT")"
 fi
 
+# List assertions capture to a file and grep that, never `list | grep`:
+# a failed list piped into grep would make an absence check false-pass,
+# and grep -q can SIGPIPE avctl on a large list.
 section "trust list shows the added hash"
-if "$AVCTL" trust list | grep -q "$TEST_SHA256_VALID"; then
+if "$AVCTL" trust list >"$TMP_OUT" 2>&1 && grep -q "$TEST_SHA256_VALID" "$TMP_OUT"; then
     pass "hash present in trust list"
 else
-    fail "hash missing from trust list"
+    fail "hash missing from trust list (or list failed)"
 fi
 
 section "trust del removes it"
-if "$AVCTL" trust del "$TEST_SHA256_VALID" >/tmp/avctl_out 2>&1; then
+if "$AVCTL" trust del "$TEST_SHA256_VALID" >"$TMP_OUT" 2>&1; then
     pass "trust del returned success"
 else
-    fail "trust del returned non-zero: $(cat /tmp/avctl_out)"
+    fail "trust del returned non-zero: $(cat "$TMP_OUT")"
 fi
 
 section "trust list no longer shows it"
-if "$AVCTL" trust list | grep -q "$TEST_SHA256_VALID"; then
-    fail "hash still present in trust list after del"
-else
+if "$AVCTL" trust list >"$TMP_OUT" 2>&1 && ! grep -q "$TEST_SHA256_VALID" "$TMP_OUT"; then
     pass "hash gone from trust list"
+else
+    fail "hash still present in trust list after del (or list failed)"
 fi
 
 section "trust del of a nonexistent hash errors cleanly"
-if "$AVCTL" trust del "$TEST_SHA256_VALID" >/tmp/avctl_out 2>&1; then
+if "$AVCTL" trust del "$TEST_SHA256_VALID" >"$TMP_OUT" 2>&1; then
     fail "trust del of a nonexistent hash unexpectedly succeeded"
 else
     pass "trust del of a nonexistent hash failed as expected"
 fi
 
 section "trust add rejects a malformed (too-short) hash"
-if echo "add deadbeef $TEST_NAME" > "$TRUST_PROC_PATH" 2>/tmp/avctl_out; then
+if echo "add deadbeef $TEST_NAME" > "$TRUST_PROC_PATH" 2>"$TMP_OUT"; then
     fail "short-hash trust add unexpectedly succeeded"
 else
     pass "short-hash trust add rejected"
 fi
 
 section "trust rejects an unknown verb"
-if echo "frobnicate $TEST_SHA256_VALID $TEST_NAME" > "$TRUST_PROC_PATH" 2>/tmp/avctl_out; then
+if echo "frobnicate $TEST_SHA256_VALID $TEST_NAME" > "$TRUST_PROC_PATH" 2>"$TMP_OUT"; then
     fail "unknown-verb trust write unexpectedly succeeded"
 else
     pass "unknown-verb trust write rejected"
 fi
 
 section "protect add an absolute path"
-if "$AVCTL" protect add "$TEST_PROTECT_PATH" >/tmp/avctl_out 2>&1; then
+if "$AVCTL" protect add "$TEST_PROTECT_PATH" >"$TMP_OUT" 2>&1; then
     pass "protect add returned success"
 else
-    fail "protect add returned non-zero: $(cat /tmp/avctl_out)"
+    fail "protect add returned non-zero: $(cat "$TMP_OUT")"
 fi
 
 section "protect list shows the added path"
-if "$AVCTL" protect list | grep -q "$TEST_PROTECT_PATH"; then
+if "$AVCTL" protect list >"$TMP_OUT" 2>&1 && grep -q "$TEST_PROTECT_PATH" "$TMP_OUT"; then
     pass "path present in protected list"
 else
-    fail "path missing from protected list"
+    fail "path missing from protected list (or list failed)"
 fi
 
 section "protect del removes it"
-if "$AVCTL" protect del "$TEST_PROTECT_PATH" >/tmp/avctl_out 2>&1; then
+if "$AVCTL" protect del "$TEST_PROTECT_PATH" >"$TMP_OUT" 2>&1; then
     pass "protect del returned success"
 else
-    fail "protect del returned non-zero: $(cat /tmp/avctl_out)"
+    fail "protect del returned non-zero: $(cat "$TMP_OUT")"
 fi
 
 section "protect list no longer shows it"
-if "$AVCTL" protect list | grep -q "$TEST_PROTECT_PATH"; then
-    fail "path still present in protected list after del"
-else
+if "$AVCTL" protect list >"$TMP_OUT" 2>&1 && ! grep -q "$TEST_PROTECT_PATH" "$TMP_OUT"; then
     pass "path gone from protected list"
+else
+    fail "path still present in protected list after del (or list failed)"
 fi
 
 section "protect del of a nonexistent path errors cleanly"
-if "$AVCTL" protect del "$TEST_PROTECT_PATH" >/tmp/avctl_out 2>&1; then
+if "$AVCTL" protect del "$TEST_PROTECT_PATH" >"$TMP_OUT" 2>&1; then
     fail "protect del of a nonexistent path unexpectedly succeeded"
 else
     pass "protect del of a nonexistent path failed as expected"
 fi
 
 section "protect add rejects a relative path"
-if "$AVCTL" protect add "relative/path" >/tmp/avctl_out 2>&1; then
+if "$AVCTL" protect add "relative/path" >"$TMP_OUT" 2>&1; then
     fail "relative-path protect add unexpectedly succeeded"
 else
     pass "relative-path protect add rejected"
 fi
 
 section "protect rejects an unknown verb"
-if echo "frobnicate $TEST_PROTECT_PATH" > "$PROTECTED_PROC_PATH" 2>/tmp/avctl_out; then
+if echo "frobnicate $TEST_PROTECT_PATH" > "$PROTECTED_PROC_PATH" 2>"$TMP_OUT"; then
     fail "unknown-verb protect write unexpectedly succeeded"
 else
     pass "unknown-verb protect write rejected"
