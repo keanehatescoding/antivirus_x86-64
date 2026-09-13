@@ -52,8 +52,14 @@ static void outmsg(const char *fmt, ...)
 	va_start(ap, fmt);
 	n = vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	if (n > 0)
-		(void)!write(STDOUT_FILENO, buf, (size_t)n);
+	if (n < 0)
+		return;
+	/* vsnprintf returns the length it WOULD have written, which can
+	 * exceed the buffer - clamp before write() reads past the end of
+	 * it. Same clamp tests/qemu-boot/init.c's outmsg() uses. */
+	if ((size_t)n >= sizeof(buf))
+		n = sizeof(buf) - 1;
+	(void)!write(STDOUT_FILENO, buf, (size_t)n);
 }
 
 static void finish(int pass)
@@ -76,8 +82,13 @@ static int libbpf_print(enum libbpf_print_level level, const char *fmt,
 	if (level == LIBBPF_DEBUG)
 		return 0;
 	n = vsnprintf(buf, sizeof(buf), fmt, ap);
-	if (n > 0)
-		(void)!write(STDOUT_FILENO, buf, (size_t)n);
+	if (n < 0)
+		return 0;
+	/* Clamp as above - a verifier log is exactly the kind of
+	 * diagnostic that overruns 2048 bytes. */
+	if ((size_t)n >= sizeof(buf))
+		n = sizeof(buf) - 1;
+	(void)!write(STDOUT_FILENO, buf, (size_t)n);
 	return 0;
 }
 
