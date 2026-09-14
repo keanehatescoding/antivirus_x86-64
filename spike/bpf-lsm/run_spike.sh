@@ -14,13 +14,16 @@
 set -u
 
 D=$(dirname "$0")
+# Honour the same override the Makefile exposes, so `make BPFTOOL=... check`
+# tests the tool the caller selected rather than whatever is on $PATH.
+BPFTOOL="${BPFTOOL:-bpftool}"
 EXPECTED_CTL_MSG="bpf_lsm_task_kill is not sleepable"
 
 echo "kernel: $(uname -r)"
 echo
 
 echo "== TEST: lsm.s/bprm_check_security (expect: verifier ACCEPTS) =="
-if out=$(bpftool prog load "$D/av_lsm_spike.bpf.o" /sys/fs/bpf/av_spike 2>&1); then
+if out=$("$BPFTOOL" prog load "$D/av_lsm_spike.bpf.o" /sys/fs/bpf/av_spike 2>&1); then
 	echo "RESULT: ACCEPTED -> hook is sleepable; -EPERM is within the"
 	echo "        verifier's permitted return range (enforcement untested)"
 	rm -f /sys/fs/bpf/av_spike
@@ -33,7 +36,7 @@ fi
 echo
 
 echo "== CONTROL: lsm.s/task_kill, not sleepable (expect: REJECTED) =="
-if out=$(bpftool prog load "$D/control_nonsleepable.bpf.o" /sys/fs/bpf/av_ctl 2>&1); then
+if out=$("$BPFTOOL" prog load "$D/control_nonsleepable.bpf.o" /sys/fs/bpf/av_ctl 2>&1); then
 	echo "RESULT: ACCEPTED -> UNEXPECTED; lsm.s not enforced, test above is void"
 	rm -f /sys/fs/bpf/av_ctl
 	B=fail

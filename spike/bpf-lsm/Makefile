@@ -28,7 +28,7 @@ vmlinux.h:
 
 # Load-only verifier test. Needs root; never attaches (see run_spike.sh).
 check: $(OBJS)
-	./run_spike.sh
+	BPFTOOL="$(BPFTOOL)" ./run_spike.sh
 
 # Enforcement test: attaches the program in a throwaway QEMU VM and
 # proves it denies an exec. Needs qemu + cpio + a readable kernel image;
