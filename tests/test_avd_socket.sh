@@ -243,6 +243,47 @@ else
     fail "expected CLEAN, got: $(cat "$AVCTL_LOG")"
 fi
 
+section "SCAN concurrently (on-demand scans share the worker pool)"
+# Two parallel SCANs of distinct clean files - exercises the
+# enqueue/wait handoff between the connection threads and the shared
+# scan-worker pool: a lost wakeup or a completion reported to the wrong
+# waiter hangs or misattributes here, which the sequential SCAN
+# sections above could never catch. Deliberately two, not
+# AVD_CONTROL_MAX_SCAN_CONNS (4): exact-cap SCAN #4's long-running
+# worker (fuzzy/TLSH passes add seconds per scan) collides with this
+# script's own SO_RCVTIMEO-bounded avctl clients, which report a
+# timeout as a daemon failure rather than retrying.
+# NOTE: per-PID `wait`, never a bare `wait` - avd itself is a
+# background job of this shell, so a bare `wait` would block until
+# avd exits (i.e. forever, until cleanup) instead of just reaping the
+# two scan clients.
+PAR_PIDS=""
+PAR_FAIL=0
+for i in 1 2; do
+    printf 'parallel scan fixture %s, harmless bytes\n' "$i" > "$TEST_TMP_DIR/pscan_$i.bin"
+    "$AVCTL" scan "$TEST_TMP_DIR/pscan_$i.bin" >"$TEST_TMP_DIR/pscan_$i.out" 2>&1 &
+    PAR_PIDS="$PAR_PIDS $!"
+done
+# Reap every child even if one already failed - a bare `wait` returns
+# only the LAST child's status when given no arguments (and here would
+# hang on avd anyway, see above), silently masking an earlier failure.
+for p in $PAR_PIDS; do
+    if ! wait "$p"; then
+        PAR_FAIL=1
+    fi
+done
+for i in 1 2; do
+    if ! grep -q '^CLEAN:' "$TEST_TMP_DIR/pscan_$i.out" 2>/dev/null; then
+        PAR_FAIL=1
+    fi
+    rm -f "$TEST_TMP_DIR/pscan_$i.bin" "$TEST_TMP_DIR/pscan_$i.out"
+done
+if [ "$PAR_FAIL" -eq 0 ]; then
+    pass "2 parallel SCANs both report CLEAN"
+else
+    fail "parallel SCANs misbehaved (a waiter hung, errored, or misattributed a result)"
+fi
+
 section "SCAN the EICAR test string (should convict via YARA)"
 # shellcheck disable=SC2016
 printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > "$TEST_FILE"
