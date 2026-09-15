@@ -601,11 +601,11 @@ int main(int argc, char **argv)
 	/* ---------------------------------------------------------------
 	 * PHASE 3b - can the denial errno be chosen?
 	 *
-	 * #102 lists FAN_DENY_ERRNO() as a plain capability. It is not: on
-	 * this kernel a custom errno is accepted only from a PRE_CONTENT
-	 * group, and a CONTENT group's response is rejected with EINVAL.
-	 * Both classes are tried here so the answer is attributed to the
-	 * class rather than to the kernel version.
+	 * #102 lists FAN_DENY_ERRNO() as a plain capability. Hypothesis
+	 * under test: a custom errno may be accepted only from a
+	 * PRE_CONTENT group, with a CONTENT group's response rejected
+	 * with EINVAL. Both classes are tried here so the answer is
+	 * attributed to the class rather than to the kernel version.
 	 * --------------------------------------------------------------- */
 	printf("== OBSERVATION 3b: is the denial errno selectable? ==\n");
 	memset(&o, 0, sizeof(o));
@@ -753,7 +753,12 @@ int main(int argc, char **argv)
 		printf("VERDICT: FAN_OPEN_EXEC_PERM holds the exec until userspace\n");
 		printf("         responds, refuses it on FAN_DENY, and hands over the\n");
 		printf("         image that actually runs.\n");
-		printf("         The denial errno was NOT selectable here: EPERM only.\n");
+		if (content_errno_ok)
+			printf("         The denial errno IS selectable on FAN_CLASS_CONTENT (EACCES honoured).\n");
+		else if (prec_errno_ok)
+			printf("         The denial errno needs FAN_CLASS_PRE_CONTENT (CONTENT rejects it).\n");
+		else
+			printf("         The denial errno was NOT selectable here: EPERM only.\n");
 		printf("         Scope: one inode mark, one listener, a stubbed verdict\n");
 		printf("         that is just a sleep. Mount-wide marking, avd's own\n");
 		printf("         re-entrancy and throughput are NOT tested - see README.\n");

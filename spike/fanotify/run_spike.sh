@@ -44,7 +44,11 @@ cp "$D/target_orig" "$D/target_decoy" "$D/target_unmarked" "$WORK/"
 # directory is noexec (or the binary is broken), every phase below would
 # fail and phase 3's denial would be indistinguishable from a file that
 # simply cannot run. Catch that here, where the message is unambiguous.
-if "$WORK/target_unmarked"; then
+# fd 3 is closed on purpose: the target writes its 9-byte startup report
+# unconditionally (see target.c), so an inherited writable fd 3 from our
+# own caller would be corrupted by this preflight run. With it closed the
+# write just fails harmlessly; the exit status is what is asserted below.
+if "$WORK/target_unmarked" 3<&-; then
 	echo "preflight: unexpected exit 0 from target_unmarked"
 	exit 1
 else
