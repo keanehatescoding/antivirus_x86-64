@@ -21,6 +21,7 @@
 #include <linux/sched.h>
 #include <linux/netlink.h>
 #include <linux/notifier.h>
+#include <linux/version.h>
 #include <net/genetlink.h>
 
 #include "netlink_proto.h"
@@ -224,14 +225,18 @@ static const struct genl_ops av_genl_ops[] = {
     {
         .cmd = AV_C_REGISTER,
         .doit = av_nl_register_doit,
-        /* Per-op policy (takes precedence over the family policy
-         * below): newer kernels prefer/require validation at the op
-         * level and may ignore the family-wide .policy, so attach
-         * av_genl_policy here too. The family .policy stays as a
-         * fallback for older kernels - both point at the same table,
-         * so there is no divergence to keep in sync. */
+        /* cppcheck-suppress syntaxError - KERNEL_VERSION comes from
+         * the kernel's generated headers, absent in standalone lint. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+        /* Per-op policy exists only on 5.10+ (dropped from struct
+         * genl_ops in 5.2, reinstated in 5.10); there it takes
+         * precedence over the family policy below, which newer
+         * kernels may otherwise ignore. On 5.7-5.9 these members
+         * don't exist, so validation comes from the family-level
+         * .policy alone. */
         .policy = av_genl_policy,
         .maxattr = AV_A_MAX,
+#endif
         .flags = GENL_ADMIN_PERM, /* CAP_NET_ADMIN only - see the
                                     * netlink-auth note in
                                     * docs/netlink-protocol.md */
@@ -239,9 +244,12 @@ static const struct genl_ops av_genl_ops[] = {
     {
         .cmd = AV_C_VERDICT,
         .doit = av_nl_verdict_doit,
+        /* cppcheck-suppress syntaxError - see AV_C_REGISTER above. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
         /* Same per-op policy as AV_C_REGISTER above. */
         .policy = av_genl_policy,
         .maxattr = AV_A_MAX,
+#endif
         .flags = GENL_ADMIN_PERM,
     },
 };
@@ -250,9 +258,10 @@ static struct genl_family av_genl_family = {
     .name    = AV_GENL_FAMILY_NAME,
     .version = AV_GENL_VERSION,
     .maxattr = AV_A_MAX,
-    .policy  = av_genl_policy, /* Fallback for kernels that only honor
-                                * family-wide policy; each op above also
-                                * carries this same table (see #99/#106). */
+    .policy  = av_genl_policy, /* Sole policy on 5.7-5.9 (no per-op
+                                * members there); on 5.10+ the per-op
+                                * tables above take precedence for
+                                * these ops (see #99/#106). */
     .ops     = av_genl_ops,
     .n_ops   = ARRAY_SIZE(av_genl_ops),
     .module  = THIS_MODULE, /* Without this, generic netlink has no way
