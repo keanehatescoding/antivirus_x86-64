@@ -224,6 +224,14 @@ static const struct genl_ops av_genl_ops[] = {
     {
         .cmd = AV_C_REGISTER,
         .doit = av_nl_register_doit,
+        /* Per-op policy (takes precedence over the family policy
+         * below): newer kernels prefer/require validation at the op
+         * level and may ignore the family-wide .policy, so attach
+         * av_genl_policy here too. The family .policy stays as a
+         * fallback for older kernels - both point at the same table,
+         * so there is no divergence to keep in sync. */
+        .policy = av_genl_policy,
+        .maxattr = AV_A_MAX,
         .flags = GENL_ADMIN_PERM, /* CAP_NET_ADMIN only - see the
                                     * netlink-auth note in
                                     * docs/netlink-protocol.md */
@@ -231,6 +239,9 @@ static const struct genl_ops av_genl_ops[] = {
     {
         .cmd = AV_C_VERDICT,
         .doit = av_nl_verdict_doit,
+        /* Same per-op policy as AV_C_REGISTER above. */
+        .policy = av_genl_policy,
+        .maxattr = AV_A_MAX,
         .flags = GENL_ADMIN_PERM,
     },
 };
@@ -239,7 +250,9 @@ static struct genl_family av_genl_family = {
     .name    = AV_GENL_FAMILY_NAME,
     .version = AV_GENL_VERSION,
     .maxattr = AV_A_MAX,
-    .policy  = av_genl_policy,
+    .policy  = av_genl_policy, /* Fallback for kernels that only honor
+                                * family-wide policy; each op above also
+                                * carries this same table (see #99/#106). */
     .ops     = av_genl_ops,
     .n_ops   = ARRAY_SIZE(av_genl_ops),
     .module  = THIS_MODULE, /* Without this, generic netlink has no way
