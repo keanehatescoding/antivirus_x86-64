@@ -310,15 +310,19 @@ QSCAN2_PID=$!
 # assert it is still pending. A synchronous design would have finished
 # it on its own connection thread by now. kill -0 alone only proves
 # the avctl client process still exists, not that avd admitted the
-# request - so also poll STATUS (field 5 = queued + in-service scans)
-# until the server itself reports both scans inside. A synchronous
-# design never enqueues, so the count stays 0 and this fails loudly
-# instead of passing on a delayed client.
+# request - so also poll STATUS (field 5 = queued + in-service scans,
+# which also counts unrelated kernel-triggered scans of suite
+# binaries) until the server reports at least our two scans inside.
+# A synchronous design never enqueues, so the count stays 0 and this
+# fails loudly instead of passing on a delayed client.
 sleep 2
 QSCAN_QUEUED=0
+# Bounded by `timeout` (socat has no dial timeout here): without it a
+# wedged daemon turns this poll into the same hang the pre-fix suite
+# showed. `timeout` is coreutils, always present where this suite runs.
 for _ in $(seq 1 50); do
-    QSTATUS="$(printf 'STATUS\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>/dev/null)"
-    if echo "$QSTATUS" | awk -F'\t' 'NR==3 { exit ($5 == 2 ? 0 : 1) }'; then
+    QSTATUS="$(timeout 5 socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>/dev/null < <(printf 'STATUS\n'))"
+    if echo "$QSTATUS" | awk -F'\t' 'NR==3 { exit ($5 >= 2 ? 0 : 1) }'; then
         QSCAN_QUEUED=1
         break
     fi
