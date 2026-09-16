@@ -308,11 +308,29 @@ done
 QSCAN2_PID=$!
 # Give scan 2 time to arrive and enqueue behind the held worker - then
 # assert it is still pending. A synchronous design would have finished
-# it on its own connection thread by now.
+# it on its own connection thread by now. kill -0 alone only proves
+# the avctl client process still exists, not that avd admitted the
+# request - so also poll STATUS (field 5 = scan_queue_len) until the
+# server itself reports the second scan queued. A synchronous design
+# never enqueues, so queue_len stays 0 and this fails loudly instead
+# of passing on a delayed client.
 sleep 2
+QSCAN_QUEUED=0
+for _ in $(seq 1 50); do
+    QSTATUS="$(printf 'STATUS\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>/dev/null)"
+    if echo "$QSTATUS" | awk -F'\t' 'NR==3 { exit ($5 == 1 ? 0 : 1) }'; then
+        QSCAN_QUEUED=1
+        break
+    fi
+    sleep 0.1
+done
 QSCAN_FAIL=0
 if [ "$QSCAN_STARTED" -eq 0 ]; then
     echo "  note: scan 1 never reached the hold gate - queueing not exercised"
+    QSCAN_FAIL=1
+fi
+if [ "$QSCAN_QUEUED" -eq 0 ]; then
+    echo "  note: server never reported scan_queue_len 1 - second SCAN not queued"
     QSCAN_FAIL=1
 fi
 if ! kill -0 "$QSCAN2_PID" 2>/dev/null; then

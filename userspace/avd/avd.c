@@ -2232,10 +2232,20 @@ static void *scan_worker_main(void *arg) {
           if (n > 0 && (size_t)n < sizeof(release)) {
             /* Poll, don't block: a blocking primitive here is what
              * made every earlier revision of this gate hang the
-             * suite on a missed wakeup instead of failing loudly. */
+             * suite on a missed wakeup instead of failing loudly.
+             * Shutdown-aware: main sets shutting_down and joins
+             * this worker, so polling release forever here would
+             * hang that join if the test exits without releasing. */
             for (;;) {
               struct stat st;
               struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+              bool stop;
+
+              pthread_mutex_lock(&queue_lock);
+              stop = shutting_down;
+              pthread_mutex_unlock(&queue_lock);
+              if (!running || stop)
+                break;
               if (stat(release, &st) == 0)
                 break;
               nanosleep(&ts, NULL);
