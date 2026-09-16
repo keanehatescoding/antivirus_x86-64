@@ -256,11 +256,19 @@ section "SCAN queueing (second SCAN waits on the shared worker pool)"
 # then restore the normal instance afterwards - the rest of the suite
 # keeps the default pool.
 kill "$AVD_PID" 2>/dev/null
+# wait alone is not enough: this script runs as root under pkexec and
+# avd's shutdown path joins its worker pool first, so a waved-off kill
+# without a reap can leave the old daemon still bound to the socket
+# when the new one starts below (bind fails, section hangs on a -S
+# that never appears). Reap, then poll until the pid is really gone.
 wait "$AVD_PID" 2>/dev/null
+for _ in $(seq 1 50); do
+    kill -0 "$AVD_PID" 2>/dev/null || break
+    sleep 0.1
+done
 # Fresh socket path: the old avd unlinks its control socket on shutdown,
 # and a stale -S test would otherwise pass instantly against the dead
 # instance's file while the new one never got to bind it.
-rm -f "$TEST_SOCK_PATH"
 TEST_HOLD_FIFO="$TEST_TMP_DIR/scan_hold.fifo"
 mkfifo "$TEST_HOLD_FIFO"
 # A FIFO open for write blocks in fifo_open/wait_for_partner until a
@@ -281,15 +289,15 @@ exec 9>"$TEST_HOLD_FIFO"
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
+# If the new avd dies at startup (e.g. bind fails because the old
+# daemon hasn't released the socket), -S never appears and this loop
+# would burn 10s before failing. Break early once the pid is gone so
+# the log below shows the real error immediately.
 for _ in $(seq 1 20); do
     [ -S "$TEST_SOCK_PATH" ] && break
+    kill -0 "$AVD_PID" 2>/dev/null || break
     sleep 0.5
 done
-if [ ! -S "$TEST_SOCK_PATH" ]; then
-    fail "single-worker avd did not create the control socket - see $AVD_LOG"
-    cat "$AVD_LOG"
-    exit 1
-fi
 printf 'queueing fixture one, harmless bytes\n' > "$TEST_TMP_DIR/qscan_1.bin"
 printf 'queueing fixture two, harmless bytes\n' > "$TEST_TMP_DIR/qscan_2.bin"
 "$AVCTL" scan "$TEST_TMP_DIR/qscan_1.bin" >"$TEST_TMP_DIR/qscan_1.out" 2>&1 &
@@ -342,6 +350,10 @@ rm -f "$TEST_HOLD_FIFO"
 # Restore the normal multi-worker avd for the rest of the suite.
 kill "$AVD_PID" 2>/dev/null
 wait "$AVD_PID" 2>/dev/null
+for _ in $(seq 1 50); do
+    kill -0 "$AVD_PID" 2>/dev/null || break
+    sleep 0.1
+done
 rm -f "$TEST_SOCK_PATH"
 (
     cd "$REPO_ROOT" || exit 1
@@ -351,6 +363,7 @@ rm -f "$TEST_SOCK_PATH"
 AVD_PID=$!
 for _ in $(seq 1 20); do
     [ -S "$TEST_SOCK_PATH" ] && break
+    kill -0 "$AVD_PID" 2>/dev/null || break
     sleep 0.5
 done
 if [ ! -S "$TEST_SOCK_PATH" ]; then
