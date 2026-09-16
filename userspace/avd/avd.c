@@ -2825,10 +2825,13 @@ static void cmd_scan(int fd, const char *path) {
    * signaled even across SIGINT/SIGTERM. `completion` lives on this
    * thread's stack, which is safe because this thread doesn't return
    * until `completed` is set (see struct scan_task's comment). */
-  if (pthread_mutex_init(&completion.lock, NULL) != 0 ||
-      pthread_cond_init(&completion.done, NULL) != 0) {
+  if (pthread_mutex_init(&completion.lock, NULL) != 0) {
+    close(sfd);
+    send_err(fd, "could not start scan - try again shortly");
+    return;
+  }
+  if (pthread_cond_init(&completion.done, NULL) != 0) {
     pthread_mutex_destroy(&completion.lock);
-    pthread_cond_destroy(&completion.done);
     close(sfd);
     send_err(fd, "could not start scan - try again shortly");
     return;
