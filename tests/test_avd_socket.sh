@@ -243,45 +243,113 @@ else
     fail "expected CLEAN, got: $(cat "$AVCTL_LOG")"
 fi
 
-section "SCAN concurrently (on-demand scans share the worker pool)"
-# Two parallel SCANs of distinct clean files - exercises the
-# enqueue/wait handoff between the connection threads and the shared
-# scan-worker pool: a lost wakeup or a completion reported to the wrong
-# waiter hangs or misattributes here, which the sequential SCAN
-# sections above could never catch. Deliberately two, not
-# AVD_CONTROL_MAX_SCAN_CONNS (4): exact-cap SCAN #4's long-running
-# worker (fuzzy/TLSH passes add seconds per scan) collides with this
-# script's own SO_RCVTIMEO-bounded avctl clients, which report a
-# timeout as a daemon failure rather than retrying.
-# NOTE: per-PID `wait`, never a bare `wait` - avd itself is a
-# background job of this shell, so a bare `wait` would block until
-# avd exits (i.e. forever, until cleanup) instead of just reaping the
-# two scan clients.
-PAR_PIDS=""
-PAR_FAIL=0
-for i in 1 2; do
-    printf 'parallel scan fixture %s, harmless bytes\n' "$i" > "$TEST_TMP_DIR/pscan_$i.bin"
-    "$AVCTL" scan "$TEST_TMP_DIR/pscan_$i.bin" >"$TEST_TMP_DIR/pscan_$i.out" 2>&1 &
-    PAR_PIDS="$PAR_PIDS $!"
+section "SCAN queueing (second SCAN waits on the shared worker pool)"
+# Runs avd with AVD_SCAN_THREADS=1 plus a test-only hold gate
+# (AVD_TEST_SCAN_HOLD_PATH, see avd.c): the first on-demand scan pins
+# the single worker on a FIFO until this script closes the writer end,
+# while the second SCAN must sit queued behind it. Under the old
+# synchronous design both connection threads would scan inline and the
+# second client would complete before the release - so "second client
+# still pending at release time, then both CLEAN" is the assertion
+# that actually observes queueing rather than mere parallelism.
+# Restart avd specially for this section (single worker + hold gate),
+# then restore the normal instance afterwards - the rest of the suite
+# keeps the default pool.
+kill "$AVD_PID" 2>/dev/null
+wait "$AVD_PID" 2>/dev/null
+# Fresh socket path: the old avd unlinks its control socket on shutdown,
+# and a stale -S test would otherwise pass instantly against the dead
+# instance's file while the new one never got to bind it.
+rm -f "$TEST_SOCK_PATH"
+TEST_HOLD_FIFO="$TEST_TMP_DIR/scan_hold.fifo"
+mkfifo "$TEST_HOLD_FIFO"
+# Writer end held open by this shell (fd 9): the held worker blocks
+# reading it until we close 9 below, which delivers EOF. Never writes
+# - the gate drains to EOF, not to a sentinel byte.
+exec 9>"$TEST_HOLD_FIFO"
+(
+    cd "$REPO_ROOT" || exit 1
+    exec env AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_FIFO" \
+        "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+        corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
+) &
+AVD_PID=$!
+for _ in $(seq 1 20); do
+    [ -S "$TEST_SOCK_PATH" ] && break
+    sleep 0.5
 done
-# Reap every child even if one already failed - a bare `wait` returns
-# only the LAST child's status when given no arguments (and here would
-# hang on avd anyway, see above), silently masking an earlier failure.
-for p in $PAR_PIDS; do
-    if ! wait "$p"; then
-        PAR_FAIL=1
+if [ ! -S "$TEST_SOCK_PATH" ]; then
+    fail "single-worker avd did not create the control socket - see $AVD_LOG"
+    cat "$AVD_LOG"
+    exit 1
+fi
+printf 'queueing fixture one, harmless bytes\n' > "$TEST_TMP_DIR/qscan_1.bin"
+printf 'queueing fixture two, harmless bytes\n' > "$TEST_TMP_DIR/qscan_2.bin"
+"$AVCTL" scan "$TEST_TMP_DIR/qscan_1.bin" >"$TEST_TMP_DIR/qscan_1.out" 2>&1 &
+QSCAN1_PID=$!
+QSCAN_STARTED=0
+# Let scan 1 reach the hold gate before starting scan 2: poll avd's
+# log for the worker's scan line rather than sleeping a fixed amount.
+for _ in $(seq 1 100); do
+    if grep -q 'test hold gate entered for ".*qscan_1.bin"' "$AVD_LOG" 2>/dev/null; then
+        QSCAN_STARTED=1
+        break
     fi
+    sleep 0.1
 done
+"$AVCTL" scan "$TEST_TMP_DIR/qscan_2.bin" >"$TEST_TMP_DIR/qscan_2.out" 2>&1 &
+QSCAN2_PID=$!
+# Give scan 2 time to arrive and enqueue behind the held worker - then
+# assert it is still pending. A synchronous design would have finished
+# it on its own connection thread by now.
+sleep 2
+QSCAN_FAIL=0
+if [ "$QSCAN_STARTED" -eq 0 ]; then
+    echo "  note: scan 1 never reached the hold gate - queueing not exercised"
+    QSCAN_FAIL=1
+fi
+if ! kill -0 "$QSCAN2_PID" 2>/dev/null; then
+    echo "  note: second SCAN completed before the release - not queued"
+    QSCAN_FAIL=1
+fi
+# Release: closing fd 9 gives the held worker EOF, both scans proceed.
+exec 9>&-
+if ! wait "$QSCAN1_PID"; then
+    QSCAN_FAIL=1
+fi
+if ! wait "$QSCAN2_PID"; then
+    QSCAN_FAIL=1
+fi
 for i in 1 2; do
-    if ! grep -q '^CLEAN:' "$TEST_TMP_DIR/pscan_$i.out" 2>/dev/null; then
-        PAR_FAIL=1
+    if ! grep -q '^CLEAN:' "$TEST_TMP_DIR/qscan_$i.out" 2>/dev/null; then
+        QSCAN_FAIL=1
     fi
-    rm -f "$TEST_TMP_DIR/pscan_$i.bin" "$TEST_TMP_DIR/pscan_$i.out"
+    rm -f "$TEST_TMP_DIR/qscan_$i.bin" "$TEST_TMP_DIR/qscan_$i.out"
 done
-if [ "$PAR_FAIL" -eq 0 ]; then
-    pass "2 parallel SCANs both report CLEAN"
+rm -f "$TEST_HOLD_FIFO"
+# Restore the normal multi-worker avd for the rest of the suite.
+kill "$AVD_PID" 2>/dev/null
+wait "$AVD_PID" 2>/dev/null
+rm -f "$TEST_SOCK_PATH"
+(
+    cd "$REPO_ROOT" || exit 1
+    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+        corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
+) &
+AVD_PID=$!
+for _ in $(seq 1 20); do
+    [ -S "$TEST_SOCK_PATH" ] && break
+    sleep 0.5
+done
+if [ ! -S "$TEST_SOCK_PATH" ]; then
+    fail "avd did not restart after the queueing section - see $AVD_LOG"
+    cat "$AVD_LOG"
+    exit 1
+fi
+if [ "$QSCAN_FAIL" -eq 0 ]; then
+    pass "second SCAN queued behind held worker, both report CLEAN"
 else
-    fail "parallel SCANs misbehaved (a waiter hung, errored, or misattributed a result)"
+    fail "queueing not observed (second SCAN finished before release, errored, or misreported)"
 fi
 
 section "SCAN the EICAR test string (should convict via YARA)"

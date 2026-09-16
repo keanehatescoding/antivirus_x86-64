@@ -298,7 +298,15 @@ static YR_RULES *compiled_rules;
  * no lock guards them. */
 static int avd_scan_threads = AVD_SCAN_THREADS_DEFAULT;
 static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
-
+/* Test-only hook for tests/test_avd_socket.sh's parallel-SCAN section:
+ * when AVD_TEST_SCAN_HOLD_PATH names a FIFO with a blocked writer
+ * (the test opens it O_WRONLY and never writes), the first on-demand
+ * scan to reach this point blocks reading one byte from it - pinning
+ * the worker while a second SCAN proves it queues behind instead of
+ * running synchronously on its own connection thread. Unset in every
+ * real deployment (NULL here costs one branch per scan), so this
+ * changes no production timing or verdict path. */
+static const char *avd_test_scan_hold_path;
 /* nl_send_auto() touches `sock`'s internal sequence-number/port state,
  * which libnl does not guarantee is safe for concurrent callers - so
  * every send_verdict() call (now potentially from any of the
@@ -306,7 +314,6 @@ static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
  * Held only around message construction+send, never around the scan
  * itself, so contention is negligible. compiled_rules and
  * fuzzy_corpus need no such lock: both are populated once at startup
- * (load_rules()/load_fuzzy_corpus()) before any worker thread exists
  * and are read-only from then on - yr_rules_scan_fd() (or
  * yr_rules_scan_file()) against a shared, unmodified YR_RULES is
  * documented as safe for concurrent callers on that basis. */
@@ -1846,11 +1853,11 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                * proceed without one rather than failing the scan
                * over it */
 
-  printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
-         on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
-
   if (!compiled_rules)
     goto record;
+
+  printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
+         on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
 
   /* sha256_fd() above drains through a dup()'d handle, and dup() shares
    * the underlying file offset with the original fd (same open file
@@ -2179,9 +2186,48 @@ static void *scan_worker_main(void *arg) {
        * so the waiter can't miss it), then this thread never touches
        * `completion` again - the waiter owns its stack slot from the
        * wake onwards. */
-      struct scan_completion *c = task->completion;
+      struct scan_completion *c;
       struct scan_result result;
 
+      /* Test-only hold gate (see avd_test_scan_hold_path's comment):
+       * the first scan to arrive blocks reading one byte from the
+       * test's FIFO, holding the single worker so the test's second
+       * SCAN provably queues behind it. No-op when the env var is
+       * unset (production). Only the first scan takes the gate - a
+       * per-process flag, reset never, so the held scan plus every
+       * scan after it proceeds normally once the test's writer end
+       * closes. */
+      if (avd_test_scan_hold_path) {
+        printf("avd: test hold gate entered for \"%s\"\n", task->path);
+        fflush(stdout);
+      }
+      if (avd_test_scan_hold_path) {
+        static bool hold_taken;
+        static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
+        bool take = false;
+
+        pthread_mutex_lock(&hold_lock);
+        if (!hold_taken) {
+          hold_taken = true;
+          take = true;
+        }
+        pthread_mutex_unlock(&hold_lock);
+
+        if (take) {
+          int hfd = open(avd_test_scan_hold_path, O_RDONLY);
+          char b;
+
+          if (hfd >= 0) {
+            /* Blocks until the test closes its writer end (EOF),
+             * then falls through to the real scan below. */
+            while (read(hfd, &b, 1) > 0)
+              ;
+            close(hfd);
+          }
+        }
+      }
+
+      c = task->completion;
       perform_scan(task->fd, task->path, NULL, 0, true, &result);
       close(task->fd);
       pthread_mutex_lock(&c->lock);
@@ -3444,10 +3490,8 @@ int main(int argc, char **argv) {
   /* Fail closed on relative/empty daemon paths: both are argv/env
    * controlled, and a relative quarantine/socket path would silently
    * resolve against whatever cwd avd was started from - quarantine
-   * writes or the world-visible control socket landing somewhere the
-   * operator didn't mean. Absolute-path-only, same stance as
-   * start_control_socket()'s own check (which re-checks the socket
-   * path) and cmd_scan()'s absolute-path requirement. Deliberately no
+   * writes or the control socket landing in an attacker-influenced
+   * directory is a real misdirection risk, not a cosmetic one. No
    * expected-prefix allowlist (e.g. quarantine-must-be-under-/var/lib):
    * argv/env overrides legitimately point outside the production
    * prefixes - the test suite's throwaway dirs live under /tmp - so
@@ -3482,6 +3526,9 @@ int main(int argc, char **argv) {
                                          AVD_SCAN_QUEUE_MAX_DEFAULT,
                                          AVD_SCAN_QUEUE_MIN,
                                          AVD_SCAN_QUEUE_MAX_MAX);
+  /* Test-only: never set in production (see avd_test_scan_hold_path's
+   * comment). getenv() once at startup, not per scan. */
+  avd_test_scan_hold_path = getenv("AVD_TEST_SCAN_HOLD_PATH");
 
   printf("avd: quarantine directory: %s\n", quarantine_dir);
   printf("avd: control socket: %s\n", control_sock_path);
