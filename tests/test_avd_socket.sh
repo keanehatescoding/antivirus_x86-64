@@ -263,9 +263,16 @@ wait "$AVD_PID" 2>/dev/null
 rm -f "$TEST_SOCK_PATH"
 TEST_HOLD_FIFO="$TEST_TMP_DIR/scan_hold.fifo"
 mkfifo "$TEST_HOLD_FIFO"
-# Writer end held open by this shell (fd 9): the held worker blocks
-# reading it until we close 9 below, which delivers EOF. Never writes
-# - the gate drains to EOF, not to a sentinel byte.
+# A FIFO open for write blocks in fifo_open/wait_for_partner until a
+# reader exists - and avd's worker only opens the read end after scan
+# 1 arrives, long after setup runs. So hold a dummy reader first
+# (background tail keeps it open), then the writer end (fd 9)
+# completes instantly. The worker's open(O_RDONLY) then also
+# completes instantly (a writer already exists) and its read blocks
+# for data that never comes - until the release below kills the tail
+# and closes fd 9, delivering EOF.
+tail -f "$TEST_HOLD_FIFO" >/dev/null &
+TEST_HOLD_KEEPER=$!
 exec 9>"$TEST_HOLD_FIFO"
 (
     cd "$REPO_ROOT" || exit 1
@@ -312,7 +319,12 @@ if ! kill -0 "$QSCAN2_PID" 2>/dev/null; then
     echo "  note: second SCAN completed before the release - not queued"
     QSCAN_FAIL=1
 fi
-# Release: closing fd 9 gives the held worker EOF, both scans proceed.
+# Release: kill the dummy-reader tail and close fd 9. The held
+# worker's read() returns EOF once the last writer (fd 9) is gone -
+# killing the tail first drops the extra reader so nothing lingers.
+# Afterwards both scans proceed to CLEAN.
+kill "$TEST_HOLD_KEEPER" 2>/dev/null
+wait "$TEST_HOLD_KEEPER" 2>/dev/null
 exec 9>&-
 if ! wait "$QSCAN1_PID"; then
     QSCAN_FAIL=1
