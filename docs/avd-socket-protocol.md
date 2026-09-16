@@ -100,7 +100,7 @@ and would need a heavier framing format to fully close.
 
 | Command | Auth | Response |
 |---|---|---|
-| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` |
+| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` (`scan_queue_len` = queued + in-service scans, not just waiting — see below) |
 | `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` |
 | `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` |
 | `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS)\trule_name\tscore\tsha256` |
@@ -155,22 +155,32 @@ it gets there.
   save`/`load` for the kernel-state equivalent). Not addressed here;
   a future on-disk log is a reasonable follow-up if this turns out to
   matter in practice.
+- **`scan_queue_len` counts in-service scans too**, not just waiting
+  ones (queued + dequeued-but-incomplete). Rationale: with a single
+  worker, the moment it picks a task up the queue depth drops to 0
+  even though the scan is still running - reporting waiting-only
+  would make "is anything in the daemon" unobservable exactly when
+  it matters. No wire change (same field, same position).
 - **Tab/newline in a field value misparses** - see Wire format above.
 - **No path-traversal protection needed on `SCAN`'s argument** beyond
   requiring it to be absolute - unlike quarantine `<id>`, an arbitrary
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
-- **`SCAN` does not share the kernel-triggered scan queue.** Unlike
-  `AV_C_SCAN_REQUEST` (which goes through the bounded worker pool
-  (size/queue depth runtime-tunable via the `AVD_SCAN_THREADS`/
-  `AVD_SCAN_QUEUE_MAX` environment variables - see
-  `docs/netlink-protocol.md`), a control-socket `SCAN` command calls
-  `perform_scan()` directly on that connection's own thread, uncoordinated
-  with kernel-triggered scans. It has its own concurrency cap,
-  `AVD_CONTROL_MAX_SCAN_CONNS` (4, well under `AVD_CONTROL_MAX_CONNS`) -
-  a root-authenticated client issuing more concurrent `SCAN`s than that
-  gets `ERR too many concurrent SCAN requests - try again shortly`
+- **`SCAN` shares the kernel-triggered scan queue.** A control-socket
+  `SCAN` command enqueues an on-demand task on the same bounded worker
+  pool `AV_C_SCAN_REQUEST` uses (size/queue depth runtime-tunable via
+  the `AVD_SCAN_THREADS`/`AVD_SCAN_QUEUE_MAX` environment variables -
+  see `docs/netlink-protocol.md`); the connection thread blocks until
+  a worker completes the scan and hands the result back, then formats
+  the `OK`/`COUNT` reply itself. On-demand scans carry their
+  already-open, regularity-checked fd into the queue rather than a
+  bare path, so the worker scans exactly the file the connection
+  thread validated. It still has its own admission cap,
+  `AVD_CONTROL_MAX_SCAN_CONNS` (4, well under `AVD_CONTROL_MAX_CONNS`)
+  in front of that queue - a root-authenticated client issuing more
+  concurrent `SCAN`s than that gets
+  `ERR too many concurrent SCAN requests - try again shortly`
   rather than tying up every control connection slot (each held for up
   to `SCAN_TIMEOUT_SECS`, not the much shorter
   `AVD_CONTROL_RECV_TIMEOUT_SECS`) and starving ordinary

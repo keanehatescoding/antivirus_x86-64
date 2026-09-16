@@ -243,6 +243,150 @@ else
     fail "expected CLEAN, got: $(cat "$AVCTL_LOG")"
 fi
 
+section "SCAN queueing (second SCAN waits on the shared worker pool)"
+# Runs avd with AVD_SCAN_THREADS=1 plus a test-only hold gate
+# (AVD_TEST_SCAN_HOLD_PATH, see avd.c): the first on-demand scan
+# creates "$dir/entered" and polls for "$dir/release", pinning the
+# single worker while the second SCAN must sit queued behind it.
+# Under the old synchronous design both connection threads would scan
+# inline and the second client would complete before the release - so
+# "second client still pending at release time, then both CLEAN" is
+# the assertion that actually observes queueing rather than mere
+# parallelism. Flag files, not a FIFO: a FIFO writer-open blocks for
+# a reader that only appears after scan 1 arrives (hang), and a dummy
+# reader of its own defeats the EOF release (hang the other way).
+# Restart avd specially for this section (single worker + hold gate),
+# then restore the normal instance afterwards - the rest of the suite
+# keeps the default pool.
+kill "$AVD_PID" 2>/dev/null
+# wait alone is not enough: this script runs as root under pkexec and
+# avd's shutdown path joins its worker pool first, so a waved-off kill
+# without a reap can leave the old daemon still bound to the socket
+# when the new one starts below (bind fails, section hangs on a -S
+# that never appears). Reap, then poll until the pid is really gone.
+wait "$AVD_PID" 2>/dev/null
+for _ in $(seq 1 50); do
+    kill -0 "$AVD_PID" 2>/dev/null || break
+    sleep 0.1
+done
+# Fresh socket path: the old avd unlinks its control socket on shutdown,
+# and a stale -S test would otherwise pass instantly against the dead
+# instance's file while the new one never got to bind it.
+TEST_HOLD_DIR="$TEST_TMP_DIR/scan_hold"
+mkdir -p "$TEST_HOLD_DIR"
+(
+    cd "$REPO_ROOT" || exit 1
+    exec env AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" \
+        "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+        corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
+) &
+AVD_PID=$!
+# If the new avd dies at startup (e.g. bind fails because the old
+# daemon hasn't released the socket), -S never appears and this loop
+# would burn 10s before failing. Break early once the pid is gone so
+# the log below shows the real error immediately.
+for _ in $(seq 1 20); do
+    [ -S "$TEST_SOCK_PATH" ] && break
+    kill -0 "$AVD_PID" 2>/dev/null || break
+    sleep 0.5
+done
+printf 'queueing fixture one, harmless bytes\n' > "$TEST_TMP_DIR/qscan_1.bin"
+printf 'queueing fixture two, harmless bytes\n' > "$TEST_TMP_DIR/qscan_2.bin"
+"$AVCTL" scan "$TEST_TMP_DIR/qscan_1.bin" >"$TEST_TMP_DIR/qscan_1.out" 2>&1 &
+QSCAN1_PID=$!
+QSCAN_STARTED=0
+# Let scan 1 reach the hold gate before starting scan 2: poll for the
+# entered flag rather than sleeping a fixed amount.
+for _ in $(seq 1 100); do
+    if [ -e "$TEST_HOLD_DIR/entered" ]; then
+        QSCAN_STARTED=1
+        break
+    fi
+    sleep 0.1
+done
+"$AVCTL" scan "$TEST_TMP_DIR/qscan_2.bin" >"$TEST_TMP_DIR/qscan_2.out" 2>&1 &
+QSCAN2_PID=$!
+# Give scan 2 time to arrive and enqueue behind the held worker - then
+# assert it is still pending. A synchronous design would have finished
+# it on its own connection thread by now. kill -0 alone only proves
+# the avctl client process still exists, not that avd admitted the
+# request - so also poll STATUS (field 5 = queued + in-service scans,
+# which also counts unrelated kernel-triggered scans of suite
+# binaries) until the server reports at least our two scans inside.
+# A synchronous design never enqueues, so the count stays 0 and this
+# fails loudly instead of passing on a delayed client.
+sleep 2
+QSCAN_QUEUED=0
+# Bounded by `timeout` (socat has no dial timeout here): without it a
+# wedged daemon turns this poll into the same hang the pre-fix suite
+# showed. `timeout` is coreutils, always present where this suite runs.
+for _ in $(seq 1 50); do
+    QSTATUS="$(timeout 5 socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>/dev/null < <(printf 'STATUS\n'))"
+    if echo "$QSTATUS" | awk -F'\t' 'NR==3 { exit ($5 >= 2 ? 0 : 1) }'; then
+        QSCAN_QUEUED=1
+        break
+    fi
+    sleep 0.1
+done
+QSCAN_FAIL=0
+if [ "$QSCAN_STARTED" -eq 0 ]; then
+    echo "  note: scan 1 never reached the hold gate - queueing not exercised"
+    QSCAN_FAIL=1
+fi
+if [ "$QSCAN_QUEUED" -eq 0 ]; then
+    echo "  note: server never reported 2 scans inside - second SCAN not queued"
+    QSCAN_FAIL=1
+fi
+if ! kill -0 "$QSCAN2_PID" 2>/dev/null; then
+    echo "  note: second SCAN completed before the release - not queued"
+    QSCAN_FAIL=1
+fi
+# Release: touch the release flag; the held worker's poll sees it and
+# both scans proceed to CLEAN.
+: > "$TEST_HOLD_DIR/release"
+if ! wait "$QSCAN1_PID"; then
+    QSCAN_FAIL=1
+fi
+if ! wait "$QSCAN2_PID"; then
+    QSCAN_FAIL=1
+fi
+for i in 1 2; do
+    if ! grep -q '^CLEAN:' "$TEST_TMP_DIR/qscan_$i.out" 2>/dev/null; then
+        QSCAN_FAIL=1
+    fi
+    rm -f "$TEST_TMP_DIR/qscan_$i.bin" "$TEST_TMP_DIR/qscan_$i.out"
+done
+rm -rf "$TEST_HOLD_DIR"
+# Restore the normal multi-worker avd for the rest of the suite.
+kill "$AVD_PID" 2>/dev/null
+wait "$AVD_PID" 2>/dev/null
+for _ in $(seq 1 50); do
+    kill -0 "$AVD_PID" 2>/dev/null || break
+    sleep 0.1
+done
+rm -f "$TEST_SOCK_PATH"
+(
+    cd "$REPO_ROOT" || exit 1
+    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+        corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
+) &
+AVD_PID=$!
+for _ in $(seq 1 20); do
+    [ -S "$TEST_SOCK_PATH" ] && break
+    kill -0 "$AVD_PID" 2>/dev/null || break
+    sleep 0.5
+done
+if [ ! -S "$TEST_SOCK_PATH" ]; then
+    fail "avd did not restart after the queueing section - see $AVD_LOG"
+    cat "$AVD_LOG"
+    exit 1
+fi
+if [ "$QSCAN_FAIL" -eq 0 ]; then
+    pass "second SCAN queued behind held worker, both report CLEAN"
+else
+    fail "queueing not observed (second SCAN finished before release, errored, or misreported)"
+fi
+
 section "SCAN the EICAR test string (should convict via YARA)"
 # shellcheck disable=SC2016
 printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > "$TEST_FILE"

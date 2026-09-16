@@ -155,18 +155,18 @@
  * can reach. A quarter of the global cap is generous for one user's real
  * concurrent avctl/GUI usage while leaving room for others. */
 #define AVD_CONTROL_MAX_CONNS_PER_UID (AVD_CONTROL_MAX_CONNS / 4)
-/* Caps how many control-socket SCAN commands may run at once, separately
- * from AVD_CONTROL_MAX_CONNS. SCAN is the one control verb that runs
- * perform_scan() (bounded by SCAN_TIMEOUT_SECS, not
- * AVD_CONTROL_RECV_TIMEOUT_SECS) directly on its own connection's thread
- * rather than sharing the kernel-triggered scan queue's worker pool - see
- * docs/avd-socket-protocol.md's SCAN section. Without a cap of its own, a
- * root-authenticated client issuing AVD_CONTROL_MAX_CONNS concurrent SCANs
- * would occupy every control connection slot for up to SCAN_TIMEOUT_SECS
- * each, starving ordinary STATUS/VERDICTS/QUARANTINE LIST use by every
- * other local user for that whole window - left well under
- * AVD_CONTROL_MAX_CONNS so those verbs always have room regardless of how
- * many SCANs are in flight. */
+/* Caps how many control-socket SCAN commands may wait on the shared scan
+ * queue at once, separately from AVD_CONTROL_MAX_CONNS. SCAN is the one
+ * control verb whose work lands on the same bounded worker pool as
+ * kernel-triggered scans (see cmd_scan()/enqueue_ondemand_scan() - the
+ * connection thread only waits for the result, the scan itself runs on
+ * a pool worker). Without a cap of its own, a root-authenticated client
+ * issuing AVD_CONTROL_MAX_CONNS concurrent SCANs would occupy every
+ * control connection slot for up to SCAN_TIMEOUT_SECS each, starving
+ * ordinary STATUS/VERDICTS/QUARANTINE LIST use by every other local
+ * user for that whole window - left well under AVD_CONTROL_MAX_CONNS
+ * so those verbs always have room regardless of how many SCANs are in
+ * flight. */
 #define AVD_CONTROL_MAX_SCAN_CONNS 4
 /* Bounds how long a single control connection may sit idle waiting for
  * its request line - without this, a client that connects and never
@@ -298,6 +298,15 @@ static YR_RULES *compiled_rules;
  * no lock guards them. */
 static int avd_scan_threads = AVD_SCAN_THREADS_DEFAULT;
 static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
+/* Test-only hook for tests/test_avd_socket.sh's parallel-SCAN section:
+ * when AVD_TEST_SCAN_HOLD_PATH names a directory, the first
+ * on-demand scan to arrive creates "$dir/entered" and then polls for
+ * "$dir/release" - pinning the worker while a second SCAN proves it
+ * queues behind instead of running synchronously on its own
+ * connection thread. Unset in every real deployment (NULL here costs
+ * one branch per scan), so this changes no production timing or
+ * verdict path. */
+static const char *avd_test_scan_hold_path;
 
 /* nl_send_auto() touches `sock`'s internal sequence-number/port state,
  * which libnl does not guarantee is safe for concurrent callers - so
@@ -306,29 +315,65 @@ static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
  * Held only around message construction+send, never around the scan
  * itself, so contention is negligible. compiled_rules and
  * fuzzy_corpus need no such lock: both are populated once at startup
- * (load_rules()/load_fuzzy_corpus()) before any worker thread exists
  * and are read-only from then on - yr_rules_scan_fd() (or
  * yr_rules_scan_file()) against a shared, unmodified YR_RULES is
  * documented as safe for concurrent callers on that basis. */
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Bounded producer/consumer queue between msg_handler() (the single
- * netlink recv thread - producer) and the avd_scan_threads scan
- * workers (consumers). A linked list rather than a ring buffer since
- * depth is small and this isn't a hot path relative to the scan
- * itself. `shutting_down` lets both a full queue's producer-side wait
- * and an empty queue's consumer-side wait unblock cleanly on
- * SIGINT/SIGTERM instead of hanging the process past `running = 0`. */
+struct scan_result {
+  uint8_t verdict; /* AV_VERDICT_CLEAN / AV_VERDICT_MALICIOUS */
+  char rule_name[AV_RULE_NAME_MAXLEN + 1];
+  int score; /* YARA aggregate score - 0 for a fuzzy/TLSH-only match or
+             * a clean result; supplementary info, not authoritative */
+  char sha256_hex[65];
+};
+
+/* Bounded producer/consumer queue between the scan producers (the single
+ * netlink recv thread via msg_handler(), plus one control-connection
+ * thread per in-flight on-demand SCAN via cmd_scan()) and the
+ * avd_scan_threads scan workers (consumers). A linked list rather than
+ * a ring buffer since depth is small and this isn't a hot path relative
+ * to the scan itself. `shutting_down` lets both a full queue's
+ * producer-side wait and an empty queue's consumer-side wait unblock
+ * cleanly on SIGINT/SIGTERM instead of hanging the process past
+ * `running = 0`. */
 struct scan_task {
   struct scan_task *next;
+  /* False: kernel-triggered scan, reported back over netlink via
+   * send_verdict(reqid). True: control-socket SCAN, reported back by
+   * copying the result into `completion` and signaling its waiter -
+   * the waiting connection thread formats the OK/COUNT reply itself. */
+  bool on_demand;
   uint64_t reqid;
   uint32_t pid;
   char path[PATH_MAX];
   char sha256_hex[65];
+  /* On-demand only: the already-open, regularity-checked fd cmd_scan()
+   * handed off (see its comment for why the worker scans this fd
+   * rather than re-opening `path`). The worker closes it once
+   * perform_scan() returns; on an enqueue failure cmd_scan() closes it
+   * instead, so exactly one side owns it on every path. */
+  int fd;
+  /* On-demand only: stack-allocated by the waiting connection thread,
+   * which outlives the task (it waits for `completed` before
+   * returning). The worker fills it in under `lock` and signals `done`
+   * exactly once, then never touches it again. */
+  struct scan_completion *completion;
+};
+
+struct scan_completion {
+  pthread_mutex_t lock;
+  pthread_cond_t done;
+  bool completed;
+  struct scan_result result;
 };
 
 static struct scan_task *queue_head, *queue_tail;
 static size_t queue_len;
+/* Tasks popped off the queue but not yet completed - see cmd_status()
+ * for why STATUS reports queue_len + scan_in_flight rather than
+ * queue_len alone. Guarded by queue_lock like everything else here. */
+static size_t scan_in_flight;
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
@@ -1766,14 +1811,6 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
            linked ? "" : " (copy fallback)");
 }
 
-struct scan_result {
-  uint8_t verdict; /* AV_VERDICT_CLEAN / AV_VERDICT_MALICIOUS */
-  char rule_name[AV_RULE_NAME_MAXLEN + 1];
-  int score; /* YARA aggregate score - 0 for a fuzzy/TLSH-only match or
-             * a clean result; supplementary info, not authoritative */
-  char sha256_hex[65];
-};
-
 /*
  * Shared core of file analysis - YARA, then fuzzy/TLSH fallback,
  * quarantine on MALICIOUS, and a verdict_history record either way.
@@ -1821,11 +1858,11 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                * proceed without one rather than failing the scan
                * over it */
 
-  printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
-         on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
-
   if (!compiled_rules)
     goto record;
+
+  printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
+         on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
 
   /* sha256_fd() above drains through a dup()'d handle, and dup() shares
    * the underlying file offset with the original fd (same open file
@@ -1982,11 +2019,11 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
    * close it. */
   /* O_NONBLOCK + fstat() + S_ISREG + clear-flag: same pattern as cmd_scan()
    * below. Without O_NONBLOCK, opening a FIFO with no writer blocks this
-   * worker thread indefinitely - and unlike cmd_scan()'s per-connection
-   * threads (bounded by AVD_CONTROL_MAX_SCAN_CONNS), these workers are the
-   * shared pool every kernel-triggered scan funnels through, so one hung
-   * worker is a direct step toward starving the whole pool. With O_NONBLOCK
-   * the open succeeds immediately regardless, and the S_ISREG check rejects
+   * worker thread indefinitely - and these workers are the one shared
+   * pool every scan funnels through now (kernel-triggered and
+   * control-socket on-demand alike), so one hung worker is a direct
+   * step toward starving the whole pool. With O_NONBLOCK the open
+   * succeeds immediately regardless, and the S_ISREG check rejects
    * FIFOs and every other non-regular file before perform_scan() touches it. */
   fd = open(path, O_RDONLY | O_NONBLOCK);
   if (fd < 0) {
@@ -2028,29 +2065,19 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
   close(fd);
 }
 
-/* Producer side (called only from msg_handler(), the netlink recv
- * thread). Copies the request into a heap task and blocks if the
- * queue is at avd_scan_queue_max rather than growing unbounded - this
- * is deliberate backpressure: if every worker is busy and the queue
- * is full, pausing the recv loop is no worse than the pre-fix
- * behavior (a scan already blocked the loop outright), and the
- * kernel's own DAEMON_TIMEOUT_MS still bounds how long any single
- * request waits before that side fails open. Returns false only on
- * shutdown or allocation failure, in which case the caller drops the
- * request (matching this codebase's existing fail-open stance). */
-static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
-                              const char *sha256_hex) {
-  struct scan_task *task = malloc(sizeof(*task));
-
+/* Shared tail of both producers below: blocks while the queue is at
+ * avd_scan_queue_max rather than growing unbounded - deliberate
+ * backpressure (see the pool-size comment at AVD_SCAN_THREADS_DEFAULT).
+ * Returns false only on shutdown or allocation failure, in which case
+ * the caller drops the request (matching this codebase's existing
+ * fail-open stance). `task` is always consumed here - freed on the
+ * failure paths, owned by the queue on success - so callers must not
+ * touch it afterwards either way. */
+static bool queue_push(struct scan_task *task) {
   if (!task)
     return false;
 
   task->next = NULL;
-  task->reqid = reqid;
-  task->pid = pid;
-  snprintf(task->path, sizeof(task->path), "%s", path ? path : "");
-  snprintf(task->sha256_hex, sizeof(task->sha256_hex), "%s",
-           sha256_hex ? sha256_hex : "");
 
   pthread_mutex_lock(&queue_lock);
   while (queue_len >= (size_t)avd_scan_queue_max && !shutting_down)
@@ -2074,11 +2101,64 @@ static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
   return true;
 }
 
+/* Producer side (called only from msg_handler(), the netlink recv
+ * thread). Copies the request into a heap task and pushes it - see
+ * queue_push() for the full-queue behavior. */
+static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
+                              const char *sha256_hex) {
+  struct scan_task *task = malloc(sizeof(*task));
+
+  if (!task)
+    return false;
+
+  task->on_demand = false;
+  task->reqid = reqid;
+  task->pid = pid;
+  snprintf(task->path, sizeof(task->path), "%s", path ? path : "");
+  snprintf(task->sha256_hex, sizeof(task->sha256_hex), "%s",
+           sha256_hex ? sha256_hex : "");
+  task->fd = -1;
+  task->completion = NULL;
+
+  return queue_push(task);
+}
+
+/* Producer side for the control socket's SCAN command (called from
+ * cmd_scan(), on that connection's thread). Unlike the netlink path
+ * above - which re-opens `path` inside the worker - the validated,
+ * already-open fd travels with the task: the worker scans exactly the
+ * file cmd_scan() checked (O_NONBLOCK + S_ISREG) rather than
+ * re-resolving the path after an unbounded queue wait, during which
+ * the original could have been swapped out from under it. `completion`
+ * is the waiter's stack-allocated handoff (see its comment); ownership
+ * of `fd` passes to the queue here - the worker closes it after the
+ * scan, or queue_push()'s failure path frees the task without closing,
+ * in which case the caller (cmd_scan()) still owns it. */
+static bool enqueue_ondemand_scan(int fd, const char *path,
+                                  struct scan_completion *completion) {
+  struct scan_task *task = malloc(sizeof(*task));
+
+  if (!task)
+    return false;
+
+  task->on_demand = true;
+  task->reqid = 0;
+  task->pid = 0;
+  snprintf(task->path, sizeof(task->path), "%s", path ? path : "");
+  task->sha256_hex[0] = '\0';
+  task->fd = fd;
+  task->completion = completion;
+
+  return queue_push(task);
+}
+
 /* Consumer side - runs on each of the avd_scan_threads worker
  * threads. Blocks for work, exits once shutting_down is set AND the
  * queue has drained (rather than abandoning whatever's still queued,
  * since those requests are otherwise silently lost with no verdict
- * sent). */
+ * sent) - draining (not abandoning) is also what lets a control
+ * connection thread blocked in cmd_scan() rely on its on-demand task
+ * always being executed and signaled, even across shutdown. */
 static void *scan_worker_main(void *arg) {
   (void)arg;
 
@@ -2099,11 +2179,106 @@ static void *scan_worker_main(void *arg) {
     if (!queue_head)
       queue_tail = NULL;
     queue_len--;
+    scan_in_flight++;
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
 
+    if (task->on_demand) {
+      /* Control-socket SCAN: same shared core as the kernel path, but
+       * the result goes back to the waiting connection thread rather
+       * than over netlink - and the reply formatting stays on that
+       * thread, so this side only hands the result over. Signaled
+       * under the completion's own lock (predicate + signal together,
+       * so the waiter can't miss it), then this thread never touches
+       * `completion` again - the waiter owns its stack slot from the
+       * wake onwards. */
+      struct scan_completion *c;
+      struct scan_result result;
+
+      /* Test-only hold gate (see avd_test_scan_hold_path's comment):
+       * the first scan to arrive sets an "entered" flag and then
+       * polls for a "release" flag, holding the single worker so the
+       * test's second SCAN provably queues behind it. Flag files, not
+       * a FIFO: FIFOs deadlock this exact setup (writer-open blocks
+       * for a reader that only appears after scan 1 arrives; a dummy
+       * reader of its own defeats the EOF release). No-op when the
+       * env var is unset (production). Only the first scan takes the
+       * gate - a per-process flag, reset never, so the held scan plus
+       * every scan after it proceeds normally once the release file
+       * appears. The entered file has a fixed name (hold dir +
+       * "/entered") so the test can poll for arrival without parsing
+       * the daemon log past its block buffering. */
+      if (avd_test_scan_hold_path) {
+        static bool hold_taken;
+        static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
+        bool take = false;
+
+        pthread_mutex_lock(&hold_lock);
+        if (!hold_taken) {
+          hold_taken = true;
+          take = true;
+        }
+        pthread_mutex_unlock(&hold_lock);
+
+        if (take) {
+          char entered[PATH_MAX];
+          char release[PATH_MAX];
+          int n;
+
+          n = snprintf(entered, sizeof(entered), "%s/entered",
+                       avd_test_scan_hold_path);
+          if (n > 0 && (size_t)n < sizeof(entered)) {
+            int efd = open(entered, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (efd >= 0)
+              close(efd);
+          }
+          n = snprintf(release, sizeof(release), "%s/release",
+                       avd_test_scan_hold_path);
+          if (n > 0 && (size_t)n < sizeof(release)) {
+            /* Poll, don't block: a blocking primitive here is what
+             * made every earlier revision of this gate hang the
+             * suite on a missed wakeup instead of failing loudly.
+             * Shutdown-aware: main sets shutting_down and joins
+             * this worker, so polling release forever here would
+             * hang that join if the test exits without releasing. */
+            for (;;) {
+              struct stat st;
+              struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+              bool stop;
+
+              pthread_mutex_lock(&queue_lock);
+              stop = shutting_down;
+              pthread_mutex_unlock(&queue_lock);
+              if (!running || stop)
+                break;
+              if (stat(release, &st) == 0)
+                break;
+              nanosleep(&ts, NULL);
+            }
+          }
+        }
+      }
+
+      c = task->completion;
+      perform_scan(task->fd, task->path, NULL, 0, true, &result);
+      close(task->fd);
+      pthread_mutex_lock(&c->lock);
+      c->result = result;
+      c->completed = true;
+      pthread_cond_signal(&c->done);
+      pthread_mutex_unlock(&c->lock);
+      pthread_mutex_lock(&queue_lock);
+      scan_in_flight--;
+      pthread_mutex_unlock(&queue_lock);
+      free(task);
+      continue;
+    }
+
     handle_scan_request(task->reqid, task->pid, task->path,
                         task->sha256_hex);
+    pthread_mutex_lock(&queue_lock);
+    scan_in_flight--;
+    pthread_mutex_unlock(&queue_lock);
     free(task);
   }
 
@@ -2326,10 +2501,17 @@ static int quarantine_id_valid(const char *id) {
 
 static void cmd_status(int fd) {
   char row[256];
+  /* Queued + in-service: queue_len alone drops to 0 the moment the
+   * single worker picks the second scan up (it then blocks in the
+   * hold gate with nothing queued behind it), so a test polling
+   * STATUS for "the second scan is inside the daemon" would race.
+   * in_flight counts tasks dequeued but not yet completed
+   * (incremented under queue_lock at pop, decremented at completion)
+   * so queued + in-flight is the stable "scans inside" signal. */
   size_t qlen;
 
   pthread_mutex_lock(&queue_lock);
-  qlen = queue_len;
+  qlen = queue_len + scan_in_flight;
   pthread_mutex_unlock(&queue_lock);
 
   write_all(fd, "OK\n", 3);
@@ -2669,13 +2851,23 @@ static void cmd_quarantine_delete(int fd, const char *id) {
 }
 
 static void cmd_scan(int fd, const char *path) {
-  struct scan_result result;
+  struct scan_completion completion;
   char row[PATH_MAX + 256];
   struct stat st;
   int sfd;
 
   if (path[0] != '/') {
     send_err(fd, "path must be absolute");
+    return;
+  }
+  /* Reject rather than let the queue handoff silently truncate: the
+   * worker scans task->path (char[PATH_MAX]) copied from here, and a
+   * truncated copy would scan the wrong file with no error. open()
+   * below would fail on an overlong path anyway (ENAMETOOLONG) - this
+   * just reports it clearly up front, and gives gcc the bound it
+   * needs to prove the enqueue copy can't truncate. */
+  if (strlen(path) >= PATH_MAX) {
+    send_err(fd, "path too long");
     return;
   }
 
@@ -2685,8 +2877,8 @@ static void cmd_scan(int fd, const char *path) {
    * control_accept_main()'s comment), a client repeatedly SCANning a
    * FIFO path could tie up every slot indefinitely. With O_NONBLOCK
    * the open succeeds immediately regardless, and the fstat()+
-   * S_ISREG() check right below rejects it before perform_scan() ever
-   * touches it - along with every other non-regular-file case
+   * S_ISREG() check right below rejects it before the scan ever runs
+   * - along with every other non-regular-file case
    * (character/block devices, sockets, directories). */
   sfd = open(path, O_RDONLY | O_NONBLOCK);
   if (sfd < 0) {
@@ -2711,14 +2903,55 @@ static void cmd_scan(int fd, const char *path) {
     return;
   }
 
-  perform_scan(sfd, path, NULL, 0, true, &result);
-  close(sfd);
+  /* On-demand scans run on the same bounded worker pool as
+   * kernel-triggered scans (see enqueue_ondemand_scan()), not
+   * synchronously on this connection's thread - so a burst of
+   * control-socket SCANs can't oversubscribe the daemon past
+   * avd_scan_threads workers on top of whatever the kernel path is
+   * already running. This thread blocks below until a worker picks
+   * the task up and signals it; the wait is unbounded the same way
+   * the old synchronous perform_scan() was (a scan takes as long as
+   * it takes), and shutdown can't strand it - workers drain the
+   * queue before exiting, so every enqueued task is executed and
+   * signaled even across SIGINT/SIGTERM. `completion` lives on this
+   * thread's stack, which is safe because this thread doesn't return
+   * until `completed` is set (see struct scan_task's comment). */
+  if (pthread_mutex_init(&completion.lock, NULL) != 0) {
+    close(sfd);
+    send_err(fd, "could not start scan - try again shortly");
+    return;
+  }
+  if (pthread_cond_init(&completion.done, NULL) != 0) {
+    pthread_mutex_destroy(&completion.lock);
+    close(sfd);
+    send_err(fd, "could not start scan - try again shortly");
+    return;
+  }
+  completion.completed = false;
+
+  if (!enqueue_ondemand_scan(sfd, path, &completion)) {
+    pthread_cond_destroy(&completion.done);
+    pthread_mutex_destroy(&completion.lock);
+    close(sfd);
+    send_err(fd, "scan queue unavailable (shutting down?) - try again shortly");
+    return;
+  }
+
+  pthread_mutex_lock(&completion.lock);
+  while (!completion.completed)
+    pthread_cond_wait(&completion.done, &completion.lock);
+  pthread_mutex_unlock(&completion.lock);
+
+  pthread_cond_destroy(&completion.done);
+  pthread_mutex_destroy(&completion.lock);
 
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
   snprintf(row, sizeof(row), "%s\t%s\t%d\t%s\n",
-           result.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
-           result.rule_name, result.score, result.sha256_hex);
+           completion.result.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS"
+                                                            : "CLEAN",
+           completion.result.rule_name, completion.result.score,
+           completion.result.sha256_hex);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
 }
@@ -2752,11 +2985,11 @@ static void cmd_scan(int fd, const char *path) {
 
 /* Guards control_scan_conn_count against AVD_CONTROL_MAX_SCAN_CONNS - see
  * that constant's comment. A separate lock from control_conn_count_lock
- * rather than reusing it: this one is held only around the SCAN branch
- * below (a coarser, much longer-held region spanning the whole
- * perform_scan() call), so keeping it distinct avoids adding that hold
- * time to control_conn_count_lock's otherwise brief, frequent critical
- * sections. */
+ * rather than reusing it: this one guards the SCAN-slot reserve/release
+ * pair bracketing cmd_scan() below (whose enqueue-and-wait for the scan
+ * result runs unlocked between the two), so keeping it distinct keeps
+ * that SCAN admission accounting out of control_conn_count_lock's
+ * otherwise brief, frequent critical sections. */
 static pthread_mutex_t control_scan_conn_lock = PTHREAD_MUTEX_INITIALIZER;
 static int control_scan_conn_count;
 
@@ -3302,10 +3535,8 @@ int main(int argc, char **argv) {
   /* Fail closed on relative/empty daemon paths: both are argv/env
    * controlled, and a relative quarantine/socket path would silently
    * resolve against whatever cwd avd was started from - quarantine
-   * writes or the world-visible control socket landing somewhere the
-   * operator didn't mean. Absolute-path-only, same stance as
-   * start_control_socket()'s own check (which re-checks the socket
-   * path) and cmd_scan()'s absolute-path requirement. Deliberately no
+   * writes or the control socket landing in an attacker-influenced
+   * directory is a real misdirection risk, not a cosmetic one. No
    * expected-prefix allowlist (e.g. quarantine-must-be-under-/var/lib):
    * argv/env overrides legitimately point outside the production
    * prefixes - the test suite's throwaway dirs live under /tmp - so
@@ -3340,6 +3571,9 @@ int main(int argc, char **argv) {
                                          AVD_SCAN_QUEUE_MAX_DEFAULT,
                                          AVD_SCAN_QUEUE_MIN,
                                          AVD_SCAN_QUEUE_MAX_MAX);
+  /* Test-only: never set in production (see avd_test_scan_hold_path's
+   * comment). getenv() once at startup, not per scan. */
+  avd_test_scan_hold_path = getenv("AVD_TEST_SCAN_HOLD_PATH");
 
   printf("avd: quarantine directory: %s\n", quarantine_dir);
   printf("avd: control socket: %s\n", control_sock_path);
