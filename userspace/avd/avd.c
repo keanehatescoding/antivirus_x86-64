@@ -370,6 +370,10 @@ struct scan_completion {
 
 static struct scan_task *queue_head, *queue_tail;
 static size_t queue_len;
+/* Tasks popped off the queue but not yet completed - see cmd_status()
+ * for why STATUS reports queue_len + scan_in_flight rather than
+ * queue_len alone. Guarded by queue_lock like everything else here. */
+static size_t scan_in_flight;
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
@@ -2175,6 +2179,7 @@ static void *scan_worker_main(void *arg) {
     if (!queue_head)
       queue_tail = NULL;
     queue_len--;
+    scan_in_flight++;
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
 
@@ -2262,12 +2267,18 @@ static void *scan_worker_main(void *arg) {
       c->completed = true;
       pthread_cond_signal(&c->done);
       pthread_mutex_unlock(&c->lock);
+      pthread_mutex_lock(&queue_lock);
+      scan_in_flight--;
+      pthread_mutex_unlock(&queue_lock);
       free(task);
       continue;
     }
 
     handle_scan_request(task->reqid, task->pid, task->path,
                         task->sha256_hex);
+    pthread_mutex_lock(&queue_lock);
+    scan_in_flight--;
+    pthread_mutex_unlock(&queue_lock);
     free(task);
   }
 
@@ -2490,10 +2501,17 @@ static int quarantine_id_valid(const char *id) {
 
 static void cmd_status(int fd) {
   char row[256];
+  /* Queued + in-service: queue_len alone drops to 0 the moment the
+   * single worker picks the second scan up (it then blocks in the
+   * hold gate with nothing queued behind it), so a test polling
+   * STATUS for "the second scan is inside the daemon" would race.
+   * in_flight counts tasks dequeued but not yet completed
+   * (incremented under queue_lock at pop, decremented at completion)
+   * so queued + in-flight is the stable "scans inside" signal. */
   size_t qlen;
 
   pthread_mutex_lock(&queue_lock);
-  qlen = queue_len;
+  qlen = queue_len + scan_in_flight;
   pthread_mutex_unlock(&queue_lock);
 
   write_all(fd, "OK\n", 3);

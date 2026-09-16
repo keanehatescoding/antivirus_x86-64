@@ -100,7 +100,7 @@ and would need a heavier framing format to fully close.
 
 | Command | Auth | Response |
 |---|---|---|
-| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` |
+| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` (`scan_queue_len` = queued + in-service scans, not just waiting — see below) |
 | `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` |
 | `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` |
 | `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS)\trule_name\tscore\tsha256` |
@@ -155,6 +155,12 @@ it gets there.
   save`/`load` for the kernel-state equivalent). Not addressed here;
   a future on-disk log is a reasonable follow-up if this turns out to
   matter in practice.
+- **`scan_queue_len` counts in-service scans too**, not just waiting
+  ones (queued + dequeued-but-incomplete). Rationale: with a single
+  worker, the moment it picks a task up the queue depth drops to 0
+  even though the scan is still running - reporting waiting-only
+  would make "is anything in the daemon" unobservable exactly when
+  it matters. No wire change (same field, same position).
 - **Tab/newline in a field value misparses** - see Wire format above.
 - **No path-traversal protection needed on `SCAN`'s argument** beyond
   requiring it to be absolute - unlike quarantine `<id>`, an arbitrary
