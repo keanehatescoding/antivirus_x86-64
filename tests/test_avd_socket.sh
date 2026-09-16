@@ -245,13 +245,16 @@ fi
 
 section "SCAN queueing (second SCAN waits on the shared worker pool)"
 # Runs avd with AVD_SCAN_THREADS=1 plus a test-only hold gate
-# (AVD_TEST_SCAN_HOLD_PATH, see avd.c): the first on-demand scan pins
-# the single worker on a FIFO until this script closes the writer end,
-# while the second SCAN must sit queued behind it. Under the old
-# synchronous design both connection threads would scan inline and the
-# second client would complete before the release - so "second client
-# still pending at release time, then both CLEAN" is the assertion
-# that actually observes queueing rather than mere parallelism.
+# (AVD_TEST_SCAN_HOLD_PATH, see avd.c): the first on-demand scan
+# creates "$dir/entered" and polls for "$dir/release", pinning the
+# single worker while the second SCAN must sit queued behind it.
+# Under the old synchronous design both connection threads would scan
+# inline and the second client would complete before the release - so
+# "second client still pending at release time, then both CLEAN" is
+# the assertion that actually observes queueing rather than mere
+# parallelism. Flag files, not a FIFO: a FIFO writer-open blocks for
+# a reader that only appears after scan 1 arrives (hang), and a dummy
+# reader of its own defeats the EOF release (hang the other way).
 # Restart avd specially for this section (single worker + hold gate),
 # then restore the normal instance afterwards - the rest of the suite
 # keeps the default pool.
@@ -269,22 +272,11 @@ done
 # Fresh socket path: the old avd unlinks its control socket on shutdown,
 # and a stale -S test would otherwise pass instantly against the dead
 # instance's file while the new one never got to bind it.
-TEST_HOLD_FIFO="$TEST_TMP_DIR/scan_hold.fifo"
-mkfifo "$TEST_HOLD_FIFO"
-# A FIFO open for write blocks in fifo_open/wait_for_partner until a
-# reader exists - and avd's worker only opens the read end after scan
-# 1 arrives, long after setup runs. So hold a dummy reader first
-# (background tail keeps it open), then the writer end (fd 9)
-# completes instantly. The worker's open(O_RDONLY) then also
-# completes instantly (a writer already exists) and its read blocks
-# for data that never comes - until the release below kills the tail
-# and closes fd 9, delivering EOF.
-tail -f "$TEST_HOLD_FIFO" >/dev/null &
-TEST_HOLD_KEEPER=$!
-exec 9>"$TEST_HOLD_FIFO"
+TEST_HOLD_DIR="$TEST_TMP_DIR/scan_hold"
+mkdir -p "$TEST_HOLD_DIR"
 (
     cd "$REPO_ROOT" || exit 1
-    exec env AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_FIFO" \
+    exec env AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" \
         "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
@@ -303,10 +295,10 @@ printf 'queueing fixture two, harmless bytes\n' > "$TEST_TMP_DIR/qscan_2.bin"
 "$AVCTL" scan "$TEST_TMP_DIR/qscan_1.bin" >"$TEST_TMP_DIR/qscan_1.out" 2>&1 &
 QSCAN1_PID=$!
 QSCAN_STARTED=0
-# Let scan 1 reach the hold gate before starting scan 2: poll avd's
-# log for the worker's scan line rather than sleeping a fixed amount.
+# Let scan 1 reach the hold gate before starting scan 2: poll for the
+# entered flag rather than sleeping a fixed amount.
 for _ in $(seq 1 100); do
-    if grep -q 'test hold gate entered for ".*qscan_1.bin"' "$AVD_LOG" 2>/dev/null; then
+    if [ -e "$TEST_HOLD_DIR/entered" ]; then
         QSCAN_STARTED=1
         break
     fi
@@ -327,13 +319,9 @@ if ! kill -0 "$QSCAN2_PID" 2>/dev/null; then
     echo "  note: second SCAN completed before the release - not queued"
     QSCAN_FAIL=1
 fi
-# Release: kill the dummy-reader tail and close fd 9. The held
-# worker's read() returns EOF once the last writer (fd 9) is gone -
-# killing the tail first drops the extra reader so nothing lingers.
-# Afterwards both scans proceed to CLEAN.
-kill "$TEST_HOLD_KEEPER" 2>/dev/null
-wait "$TEST_HOLD_KEEPER" 2>/dev/null
-exec 9>&-
+# Release: touch the release flag; the held worker's poll sees it and
+# both scans proceed to CLEAN.
+: > "$TEST_HOLD_DIR/release"
 if ! wait "$QSCAN1_PID"; then
     QSCAN_FAIL=1
 fi
@@ -346,7 +334,7 @@ for i in 1 2; do
     fi
     rm -f "$TEST_TMP_DIR/qscan_$i.bin" "$TEST_TMP_DIR/qscan_$i.out"
 done
-rm -f "$TEST_HOLD_FIFO"
+rm -rf "$TEST_HOLD_DIR"
 # Restore the normal multi-worker avd for the rest of the suite.
 kill "$AVD_PID" 2>/dev/null
 wait "$AVD_PID" 2>/dev/null

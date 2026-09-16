@@ -299,14 +299,15 @@ static YR_RULES *compiled_rules;
 static int avd_scan_threads = AVD_SCAN_THREADS_DEFAULT;
 static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
 /* Test-only hook for tests/test_avd_socket.sh's parallel-SCAN section:
- * when AVD_TEST_SCAN_HOLD_PATH names a FIFO with a blocked writer
- * (the test opens it O_WRONLY and never writes), the first on-demand
- * scan to reach this point blocks reading one byte from it - pinning
- * the worker while a second SCAN proves it queues behind instead of
- * running synchronously on its own connection thread. Unset in every
- * real deployment (NULL here costs one branch per scan), so this
- * changes no production timing or verdict path. */
+ * when AVD_TEST_SCAN_HOLD_PATH names a directory, the first
+ * on-demand scan to arrive creates "$dir/entered" and then polls for
+ * "$dir/release" - pinning the worker while a second SCAN proves it
+ * queues behind instead of running synchronously on its own
+ * connection thread. Unset in every real deployment (NULL here costs
+ * one branch per scan), so this changes no production timing or
+ * verdict path. */
 static const char *avd_test_scan_hold_path;
+
 /* nl_send_auto() touches `sock`'s internal sequence-number/port state,
  * which libnl does not guarantee is safe for concurrent callers - so
  * every send_verdict() call (now potentially from any of the
@@ -2190,17 +2191,18 @@ static void *scan_worker_main(void *arg) {
       struct scan_result result;
 
       /* Test-only hold gate (see avd_test_scan_hold_path's comment):
-       * the first scan to arrive blocks reading one byte from the
-       * test's FIFO, holding the single worker so the test's second
-       * SCAN provably queues behind it. No-op when the env var is
-       * unset (production). Only the first scan takes the gate - a
-       * per-process flag, reset never, so the held scan plus every
-       * scan after it proceeds normally once the test's writer end
-       * closes. */
-      if (avd_test_scan_hold_path) {
-        printf("avd: test hold gate entered for \"%s\"\n", task->path);
-        fflush(stdout);
-      }
+       * the first scan to arrive sets an "entered" flag and then
+       * polls for a "release" flag, holding the single worker so the
+       * test's second SCAN provably queues behind it. Flag files, not
+       * a FIFO: FIFOs deadlock this exact setup (writer-open blocks
+       * for a reader that only appears after scan 1 arrives; a dummy
+       * reader of its own defeats the EOF release). No-op when the
+       * env var is unset (production). Only the first scan takes the
+       * gate - a per-process flag, reset never, so the held scan plus
+       * every scan after it proceeds normally once the release file
+       * appears. The entered file has a fixed name (hold dir +
+       * "/entered") so the test can poll for arrival without parsing
+       * the daemon log past its block buffering. */
       if (avd_test_scan_hold_path) {
         static bool hold_taken;
         static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2214,15 +2216,30 @@ static void *scan_worker_main(void *arg) {
         pthread_mutex_unlock(&hold_lock);
 
         if (take) {
-          int hfd = open(avd_test_scan_hold_path, O_RDONLY);
-          char b;
+          char entered[PATH_MAX];
+          char release[PATH_MAX];
+          int n;
 
-          if (hfd >= 0) {
-            /* Blocks until the test closes its writer end (EOF),
-             * then falls through to the real scan below. */
-            while (read(hfd, &b, 1) > 0)
-              ;
-            close(hfd);
+          n = snprintf(entered, sizeof(entered), "%s/entered",
+                       avd_test_scan_hold_path);
+          if (n > 0 && (size_t)n < sizeof(entered)) {
+            int efd = open(entered, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (efd >= 0)
+              close(efd);
+          }
+          n = snprintf(release, sizeof(release), "%s/release",
+                       avd_test_scan_hold_path);
+          if (n > 0 && (size_t)n < sizeof(release)) {
+            /* Poll, don't block: a blocking primitive here is what
+             * made every earlier revision of this gate hang the
+             * suite on a missed wakeup instead of failing loudly. */
+            for (;;) {
+              struct stat st;
+              struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+              if (stat(release, &st) == 0)
+                break;
+              nanosleep(&ts, NULL);
+            }
           }
         }
       }
