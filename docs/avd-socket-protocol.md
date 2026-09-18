@@ -100,7 +100,7 @@ and would need a heavier framing format to fully close.
 
 | Command | Auth | Response |
 |---|---|---|
-| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` (`scan_queue_len` = queued + in-service scans, not just waiting — see below) |
+| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads\tscans_total\tscans_malicious\tscan_avg_ms\tscan_max_ms\tlast_scan_ms` (`scan_queue_len` = queued + in-service scans, not just waiting — see below; `scans_total`/`scans_malicious` = completed scans since daemon start, `scan_avg_ms`/`scan_max_ms`/`last_scan_ms` = mean/max/last completed-scan latency in whole ms, monotonic clock) |
 | `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` |
 | `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` |
 | `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS)\trule_name\tscore\tsha256` |

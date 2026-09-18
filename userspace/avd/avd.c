@@ -85,6 +85,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -374,6 +375,20 @@ static size_t queue_len;
  * for why STATUS reports queue_len + scan_in_flight rather than
  * queue_len alone. Guarded by queue_lock like everything else here. */
 static size_t scan_in_flight;
+/* Aggregate scan metrics for STATUS (issue #105, observability bullet).
+ * Updated once per completed scan at perform_scan()'s single `record:`
+ * exit path, so every scan - clean or malicious, kernel-triggered or
+ * on-demand, early fail-open or full pipeline - counts exactly once.
+ * STATUS answers any local peer with aggregate counts only (no paths or
+ * hashes), so totals here leak nothing per-file. Guarded by their own
+ * lock, not queue_lock: perform_scan() runs on worker threads
+ * concurrently with cmd_status() readers. */
+static pthread_mutex_t metrics_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t scans_total;
+static uint64_t scans_malicious;
+static uint64_t scan_time_total_ms;
+static uint64_t scan_time_max_ms;
+static uint64_t last_scan_ms;
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
@@ -1845,6 +1860,12 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
    * that as "owner unknown", visible to root only. See struct
    * verdict_record's uid field comment. */
   uid_t owner_uid = fstat(fd, &owner_st) == 0 ? owner_st.st_uid : (uid_t)-1;
+  /* Wall-clock for STATUS latency metrics. Monotonic, so NTP steps and
+   * the time-of-day clock can't skew it - same clock the recv-deadline
+   * code below already uses. Started before anything scan-shaped so the
+   * early fail-open path (!compiled_rules) still records a sample. */
+  struct timespec scan_t0;
+  clock_gettime(CLOCK_MONOTONIC, &scan_t0);
 
   memset(out, 0, sizeof(*out));
   out->verdict = AV_VERDICT_CLEAN;
@@ -1991,6 +2012,29 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   }
 
 record:
+  /* Single exit path: counters updated here see every completed scan
+   * exactly once. Elapsed in whole ms (truncated, not rounded - a
+   * sub-ms scan reports 0, honestly). */
+  {
+    struct timespec scan_t1;
+    /* Signed long arithmetic: a negative tv_nsec difference borrows
+     * from the whole-second part automatically, no explicit guard. */
+    int64_t elapsed_ms;
+    clock_gettime(CLOCK_MONOTONIC, &scan_t1);
+    elapsed_ms = (int64_t)(scan_t1.tv_sec - scan_t0.tv_sec) * 1000 +
+                 (long)(scan_t1.tv_nsec - scan_t0.tv_nsec) / 1000000;
+    if (elapsed_ms < 0)
+      elapsed_ms = 0;
+    pthread_mutex_lock(&metrics_lock);
+    scans_total++;
+    if (out->verdict == AV_VERDICT_MALICIOUS)
+      scans_malicious++;
+    scan_time_total_ms += (uint64_t)elapsed_ms;
+    if ((uint64_t)elapsed_ms > scan_time_max_ms)
+      scan_time_max_ms = (uint64_t)elapsed_ms;
+    last_scan_ms = (uint64_t)elapsed_ms;
+    pthread_mutex_unlock(&metrics_lock);
+  }
   snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
   record_verdict_history(pid, owner_uid, path, out->sha256_hex, out->verdict,
                          out->rule_name, out->score, on_demand);
@@ -2498,9 +2542,11 @@ static int quarantine_id_valid(const char *id) {
     return 0;
   return 1;
 }
-
 static void cmd_status(int fd) {
-  char row[256];
+  /* 512: five uint64 metrics (each up to 20 digits) joined the six
+   * original fields - 256 still fit but with no headroom worth
+   * trusting; snprintf() would silently truncate the tail. */
+  char row[512];
   /* Queued + in-service: queue_len alone drops to 0 the moment the
    * single worker picks the second scan up (it then blocks in the
    * hold gate with nothing queued behind it), so a test polling
@@ -2509,16 +2555,35 @@ static void cmd_status(int fd) {
    * (incremented under queue_lock at pop, decremented at completion)
    * so queued + in-flight is the stable "scans inside" signal. */
   size_t qlen;
+  /* Snapshot under metrics_lock (see the globals' comment): STATUS
+   * must never report a torn total/accumulator pair. avg is derived,
+   * not stored - total/count with a zero-count guard, so a fresh
+   * daemon reports 0 rather than dividing by zero. Appended after
+   * scan_threads, so field indices 0-5 are byte-stable for existing
+   * parsers (notably tests/test_avd_socket.sh's $5 queueing poll). */
+  uint64_t total, malicious, time_total, time_max, last_ms, avg_ms;
 
   pthread_mutex_lock(&queue_lock);
   qlen = queue_len + scan_in_flight;
   pthread_mutex_unlock(&queue_lock);
 
+  pthread_mutex_lock(&metrics_lock);
+  total = scans_total;
+  malicious = scans_malicious;
+  time_total = scan_time_total_ms;
+  time_max = scan_time_max_ms;
+  last_ms = last_scan_ms;
+  pthread_mutex_unlock(&metrics_lock);
+  avg_ms = total ? time_total / total : 0;
+
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
-  snprintf(row, sizeof(row), "%ld\t%d\t%zu\t%zu\t%zu\t%d\n",
+  snprintf(row, sizeof(row), "%ld\t%d\t%zu\t%zu\t%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\n",
            (long)(time(NULL) - start_time), compiled_rules ? 1 : 0,
-           fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads);
+           fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads,
+           (unsigned long long)total, (unsigned long long)malicious,
+           (unsigned long long)avg_ms, (unsigned long long)time_max,
+           (unsigned long long)last_ms);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
 }

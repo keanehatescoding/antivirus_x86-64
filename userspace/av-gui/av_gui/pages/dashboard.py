@@ -10,6 +10,8 @@ from .. import avd_client, path_validation, procfs_client
 _ROWS = [
     "avd status", "uptime", "rules loaded", "fuzzy corpus entries",
     "TLSH corpus entries", "scan queue depth", "scan worker threads",
+    "scans completed", "malicious scans", "avg scan latency",
+    "max scan latency", "last scan latency",
     "signatures", "trusted binaries", "protected paths",
     "daemon-unavailable policy",
 ]
@@ -56,9 +58,21 @@ class Page:
             self._set("TLSH corpus entries", st["tlsh_corpus_count"])
             self._set("scan queue depth", st["scan_queue_len"])
             self._set("scan worker threads", st["scan_threads"])
+            # Metrics fields exist only on daemons new enough to report
+            # them (avd_client.status() accepts both row shapes) - an
+            # older daemon leaves these as "-" rather than breaking the
+            # whole dashboard.
+            self._set("scans completed", st.get("scans_total", "-"))
+            self._set("malicious scans", st.get("scans_malicious", "-"))
+            for key, field in (
+                ("avg scan latency", "scan_avg_ms"),
+                ("max scan latency", "scan_max_ms"),
+                ("last scan latency", "last_scan_ms"),
+            ):
+                self._set(key, f"{st[field]}ms" if field in st else "-")
         except avd_client.AvdError as exc:
             self._set("avd status", "unreachable")
-            for key in _ROWS[1:7]:
+            for key in _ROWS[1:12]:
                 self._set(key, "-")
             errors.append(path_validation.for_display(f"avd: {exc}"))
 
@@ -72,7 +86,7 @@ class Page:
                 path_validation.for_display(state["policy"] or "-"),
             )
         except procfs_client.ProcfsError as exc:
-            for key in _ROWS[7:]:
+            for key in _ROWS[12:]:
                 self._set(key, "-")
             errors.append(path_validation.for_display(f"avctl: {exc}"))
 
