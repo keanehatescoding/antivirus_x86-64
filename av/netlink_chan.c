@@ -180,13 +180,13 @@ static int av_nl_verdict_doit(struct sk_buff *skb, struct genl_info *info)
 
     reqid = nla_get_u64(info->attrs[AV_A_REQID]);
     verdict = nla_get_u8(info->attrs[AV_A_VERDICT]);
-    /* Only AV_VERDICT_CLEAN (0) and AV_VERDICT_MALICIOUS (1) are
-     * defined (netlink_proto.h) - anything else is a malformed or
-     * malicious verdict. Reject it here with -EINVAL rather than
+    /* Closed verdict set lives in netlink_proto.h as av_verdict_valid()
+     * (shared with the adversarial test) - anything else is a malformed
+     * or malicious verdict. Reject it here with -EINVAL rather than
      * letting av_work_fn() treat every non-MALICIOUS value as clean
      * by omission, which would silently mask daemon bugs and widen
      * the accepted input space for a compromised/buggy sender. */
-    if (verdict != AV_VERDICT_CLEAN && verdict != AV_VERDICT_MALICIOUS) {
+    if (!av_verdict_valid(verdict)) {
         pr_warn("kernel-av: AV_C_VERDICT with invalid verdict %u "
                 "(reqid %llu) rejected\n", verdict,
                 (unsigned long long)reqid);

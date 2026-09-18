@@ -106,6 +106,7 @@
 #include <yara.h>
 
 #include "../../av/netlink_proto.h"
+#include "control_parse.h"
 #include "sha256.h"
 #include "tlsh_shim.h"
 
@@ -169,12 +170,9 @@
  * so those verbs always have room regardless of how many SCANs are in
  * flight. */
 #define AVD_CONTROL_MAX_SCAN_CONNS 4
-/* Bounds how long a single control connection may sit idle waiting for
- * its request line - without this, a client that connects and never
- * sends a newline (or a slow/hostile one trickling bytes) would block
- * that connection's thread, and therefore one of AVD_CONTROL_MAX_CONNS
- * slots, indefinitely. */
-#define AVD_CONTROL_RECV_TIMEOUT_SECS 5
+/* AVD_CONTROL_RECV_TIMEOUT_SECS lives in control_parse.h alongside the
+ * read_line() it bounds, so the adversarial test compiles the same
+ * constant as the daemon. */
 /* Bounded, in-memory, ring-buffered verdict history for the control
  * socket's VERDICTS command - deliberately NOT persisted to disk (lost
  * on daemon restart). This is an explicit, documented limitation, not
@@ -2474,81 +2472,10 @@ static void send_err(int fd, const char *msg) {
   write_all(fd, buf, strlen(buf));
 }
 
-/*
- * Reads one newline-terminated line from `fd` into `buf` (NUL
- * terminated, newline stripped), one byte at a time - simple rather
- * than fast, which is fine here: control-socket commands are rare
- * relative to the actual scan path and never more than
- * AVD_SOCK_LINE_MAX bytes. Returns the line length on success, 0 on a
- * clean EOF before any data, -1 on a read error, a timeout, or on
- * exceeding `bufsz` without finding a newline (a line this long can
- * only be a malformed/hostile client - see AVD_SOCK_LINE_MAX's
- * comment).
- *
- * Enforces its own ABSOLUTE deadline (AVD_CONTROL_RECV_TIMEOUT_SECS
- * from the first call), on top of whatever SO_RCVTIMEO the caller may
- * have set on `fd` - SO_RCVTIMEO alone only bounds each individual
- * read() call, so a client trickling one byte just under that
- * interval at a time would never trip any single call's timeout and
- * could hold a connection (and its AVD_CONTROL_MAX_CONNS slot) open
- * for up to AVD_SOCK_LINE_MAX reads' worth of that interval -
- * effectively unbounded in practice. This function has exactly one
- * caller (control_conn_main()), so hardcoding the same constant here
- * rather than threading a deadline parameter through is the simpler
- * choice for now.
- */
-static ssize_t read_line(int fd, char *buf, size_t bufsz) {
-  size_t len = 0;
-  struct timespec deadline;
-
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += AVD_CONTROL_RECV_TIMEOUT_SECS;
-
-  while (len + 1 < bufsz) {
-    struct timespec now;
-    char c;
-    ssize_t n;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (now.tv_sec > deadline.tv_sec ||
-        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
-      errno = ETIMEDOUT;
-      return -1;
-    }
-
-    n = read(fd, &c, 1);
-
-    if (n < 0) {
-      if (errno == EINTR)
-        continue;
-      return -1;
-    }
-    if (n == 0)
-      return len == 0 ? 0 : -1; /* EOF mid-line - treat as malformed,
-                                * not as "here's a valid short line" */
-    if (c == '\n') {
-      buf[len] = '\0';
-      return (ssize_t)len;
-    }
-    buf[len++] = c;
-  }
-  return -1; /* line too long */
-}
-
-/* id must be a bare basename (no '/', not "." or ".."), matching what
- * cmd_quarantine_list() returns - reconstructed into a path below via
- * plain snprintf(), so this is the only thing standing between a
- * hostile QUARANTINE RESTORE/DELETE argument and a path-traversal
- * escape out of quarantine_dir. */
-static int quarantine_id_valid(const char *id) {
-  if (!id[0] || strchr(id, '/'))
-    return 0;
-  if (!strcmp(id, ".") || !strcmp(id, ".."))
-    return 0;
-  if (strlen(id) >= PATH_MAX - 32) /* leaves room for the .quarantined.meta suffix */
-    return 0;
-  return 1;
-}
+/* read_line(), quarantine_id_valid(), parse_verdicts_count(), and
+ * PREFIX_MATCH() live in control_parse.h - shared with the adversarial
+ * test (tests/test_parser_robustness.sh) so the suite exercises the
+ * production implementation rather than a copy that could drift. */
 static void cmd_status(int fd) {
   /* 512: five uint64 metrics (each up to 20 digits) joined the six
    * original fields - 256 still fit but with no headroom worth
@@ -3040,21 +2967,8 @@ static void cmd_scan(int fd, const char *path) {
  * paths and SHA-256 hashes, which the world-writable socket must not
  * hand out to an unrelated local user. See docs/avd-socket-protocol.md.
  */
-/*
- * sizeof(literal) - 1, NOT a hand-counted length - a manually-counted
- * prefix length here previously drifted from the actual string length
- * (17 vs. the real 16 for "VERDICTS RECENT ", 20 vs. 19 for
- * "QUARANTINE RESTORE ", 19 vs. 18 for "QUARANTINE DELETE "), which
- * silently broke every one of those commands: strncmp() with too LONG
- * an n implicitly requires line[n-1] to be the prefix's own NUL
- * terminator too, so it never matches a real command with an argument
- * after it. Caught by tests/test_avd_socket.sh - see that file's
- * comment for the exact repro. sizeof(literal)-1 can't drift from the
- * literal it's computed from.
- */
-#define PREFIX_MATCH(line, literal) \
-  (!strncmp((line), (literal), sizeof(literal) - 1))
-
+/* PREFIX_MATCH() lives in control_parse.h (shared with the adversarial
+ * test) - see that header for the hand-counted-length drift history. */
 /* Guards control_scan_conn_count against AVD_CONTROL_MAX_SCAN_CONNS - see
  * that constant's comment. A separate lock from control_conn_count_lock
  * rather than reusing it: this one guards the SCAN-slot reserve/release
@@ -3068,18 +2982,15 @@ static int control_scan_conn_count;
 static void handle_control_line(int fd, const char *line, uid_t peer_uid,
                                 bool is_root) {
   unsigned long n;
-  char *end;
 
   if (!strcmp(line, "STATUS")) {
     cmd_status(fd);
   } else if (PREFIX_MATCH(line, "VERDICTS RECENT ")) {
     const char *arg = line + sizeof("VERDICTS RECENT ") - 1;
 
-    n = strtoul(arg, &end, 10);
-    /* end == arg catches empty/non-numeric; *end != '\0' catches
-     * trailing garbage ("5abc" → n=5) that would otherwise parse as a
-     * valid count on this authenticated channel. */
-    if (end == arg || *end != '\0') {
+    /* Strict count parsing lives in control_parse.h so the adversarial
+     * test exercises the same check the daemon enforces. */
+    if (!parse_verdicts_count(arg, &n)) {
       send_err(fd, "malformed VERDICTS RECENT (expected a count)");
       return;
     }

@@ -12,10 +12,10 @@
 #
 # Neither parser has fuzz coverage today; this is the deterministic,
 # rootless first half of that bullet (fixed adversarial vectors, no
-# libFuzzer dependency). The validation logic below mirrors the
-# production code exactly (source lines cited per block) so a drift in
-# either file fails loudly here instead of silently widening the
-# accepted input space.
+# libFuzzer dependency). The harness includes the production headers
+# directly (control_parse.h, netlink_proto.h), so it exercises the
+# exact code the daemon/kernel enforce - a regression fails here
+# instead of passing against a stale copy.
 #
 # Pure userspace, no kernel module or root needed - the harness
 # compiles only standard headers (no libnl/yara), same stance as
@@ -24,6 +24,7 @@
 #
 set -u
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/av_test_parser.XXXXXX")" || exit 1
 
 # shellcheck disable=SC2317,SC2329
@@ -35,16 +36,18 @@ trap cleanup EXIT
 cat > "$BUILD_DIR/harness.c" <<'EOF'
 /* Parser-robustness harness for issue #105 - built and run by
  * tests/test_parser_robustness.sh only, not part of the shipped avd
- * binary. Each block mirrors one production validation site; comments
- * cite the source so a logic drift is caught by inspection as well as
- * by failure. */
-#include <errno.h>
+ * binary. Includes the production headers directly
+ * (userspace/avd/control_parse.h, av/netlink_proto.h), so every CHECK
+ * below exercises the exact code the daemon/kernel enforce - a
+ * regression in either file fails here instead of passing against a
+ * stale copy. */
 #include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
+
+#include "control_parse.h"
+#include "netlink_proto.h"
 
 static int PASS, FAIL;
 
@@ -53,101 +56,12 @@ static int PASS, FAIL;
     else { printf("  FAIL: %s\n", label); FAIL++; } \
 } while (0)
 
-/* ---- quarantine_id_valid() (userspace/avd/avd.c) ----
- * Exact copy: bare basename, no '/', not "." or "..", room for the
- * ".quarantined.meta" suffix. The only thing standing between a
- * hostile QUARANTINE RESTORE/DELETE argument and a path-traversal
- * escape out of quarantine_dir. */
-static int quarantine_id_valid(const char *id) {
-    if (!id[0] || strchr(id, '/'))
-        return 0;
-    if (!strcmp(id, ".") || !strcmp(id, ".."))
-        return 0;
-    if (strlen(id) >= (size_t)(PATH_MAX - 32))
-        return 0;
-    return 1;
-}
-
-/* ---- VERDICTS RECENT count strictness (avd.c handle_control_line()) ----
- * strtoul() + (end == arg || *end != '\0') rejection of empty,
- * non-numeric, and trailing-garbage inputs. Returns 1 when the input
- * would be accepted, 0 when rejected with "malformed VERDICTS RECENT". */
-static int verdicts_count_accepted(const char *arg, unsigned long *nout) {
-    char *end;
-    unsigned long n = strtoul(arg, &end, 10);
-    if (end == arg || *end != '\0')
-        return 0;
-    if (nout)
-        *nout = n;
-    return 1;
-}
-
-/* ---- PREFIX_MATCH() dispatch (avd.c handle_control_line()) ----
- * sizeof(literal)-1, never a hand-counted length: a too-long n
- * implicitly requires the NUL terminator to match too, silently
- * breaking every command with an argument. */
-#define PREFIX_MATCH(line, literal) \
-    (!strncmp((line), (literal), sizeof(literal) - 1))
-
 static int is_status(const char *line) { return !strcmp(line, "STATUS"); }
 static int is_quarantine_list(const char *line) { return !strcmp(line, "QUARANTINE LIST"); }
 static int is_verdicts(const char *line) { return PREFIX_MATCH(line, "VERDICTS RECENT "); }
 static int is_restore(const char *line) { return PREFIX_MATCH(line, "QUARANTINE RESTORE "); }
 static int is_delete(const char *line) { return PREFIX_MATCH(line, "QUARANTINE DELETE "); }
 static int is_scan(const char *line) { return PREFIX_MATCH(line, "SCAN "); }
-
-/* ---- netlink verdict range (av/netlink_chan.c av_nl_verdict_doit()) ----
- * Only AV_VERDICT_CLEAN (0) / AV_VERDICT_MALICIOUS (1) are defined;
- * anything else is rejected with -EINVAL rather than falling through
- * to clean. Mirrors the production check verbatim. */
-#define AV_VERDICT_CLEAN 0
-#define AV_VERDICT_MALICIOUS 1
-static int verdict_accepted(unsigned int v) {
-    return v == AV_VERDICT_CLEAN || v == AV_VERDICT_MALICIOUS;
-}
-
-/* ---- read_line() bounds (avd.c control socket) ----
- * Exact copy (deadline + one-byte reads + bufsz cap): overlong or
- * newline-less input returns -1, clean EOF before any data returns 0,
- * EOF mid-line returns -1. AVD_CONTROL_RECV_TIMEOUT_SECS is 5s in
- * production; the harness feeds all bytes up front so the deadline
- * never fires. */
-#define AVD_CONTROL_RECV_TIMEOUT_SECS 5
-static ssize_t read_line(int fd, char *buf, size_t bufsz) {
-    size_t len = 0;
-    struct timespec deadline;
-
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += AVD_CONTROL_RECV_TIMEOUT_SECS;
-
-    while (len + 1 < bufsz) {
-        struct timespec now;
-        char c;
-        ssize_t n;
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > deadline.tv_sec ||
-            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
-            errno = ETIMEDOUT;
-            return -1;
-        }
-
-        n = read(fd, &c, 1);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 0)
-            return len == 0 ? 0 : -1;
-        if (c == '\n') {
-            buf[len] = '\0';
-            return (ssize_t)len;
-        }
-        buf[len++] = c;
-    }
-    return -1;
-}
 
 /* Feed `data` (len bytes, then EOF) through a pipe into read_line(). */
 static ssize_t read_line_once(const char *data, size_t len, char *out, size_t outsz) {
@@ -190,14 +104,15 @@ int main(void) {
         CHECK(quarantine_id_valid(over) == 0, "quarantine id rejects overlong id");
     }
 
-    /* 2. VERDICTS RECENT count: strict, no trailing garbage */
-    CHECK(verdicts_count_accepted("5", &n) == 1 && n == 5, "verdicts count accepts plain number");
-    CHECK(verdicts_count_accepted("0", &n) == 1 && n == 0, "verdicts count accepts zero");
-    CHECK(verdicts_count_accepted("", NULL) == 0, "verdicts count rejects empty");
-    CHECK(verdicts_count_accepted("abc", NULL) == 0, "verdicts count rejects non-numeric");
-    CHECK(verdicts_count_accepted("5abc", NULL) == 0, "verdicts count rejects trailing garbage");
-    CHECK(verdicts_count_accepted("5 ", NULL) == 0, "verdicts count rejects trailing space");
-    CHECK(verdicts_count_accepted("12x34", NULL) == 0, "verdicts count rejects mid-string garbage");
+    /* 2. VERDICTS RECENT count: strict, no trailing garbage.
+     * parse_verdicts_count() is the production helper avd.c calls. */
+    CHECK(parse_verdicts_count("5", &n) == 1 && n == 5, "verdicts count accepts plain number");
+    CHECK(parse_verdicts_count("0", &n) == 1 && n == 0, "verdicts count accepts zero");
+    CHECK(parse_verdicts_count("", NULL) == 0, "verdicts count rejects empty");
+    CHECK(parse_verdicts_count("abc", NULL) == 0, "verdicts count rejects non-numeric");
+    CHECK(parse_verdicts_count("5abc", NULL) == 0, "verdicts count rejects trailing garbage");
+    CHECK(parse_verdicts_count("5 ", NULL) == 0, "verdicts count rejects trailing space");
+    CHECK(parse_verdicts_count("12x34", NULL) == 0, "verdicts count rejects mid-string garbage");
 
     /* 3. dispatch: exact verbs vs prefix verbs */
     CHECK(is_status("STATUS") == 1, "dispatch accepts STATUS");
@@ -212,12 +127,13 @@ int main(void) {
     CHECK(is_scan("SCAN") == 0, "dispatch rejects bare SCAN without trailing space");
     CHECK(is_scan("SCANX /tmp/x") == 0, "dispatch rejects SCAN prefix extension");
 
-    /* 4. netlink verdict: closed value set */
-    CHECK(verdict_accepted(0) == 1, "netlink verdict accepts CLEAN (0)");
-    CHECK(verdict_accepted(1) == 1, "netlink verdict accepts MALICIOUS (1)");
-    CHECK(verdict_accepted(2) == 0, "netlink verdict rejects 2");
-    CHECK(verdict_accepted(42) == 0, "netlink verdict rejects 42");
-    CHECK(verdict_accepted(255) == 0, "netlink verdict rejects 255");
+    /* 4. netlink verdict: closed value set.
+     * av_verdict_valid() is the production helper netlink_chan.c calls. */
+    CHECK(av_verdict_valid(0) == 1, "netlink verdict accepts CLEAN (0)");
+    CHECK(av_verdict_valid(1) == 1, "netlink verdict accepts MALICIOUS (1)");
+    CHECK(av_verdict_valid(2) == 0, "netlink verdict rejects 2");
+    CHECK(av_verdict_valid(42) == 0, "netlink verdict rejects 42");
+    CHECK(av_verdict_valid(255) == 0, "netlink verdict rejects 255");
 
     /* 5. read_line: bounds, not silent truncation */
     CHECK(read_line_once("HELLO\n", 6, buf, sizeof(buf)) == 5 && !strcmp(buf, "HELLO"),
@@ -249,6 +165,7 @@ int main(void) {
 EOF
 
 if ! cc -Wall -Wextra -O2 \
+        -I "$REPO_ROOT/userspace/avd" -I "$REPO_ROOT/av" \
         "$BUILD_DIR/harness.c" -o "$BUILD_DIR/harness" 2>"$BUILD_DIR/build.log"; then
     echo "FAIL: could not build the parser-robustness harness - see build log:"
     cat "$BUILD_DIR/build.log"
