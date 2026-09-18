@@ -2017,12 +2017,19 @@ record:
    * sub-ms scan reports 0, honestly). */
   {
     struct timespec scan_t1;
-    /* Signed long arithmetic: a negative tv_nsec difference borrows
-     * from the whole-second part automatically, no explicit guard. */
+    /* Borrow one second when tv_nsec wraps: signed division truncates
+     * toward zero, so a bare (nsec1 - nsec0) / 1e6 over-reports by up
+     * to 1 ms across a second boundary (e.g. 1.9005s -> 2.1000s is
+     * 199.5 ms but reported 200 ms). Normalizing first keeps the
+     * whole-ms truncation honest. */
     int64_t elapsed_ms;
     clock_gettime(CLOCK_MONOTONIC, &scan_t1);
-    elapsed_ms = (int64_t)(scan_t1.tv_sec - scan_t0.tv_sec) * 1000 +
-                 (long)(scan_t1.tv_nsec - scan_t0.tv_nsec) / 1000000;
+    elapsed_ms = (int64_t)(scan_t1.tv_sec - scan_t0.tv_sec) * 1000;
+    if (scan_t1.tv_nsec < scan_t0.tv_nsec)
+      elapsed_ms -= 1000;
+    elapsed_ms += (scan_t1.tv_nsec - scan_t0.tv_nsec +
+                   (scan_t1.tv_nsec < scan_t0.tv_nsec ? 1000000000L : 0)) /
+                  1000000L;
     if (elapsed_ms < 0)
       elapsed_ms = 0;
     pthread_mutex_lock(&metrics_lock);
