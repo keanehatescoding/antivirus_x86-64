@@ -137,6 +137,19 @@ check "shipped fuzzy fixture still loads" \
 check "shipped TLSH fixture still loads" \
     "avd: loaded 1 TLSH hash(es) from $REPO_ROOT/corpus/tlsh_hashes.txt" \
     "$BUILD_DIR/clean.log"
+# Fixture-only corpora must warn at startup (#99): packaged installs
+# never show make install's echo, but every install runs these
+# loaders, so this stderr line is the channel that reaches real users
+# via the journal. The mixed corpora above carry non-fixture names
+# (good-fuzzy/good-tlsh), so they must NOT trigger it.
+check "shipped fuzzy corpus warns it is fixture-only" \
+    "fuzzy corpus \"$REPO_ROOT/corpus/fuzzy_hashes.txt\" contains only the demo fixture sample" \
+    "$BUILD_DIR/clean.log"
+check "shipped TLSH corpus warns it is fixture-only" \
+    "TLSH corpus \"$REPO_ROOT/corpus/tlsh_hashes.txt\" contains only the demo fixture sample" \
+    "$BUILD_DIR/clean.log"
+check_absent "non-fixture corpus does not warn" \
+    "contains only the demo fixture sample" "$BUILD_DIR/mixed.log"
 
 echo
 echo "test_corpus_format.sh: $PASS passed, $FAIL failed"

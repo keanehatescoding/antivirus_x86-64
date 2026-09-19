@@ -262,6 +262,14 @@ struct fuzzy_corpus_entry {
   char name[128];
 };
 
+/* Name carried by the demo fixture entries in corpus/fuzzy_hashes.txt
+ * and corpus/tlsh_hashes.txt (see their TEST FIXTURE ONLY headers).
+ * The loaders warn at startup when a corpus holds nothing but this
+ * sample (#99): packaged installs never see make install's echo, but
+ * every install - deb/rpm/tarball or source - runs these loaders, so
+ * this is the channel that actually reaches the end user. */
+#define DEMO_FIXTURE_NAME "test-ptrace-sample"
+
 /* Hash field NOT compile-time sized off av_tlsh_hash_maxlen() -
  * avd.c never includes tlsh_core.h itself (see tlsh_shim.h), so it has
  * no compile-time knowledge of the vendored TLSH implementation's
@@ -653,6 +661,9 @@ static int load_fuzzy_corpus(const char *path) {
   FILE *fp;
   char line[512];
   size_t capacity = 16;
+  /* Stays true only while every loaded entry is the demo fixture
+   * sample - any real entry clears it (see DEMO_FIXTURE_NAME). */
+  int only_fixture = 1;
 
   fp = fopen(path, "r");
   if (!fp) {
@@ -707,6 +718,8 @@ static int load_fuzzy_corpus(const char *path) {
     snprintf(fuzzy_corpus[fuzzy_corpus_count].name,
              sizeof(fuzzy_corpus[fuzzy_corpus_count].name), "%.*s",
              (int)sizeof(fuzzy_corpus[fuzzy_corpus_count].name) - 1, name_part);
+    if (strcmp(name_part, DEMO_FIXTURE_NAME) != 0)
+      only_fixture = 0;
     fuzzy_corpus_count++;
   }
   fclose(fp);
@@ -719,6 +732,13 @@ static int load_fuzzy_corpus(const char *path) {
   else
     printf("avd: loaded %zu fuzzy hash(es) from %s\n", fuzzy_corpus_count,
            path);
+
+  if (only_fixture && fuzzy_corpus_count > 0)
+    fprintf(stderr,
+            "avd: fuzzy corpus \"%s\" contains only the demo fixture "
+            "sample - add real sample hashes before relying on fuzzy "
+            "verdicts\n",
+            path);
 
   return 0;
 }
@@ -981,6 +1001,9 @@ static int load_tlsh_corpus(const char *path) {
   char line[512];
   size_t capacity = 16;
   size_t hash_maxlen = av_tlsh_hash_maxlen();
+  /* Same demo-fixture tracking as load_fuzzy_corpus() - see
+   * DEMO_FIXTURE_NAME. */
+  int only_fixture = 1;
 
   /* AV_TLSH_HASH_BUFSZ's comment promises this holds; check it rather
    * than trust it silently drifting true forever if either constant
@@ -1049,6 +1072,8 @@ static int load_tlsh_corpus(const char *path) {
     snprintf(tlsh_corpus[tlsh_corpus_count].name,
              sizeof(tlsh_corpus[tlsh_corpus_count].name), "%.*s",
              (int)sizeof(tlsh_corpus[tlsh_corpus_count].name) - 1, name_part);
+    if (strcmp(name_part, DEMO_FIXTURE_NAME) != 0)
+      only_fixture = 0;
     tlsh_corpus_count++;
   }
   fclose(fp);
@@ -1060,6 +1085,13 @@ static int load_tlsh_corpus(const char *path) {
             path);
   else
     printf("avd: loaded %zu TLSH hash(es) from %s\n", tlsh_corpus_count, path);
+
+  if (only_fixture && tlsh_corpus_count > 0)
+    fprintf(stderr,
+            "avd: TLSH corpus \"%s\" contains only the demo fixture "
+            "sample - add real sample hashes before relying on TLSH "
+            "verdicts\n",
+            path);
 
   return 0;
 }
