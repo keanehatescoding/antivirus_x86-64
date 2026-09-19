@@ -41,6 +41,12 @@ echo "### test_avd_sigroute.sh (SIGINT/SIGTERM routing to avd main thread) ###"
 "$REPO_ROOT/tests/test_avd_sigroute.sh" || FAIL=1
 
 echo
+echo "### test_parser_robustness.sh (adversarial parser coverage for #105) ###"
+# Same no-root-needed reasoning as test_sha256.sh above - pure
+# userspace harness, no daemon or kernel module involved.
+"$REPO_ROOT/tests/test_parser_robustness.sh" || FAIL=1
+
+echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 
