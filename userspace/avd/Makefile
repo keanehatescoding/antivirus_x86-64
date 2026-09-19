@@ -156,6 +156,12 @@ install: avd
 	install -m 0644 ../../corpus/tlsh_hashes.txt \
 		"$(DESTDIR)$(SYSCONFDIR)/tlsh_hashes.txt"
 	@echo
+	@echo "NOTE: the installed fuzzy_hashes.txt/tlsh_hashes.txt are TEST"
+	@echo "FIXTURES ONLY (single harmless sample each, see the headers in"
+	@echo "corpus/*.txt) - they demonstrate the matching plumbing, not real"
+	@echo "detection coverage. Populate $(SYSCONFDIR)/{fuzzy,tlsh}_hashes.txt"
+	@echo "with real sample hashes before relying on fuzzy/TLSH verdicts."
+	@echo
 	@echo "Installed:"
 	@echo "  $(DESTDIR)$(PREFIX)/bin/avd"
 	@echo "  $(DESTDIR)$(UNITDIR)/avd.service"
