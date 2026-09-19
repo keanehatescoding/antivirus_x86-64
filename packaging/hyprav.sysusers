@@ -1,0 +1,11 @@
+# systemd-sysusers declaration for the hyprav trusted-reader group
+# (shipped as packaging/hyprav.sysusers, see #143).
+#
+# The three IOC /proc entries are 0640; membership in this group is
+# what lets a non-root desktop user read them via the GUI dashboard
+# and unprivileged `avctl save`. Fields per sysusers.d(5):
+# type / name / id / GECOS - "-" id means allocate a system uid/gid
+# dynamically, so no per-machine gid bookkeeping is needed anywhere
+# (the modprobe hook and apply-ioc-group.sh reference the group by
+# name, never by number).
+g hyprav - -

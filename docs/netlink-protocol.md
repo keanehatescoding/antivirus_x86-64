@@ -78,7 +78,11 @@ This is backed by `/proc/kernel_av_daemon_policy` (0644, single
 `atomic_t` in `main.c`) — see `daemon_policy_proc_write()`'s comment
 there for the exact accepted values (`fail-open`/`fail-closed`, plus a
 mandatory trailing newline, same convention as the other `/proc`
-write handlers). Resets to fail-open on every module load/unload, same
+write handlers). The 0644 reads are deliberate: unlike the three IOC
+entries (signatures/trust/protected, `0640 root:hyprav` since #143),
+this is a single flag rather than fingerprintable IOC content, and
+the GUI policy display plus `avctl policy get` read it unprivileged.
+Resets to fail-open on every module load/unload, same
 as every other in-memory kernel-side state here; `avctl save`/`avctl
 load` round-trip it alongside signatures/trust/protected-paths if you
 want it to persist across reloads.

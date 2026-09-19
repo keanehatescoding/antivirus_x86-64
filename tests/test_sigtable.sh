@@ -100,6 +100,13 @@ else
     fail "seeded EICAR signature NOT found - check av_init() seeding"
 fi
 
+section "proc entry restricts reads to owner/group (0640, #143)"
+if [ "$(stat -c %a "$PROC_PATH")" = "640" ]; then
+    pass "mode is 0640"
+else
+    fail "mode is $(stat -c %a "$PROC_PATH"), expected 640"
+fi
+
 echo
 echo "==================================="
 echo "sigtable tests: $PASS passed, $FAIL failed"
