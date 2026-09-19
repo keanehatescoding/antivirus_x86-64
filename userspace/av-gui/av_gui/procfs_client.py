@@ -15,7 +15,10 @@ class ProcfsError(Exception):
     """Raised when `avctl save -` can't be run or exits non-zero -
     typically means the kernel module isn't loaded (see avctl's own
     "is the av module loaded?" hint in its error output, passed
-    through here via stderr)."""
+    through here via stderr), or that this user isn't in the hyprav
+    trusted-reader group (the IOC entries are 0640 root:hyprav, see
+    #143 - avctl prints a group hint for EACCES, also passed through
+    via stderr)."""
 
 
 def read_state():

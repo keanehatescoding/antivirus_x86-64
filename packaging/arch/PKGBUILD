@@ -169,6 +169,18 @@ package_hyprav() {
   # install (confirmed: pacman warned "directory permissions differ").
   install -dm700 "$pkgdir/var/lib/av-quarantine"
 
+  # #143 trusted-reader group plumbing (same set as debian/rules and
+  # packaging/fedora/hyprav.spec install): sysusers declaration
+  # (applied by pacman's systemd-sysusers hook on install; otherwise
+  # run `systemd-sysusers` once by hand), modprobe.d install hook
+  # that chgrps the IOC /proc entries at module load, and the helper
+  # it runs. All in the base hyprav package - the group governs
+  # GUI/avctl reads, and the hook is inert until av.ko from
+  # hyprav-dkms is actually loaded.
+  install -Dm644 packaging/hyprav.sysusers "$pkgdir/usr/lib/sysusers.d/hyprav.conf"
+  install -Dm644 packaging/hyprav-modprobe.conf "$pkgdir/usr/lib/modprobe.d/hyprav.conf"
+  install -Dm755 packaging/apply-ioc-group.sh "$pkgdir/usr/lib/hyprav/apply-ioc-group"
+
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
 

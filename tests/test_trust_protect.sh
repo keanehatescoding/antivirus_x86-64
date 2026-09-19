@@ -161,6 +161,18 @@ else
     pass "unknown-verb protect write rejected"
 fi
 
+section "proc entries restrict reads to owner/group (0640, #143)"
+if [ "$(stat -c %a "$TRUST_PROC_PATH")" = "640" ]; then
+    pass "trust mode is 0640"
+else
+    fail "trust mode is $(stat -c %a "$TRUST_PROC_PATH"), expected 640"
+fi
+if [ "$(stat -c %a "$PROTECTED_PROC_PATH")" = "640" ]; then
+    pass "protected mode is 0640"
+else
+    fail "protected mode is $(stat -c %a "$PROTECTED_PROC_PATH"), expected 640"
+fi
+
 echo
 echo "==================================="
 echo "trust/protect tests: $PASS passed, $FAIL failed"

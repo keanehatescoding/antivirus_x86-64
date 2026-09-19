@@ -72,6 +72,15 @@ if ! insmod "$KO"; then
     exit 1
 fi
 
+# Apply the hyprav trusted-reader group to the IOC /proc entries
+# (#143): a bare insmod bypasses the packaged modprobe.d install
+# hook, so without this the entries stay root:root 0640 and the GUI
+# dashboard (which reads via unprivileged `avctl save -`) breaks
+# until someone chgrps by hand. Best-effort - no hyprav group on
+# this machine yet just means stay fail-closed (root-owned 0640),
+# never block the reload itself.
+"$REPO_ROOT/packaging/apply-ioc-group.sh" || true
+
 if [ -s "$STATE_FILE" ]; then
     echo "av-reload.sh: replaying state from $STATE_FILE"
     if ! "$AVCTL" load "$STATE_FILE"; then

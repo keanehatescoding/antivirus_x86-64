@@ -10,6 +10,10 @@
  *   cat  /proc/kernel_av_signatures                  - list entries
  *   echo "add sha256 <hex> <name>" > .../kernel_av_signatures
  *   echo "del sha256 <hex>"        > .../kernel_av_signatures
+ *
+ * Reads require membership in the hyprav trusted-reader group (the
+ * entry is 0640 root:hyprav, see av_sigtable_proc_init() and #143) -
+ * writes additionally require root (CAP_SYS_ADMIN).
  */
 
 #include <linux/ctype.h>
@@ -320,8 +324,21 @@ static const struct proc_ops sig_proc_ops = {
 static struct proc_dir_entry *sig_proc_entry;
 
 int av_sigtable_proc_init(void) {
+  /* 0640, not 0644 (#143): the signature list is fingerprintable IOC
+   * state - any local user could read what is detected (and, by
+   * omission, what is not) via the old world-readable mode. Group
+   * ownership to the hyprav trusted-reader group is applied in
+   * userspace after load - the kernel cannot resolve group names,
+   * only numeric gids (and a gid module_param would need per-machine
+   * rendering by every packager for zero gain over chgrp). See
+   * packaging/apply-ioc-group.sh, run automatically by the
+   * /usr/lib/modprobe.d/hyprav.conf install hook on packaged installs
+   * and by scripts/av-reload.sh in the dev insmod flow. Until that
+   * runs the entry is root:root 0640 - fail-closed for non-root
+   * reads. Writes were already root-only (DAC plus the CAP_SYS_ADMIN
+   * check in sig_proc_write()) and are unchanged. */
   sig_proc_entry =
-      proc_create("kernel_av_signatures", 0644, NULL, &sig_proc_ops);
+      proc_create("kernel_av_signatures", 0640, NULL, &sig_proc_ops);
   if (!sig_proc_entry)
     return -ENOMEM;
   return 0;
