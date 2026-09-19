@@ -1,14 +1,16 @@
 Why this package uses `3.0 (native)` (see `debian/source/format`).
 
-This project is its own upstream: releases are cut from this repository
-(`v*` tags drive `.github/workflows/release.yml`), and the `.deb` is
-built directly from the tagged tree in CI
-(`.github/workflows/build-packages.yml` stamps `debian/changelog` at
-release time). There is no separate upstream tarball, and the version
-string carries no Debian revision suffix that quilt mode would split
-off into a `.orig` / `.debian.tar` pair.
+This project is its own upstream with a single version stream:
+releases are cut from this repository (`v*` tags drive
+`.github/workflows/release.yml`), and the `.deb` is built directly
+from the tagged tree in CI (`.github/workflows/build-packages.yml`
+stamps `debian/changelog` at release time). That is why `native` is
+deliberate.
 
-Switching to `3.0 (quilt)` would therefore require manufacturing a
-`.orig` tarball in CI purely to satisfy the format, with no change in
-what actually ships. `native` is kept deliberately; revisit only if a
-genuinely separate upstream release artifact exists one day.
+Separately, `3.0 (quilt)` would change the source-package layout to
+`.orig.tar.*` plus `.debian.tar.*` archives. dpkg-source can generate
+the `.orig` from the source directory (no pre-existing upstream
+tarball needed), but CI would then have to produce and carry those
+archives on every source build, for no change in what actually ships.
+`native` avoids that overhead; revisit only if a genuinely separate
+upstream release artifact exists one day.
