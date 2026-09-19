@@ -3,7 +3,7 @@ av-y := main.o sigtable.o netlink_chan.o behavior.o
 
 # No ccflags-y hardening here, deliberately: an out-of-tree module built
 # via `make -C $(KDIR) M=$(PWD) modules` inherits the target kernel's own
-# KBUILD_CFLAGS (including whatever CONFIG_CC_STACKPROTECTOR_* /
+# KBUILD_CFLAGS (including whatever CONFIG_STACKPROTECTOR_* /
 # structleak options the distro enabled), so re-adding those flags would
 # only duplicate what the kernel build already passes. Revisit only for
 # a flag the kernel build provably does not supply.
