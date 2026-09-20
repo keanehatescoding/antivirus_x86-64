@@ -78,6 +78,26 @@ cd ../av-gui && make && sudo make install
 av-gui
 ```
 
+### IOC read access: the `hyprav` group
+
+The signatures/trust/protected-path `/proc` entries are `0640
+root:hyprav` — group ownership is applied at module load by the
+packaged `modprobe.d` hook (or by `scripts/av-reload.sh` in the dev
+`insmod` flow, which bypasses modprobe). Your desktop user must be a
+member for the GUI dashboard and unprivileged `avctl save` to read
+them (writes were already root-only and are unchanged):
+
+```bash
+getent group hyprav >/dev/null || sudo groupadd -r hyprav  # packaged installs already do this via sysusers
+sudo usermod -aG hyprav "$USER"                            # then log out and back in
+```
+
+Without membership those reads fail with "permission denied" (see
+[#143](https://github.com/keanehatescoding/antivirus_x86-64/issues/143));
+with a manual `insmod` outside `av-reload.sh`, run the helper once
+after loading - `sudo /usr/lib/hyprav/apply-ioc-group` on a packaged
+install, `sudo packaging/apply-ioc-group.sh` from a source checkout.
+
 See the wiki's **Building and Running**, **avd Daemon**, **avctl CLI**, and
 **av gui** pages for install-path overrides (`PREFIX`/`SYSCONFDIR`/`UNITDIR`/
 `DESTDIR`), the systemd unit's security model, and the Flatpak/AppImage

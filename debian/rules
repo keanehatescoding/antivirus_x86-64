@@ -48,6 +48,20 @@ override_dh_auto_install:
 	$(MAKE) -C userspace/av-gui install \
 		DESTDIR=$(CURDIR)/debian/hyprav-gui PREFIX=/usr
 
+	# #143 trusted-reader group plumbing, all into the base hyprav
+	# package (the group governs GUI/avctl reads; the hook is inert
+	# until av.ko from hyprav-dkms is actually loaded): the sysusers
+	# declaration is handled by dh_installsysusers from
+	# debian/hyprav.sysusers (enabled via the
+	# dh-sequence-installsysusers Build-Depends - it installs the
+	# file AND generates the postinst snippet that runs
+	# systemd-sysusers on install, so the group exists before first
+	# module load even on a fresh install), while the modprobe.d
+	# install hook and the helper it runs have no dh helper and are
+	# installed explicitly.
+	install -D -m644 packaging/hyprav-modprobe.conf $(CURDIR)/debian/hyprav/usr/lib/modprobe.d/hyprav.conf
+	install -D -m755 packaging/apply-ioc-group.sh $(CURDIR)/debian/hyprav/usr/lib/hyprav/apply-ioc-group
+
 # dh_fixperms (standard part of the dh sequence) normalizes every
 # shipped directory back toward 0755 regardless of what
 # override_dh_auto_install set - confirmed on a real Debian 13 box:

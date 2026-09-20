@@ -114,8 +114,10 @@ not a path, must not contain `/`.
 ## Authorization
 
 Gated **per command, not per connection** - matches this codebase's
-existing precedent of world-readable `/proc` state (e.g.
-`/proc/kernel_av_signatures` is `0644`) with writes checked
+existing precedent of group-readable `/proc` state (e.g.
+`/proc/kernel_av_signatures` is `0640 root:hyprav`, with group
+ownership applied at module load - see #143 and
+`packaging/apply-ioc-group.sh`) with writes checked
 separately, rather than two sockets with two different modes. Right
 after `accept()`, `avd` reads the connecting process's credentials via
 `SO_PEERCRED` (kernel-populated at `connect()` time from the actual

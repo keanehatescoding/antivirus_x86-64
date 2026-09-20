@@ -1905,6 +1905,12 @@ static int __init av_init(void) {
     goto err_sigtable;
   }
 
+  /* Deliberately left 0644 while the three IOC entries went 0640
+   * root:hyprav (#143, "include or leave" - leave): this is a single
+   * fail-open/fail-closed flag, not fingerprintable IOC content, and
+   * the GUI policy display plus `avctl policy get` read it
+   * unprivileged. Restricting reads would break those with no
+   * hardening gain - writes stay root-only via DAC, same as before. */
   daemon_policy_proc_entry = proc_create(
       "kernel_av_daemon_policy", 0644, NULL, &daemon_policy_proc_ops);
   if (!daemon_policy_proc_entry) {

@@ -572,6 +572,21 @@ static void save_abort(FILE *out, struct save_dest *d, const char *tmp_path,
     }
 }
 
+/* EACCES hint shared by do_save()'s three IOC opens below: since
+ * #143 the signatures/trust/protected entries are 0640 root:hyprav,
+ * so a non-member user gets EACCES rather than the old world-readable
+ * contents. Must run before any fprintf in the branch - those may
+ * clobber errno, while here it still holds fopen()'s failure. The
+ * policy open has no such hint: daemon_policy stays 0644, so EACCES
+ * there means something else entirely. */
+static void save_eacces_hint(void)
+{
+    if (errno == EACCES)
+        fprintf(stderr, "avctl: permission denied - is your user in the "
+                        "hyprav group? (sudo usermod -aG hyprav $USER, then "
+                        "re-login; see README)\n");
+}
+
 static int do_save(const char *path)
 {
     FILE *out;
@@ -664,6 +679,7 @@ static int do_save(const char *path)
 
     in = fopen(PROC_PATH, "r");
     if (!in) {
+        save_eacces_hint();
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROC_PATH, strerror(errno));
@@ -682,6 +698,7 @@ static int do_save(const char *path)
 
     in = fopen(TRUST_PROC_PATH, "r");
     if (!in) {
+        save_eacces_hint();
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 TRUST_PROC_PATH, strerror(errno));
@@ -700,6 +717,7 @@ static int do_save(const char *path)
 
     in = fopen(PROTECTED_PROC_PATH, "r");
     if (!in) {
+        save_eacces_hint();
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROTECTED_PROC_PATH, strerror(errno));

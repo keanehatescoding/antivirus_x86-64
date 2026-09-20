@@ -156,6 +156,16 @@ make -C userspace/avctl install DESTDIR=%{buildroot} PREFIX=%{_prefix} POLKIT_AC
 # that at runtime for no reason.
 install -dm700 %{buildroot}%{_localstatedir}/lib/av-quarantine
 
+# #143 trusted-reader group plumbing (same set as debian/rules and
+# packaging/arch/PKGBUILD install): sysusers declaration, modprobe.d
+# install hook that chgrps the IOC /proc entries at module load, and
+# the helper it runs. Fixed /usr/lib paths, NOT %{_libdir}
+# (/usr/lib64 here): the modprobe hook hardcodes the helper path, so
+# all three distros share /usr/lib/hyprav unconditionally.
+install -D -m644 packaging/hyprav.sysusers %{buildroot}/usr/lib/sysusers.d/hyprav.conf
+install -D -m644 packaging/hyprav-modprobe.conf %{buildroot}/usr/lib/modprobe.d/hyprav.conf
+install -D -m755 packaging/apply-ioc-group.sh %{buildroot}/usr/lib/hyprav/apply-ioc-group
+
 install -dm755 %{buildroot}%{_usrsrc}/hyprav-av-%{version}
 cp -r av/* %{buildroot}%{_usrsrc}/hyprav-av-%{version}/
 # KDIR override for the same reason as the Arch/Debian packaging:
@@ -183,6 +193,11 @@ make -C userspace/av-gui install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
 %post
 %systemd_post avd.service
+# Create the hyprav trusted-reader group now (#143): the sysusers file
+# above is the declarative record for image builds, while this covers
+# a plain `rpm -i` on a system where no sysusers trigger has run yet.
+# Idempotent - getent passes on upgrade/reinstall when it exists.
+getent group hyprav >/dev/null || groupadd -r hyprav || :
 
 %preun
 %systemd_preun avd.service
@@ -204,6 +219,9 @@ dkms remove -m hyprav-av -v %{version} --all || :
 %{_bindir}/avctl
 %{_unitdir}/avd.service
 %{_datadir}/polkit-1/actions/org.hyprav.avctl.policy
+/usr/lib/sysusers.d/hyprav.conf
+/usr/lib/modprobe.d/hyprav.conf
+/usr/lib/hyprav/apply-ioc-group
 %dir %{_sysconfdir}/hyprav
 %dir %{_sysconfdir}/hyprav/rules
 %config(noreplace) %{_sysconfdir}/hyprav/rules/*.yar
