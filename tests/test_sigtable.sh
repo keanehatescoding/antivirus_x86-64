@@ -126,9 +126,14 @@ section "unprivileged users cannot read the entry (#143)"
 # Pins the actual security property rather than just the metadata:
 # a mode regression to 0644 would still show the right group above
 # while leaking contents. Guarded - without runuser(1) or a nobody
-# user there is no unprivileged identity to probe with.
+# user there is no unprivileged identity to probe with - and the
+# probe first confirms nobody is not itself a hyprav member here: on
+# a host where it is, the read would rightly succeed and the probe
+# would false-fail despite correct permissions.
 if [ "$(id -u)" -eq 0 ] && command -v runuser >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-    if runuser -u nobody -- cat "$PROC_PATH" >/dev/null 2>&1; then
+    if id -nG nobody 2>/dev/null | tr ' ' '\n' | grep -qx hyprav; then
+        echo "  SKIP: nobody is a hyprav member on this machine - denial not probeable"
+    elif runuser -u nobody -- cat "$PROC_PATH" >/dev/null 2>&1; then
         fail "unprivileged read of $PROC_PATH succeeded (expected EACCES)"
     else
         pass "unprivileged read correctly denied"
