@@ -15,6 +15,7 @@ Maintainer: keanehatescoding <159132270+keanehatescoding@users.noreply.github.co
 # build before av-gui ever gets installed - only worked on the Debian
 # 13 test box because those happened to already be present there.
 Build-Depends: debhelper-compat (= 13),
+               dh-sequence-installsysusers,
                pkg-config,
                libnl-genl-3-dev,
                libyara-dev,

@@ -55,6 +55,12 @@ echo "### test_sigtable.sh (avctl/proc protocol) ###"
 # test_detection.sh unloads the module as part of its own cleanup, so
 # reload it here for the sigtable protocol tests.
 insmod "$REPO_ROOT/av/av.ko" 2>/dev/null || true
+# Apply the hyprav trusted-reader group to the fresh IOC entries
+# (#143): a bare insmod bypasses the packaged modprobe.d hook, which
+# would leave the group assertions in the protocol tests below with
+# nothing to assert. Best-effort - no hyprav group on this machine
+# just means those assertions skip (the mode checks still run).
+"$REPO_ROOT/packaging/apply-ioc-group.sh" || true
 "$REPO_ROOT/tests/test_sigtable.sh" || FAIL=1
 echo
 echo "### test_trust_protect.sh (avctl trust/protect protocol) ###"

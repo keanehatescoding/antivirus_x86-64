@@ -51,12 +51,14 @@ override_dh_auto_install:
 	# #143 trusted-reader group plumbing, all into the base hyprav
 	# package (the group governs GUI/avctl reads; the hook is inert
 	# until av.ko from hyprav-dkms is actually loaded): the sysusers
-	# declaration (applied by systemd-sysusers on install), the
-	# modprobe.d install hook that chgrps the IOC /proc entries at
-	# module load, and the helper it runs. Explicit installs rather
-	# than dh_installsysusers, so no specific debhelper magic is
-	# relied upon.
-	install -D -m644 packaging/hyprav.sysusers $(CURDIR)/debian/hyprav/usr/lib/sysusers.d/hyprav.conf
+	# declaration is handled by dh_installsysusers from
+	# debian/hyprav.sysusers (enabled via the
+	# dh-sequence-installsysusers Build-Depends - it installs the
+	# file AND generates the postinst snippet that runs
+	# systemd-sysusers on install, so the group exists before first
+	# module load even on a fresh install), while the modprobe.d
+	# install hook and the helper it runs have no dh helper and are
+	# installed explicitly.
 	install -D -m644 packaging/hyprav-modprobe.conf $(CURDIR)/debian/hyprav/usr/lib/modprobe.d/hyprav.conf
 	install -D -m755 packaging/apply-ioc-group.sh $(CURDIR)/debian/hyprav/usr/lib/hyprav/apply-ioc-group
 

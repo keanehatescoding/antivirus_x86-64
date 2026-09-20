@@ -1,5 +1,7 @@
 # systemd-sysusers declaration for the hyprav trusted-reader group
-# (shipped as packaging/hyprav.sysusers, see #143).
+# (shipped as packaging/hyprav.sysusers, see #143). Debian consumes
+# the twin copy at debian/hyprav.sysusers via dh_installsysusers -
+# both declare the same single line, keep them in sync.
 #
 # The three IOC /proc entries are 0640; membership in this group is
 # what lets a non-root desktop user read them via the GUI dashboard

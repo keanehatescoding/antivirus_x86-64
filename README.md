@@ -94,8 +94,9 @@ sudo usermod -aG hyprav "$USER"                            # then log out and ba
 
 Without membership those reads fail with "permission denied" (see
 [#143](https://github.com/keanehatescoding/antivirus_x86-64/issues/143));
-with a manual `insmod` outside `av-reload.sh`, run
-`sudo packaging/apply-ioc-group.sh` once after loading.
+with a manual `insmod` outside `av-reload.sh`, run the helper once
+after loading - `sudo /usr/lib/hyprav/apply-ioc-group` on a packaged
+install, `sudo packaging/apply-ioc-group.sh` from a source checkout.
 
 See the wiki's **Building and Running**, **avd Daemon**, **avctl CLI**, and
 **av gui** pages for install-path overrides (`PREFIX`/`SYSCONFDIR`/`UNITDIR`/

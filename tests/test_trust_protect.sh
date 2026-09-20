@@ -173,6 +173,46 @@ else
     fail "protected mode is $(stat -c %a "$PROTECTED_PROC_PATH"), expected 640"
 fi
 
+section "proc entries are group-owned by hyprav (#143)"
+# No hyprav group on this machine (minimal dev VM before groupadd) is
+# a legitimate state - run_all.sh applies the helper best-effort, but
+# a bare manual insmod skips it. Skip rather than fail; the mode
+# checks above still pin the read restriction either way.
+if getent group hyprav >/dev/null; then
+    if [ "$(stat -c %G "$TRUST_PROC_PATH")" = "hyprav" ]; then
+        pass "trust group is hyprav"
+    else
+        fail "trust group is $(stat -c %G "$TRUST_PROC_PATH"), expected hyprav (run the modprobe hook or apply-ioc-group.sh)"
+    fi
+    if [ "$(stat -c %G "$PROTECTED_PROC_PATH")" = "hyprav" ]; then
+        pass "protected group is hyprav"
+    else
+        fail "protected group is $(stat -c %G "$PROTECTED_PROC_PATH"), expected hyprav (run the modprobe hook or apply-ioc-group.sh)"
+    fi
+else
+    echo "  SKIP: no hyprav group on this machine"
+fi
+
+section "unprivileged users cannot read the entries (#143)"
+# Pins the actual security property rather than just the metadata:
+# a mode regression to 0644 would still show the right group above
+# while leaking contents. Guarded - without runuser(1) or a nobody
+# user there is no unprivileged identity to probe with.
+if [ "$(id -u)" -eq 0 ] && command -v runuser >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+    if runuser -u nobody -- cat "$TRUST_PROC_PATH" >/dev/null 2>&1; then
+        fail "unprivileged read of $TRUST_PROC_PATH succeeded (expected EACCES)"
+    else
+        pass "unprivileged trust read correctly denied"
+    fi
+    if runuser -u nobody -- cat "$PROTECTED_PROC_PATH" >/dev/null 2>&1; then
+        fail "unprivileged read of $PROTECTED_PROC_PATH succeeded (expected EACCES)"
+    else
+        pass "unprivileged protected read correctly denied"
+    fi
+else
+    echo "  SKIP: no runuser/nobody to probe unprivileged reads"
+fi
+
 echo
 echo "==================================="
 echo "trust/protect tests: $PASS passed, $FAIL failed"
