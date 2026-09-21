@@ -222,11 +222,34 @@ static bool path_is_rapid_write_noise(const char *path) {
 
 /* Substring match against these flags the corresponding heuristic.
  * Deliberately simple (no regex/glob) to keep this fully atomic-safe
- * if ever needed in a tighter path later, and easy to reason about. */
+ * if ever needed in a tighter path later, and easy to reason about.
+ *
+ * Identity credentials and their direct analogues live here: password
+ * databases, group/sudo policy, user and host SSH keys, GnuPG private
+ * keys, and long-lived cloud/cluster credentials. The trailing-slash
+ * entries ("/.ssh/", "/.gnupg/", ...) are deliberately bare substrings
+ * so they match under any home directory. Entries WITHOUT a trailing
+ * slash rely on path_has_bounded_substring() below, which requires a
+ * '/' or end-of-string right after the match - so the shadow(5) backup
+ * copies ("/etc/shadow-", "/etc/passwd-", "/etc/gshadow-") and
+ * "/etc/gshadow" need their own explicit entries: the base needles
+ * alone would NOT match them (a trailing '-' is neither '/' nor
+ * end-of-string). Same reason "/etc/sudoers" does not cover
+ * "/etc/sudoers.d/" - that directory wants prefix matching and lives
+ * in sensitive_path_prefixes[] instead. */
 static const char *const sensitive_path_substrings[] = {
     "/etc/passwd",
+    "/etc/passwd-",
     "/etc/shadow",
+    "/etc/shadow-",
+    "/etc/gshadow",
+    "/etc/gshadow-",
+    "/etc/sudoers",
     "/.ssh/",
+    "/.gnupg/",
+    "/.aws/",
+    "/.kube/",
+    "/.config/gcloud/",
 };
 #define NUM_SENSITIVE_SUBSTRINGS ARRAY_SIZE(sensitive_path_substrings)
 
@@ -238,9 +261,16 @@ static const char *const sensitive_path_substrings[] = {
  * /etc/passwd, /etc/shadow, and /.ssh/ - specific enough that a
  * substring match rarely fires outside the real path - "boot" alone
  * needed the same anchored-prefix treatment path_is_pseudo_fs() above
- * already uses for excluded_path_prefixes[]. */
+ * already uses for excluded_path_prefixes[]. "/etc/sudoers.d/" and
+ * "/etc/ssh/" join this list for the same reason: the former must not
+ * depend on the "/etc/sudoers" substring (whose bounded match rejects
+ * the '.' in "sudoers.d"), and the latter is host-key material at a
+ * fixed absolute location, distinct from the per-user "/.ssh/"
+ * substring entry. */
 static const char *const sensitive_path_prefixes[] = {
     "/boot/",
+    "/etc/sudoers.d/",
+    "/etc/ssh/",
 };
 #define NUM_SENSITIVE_PREFIXES ARRAY_SIZE(sensitive_path_prefixes)
 
