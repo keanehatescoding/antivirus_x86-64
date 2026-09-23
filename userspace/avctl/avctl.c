@@ -371,9 +371,10 @@ struct save_dest {
  * directory owned by our euid or root, with no group/other write
  * access unless the sticky bit is set (in a sticky directory only an
  * entry's owner, the directory owner, or root can rename/remove
- * entries). Returns 0 if trusted, -1 (with an error already printed)
+ * entries). `op` is "save" or "load" for the refusal messages.
+ * Returns 0 if trusted, -1 (with an error already printed)
  * otherwise. */
-static int save_dir_trusted_fd(int fd, const char *path)
+static int save_dir_trusted_fd(int fd, const char *path, const char *op)
 {
     struct stat st;
     uid_t euid = geteuid();
@@ -385,20 +386,20 @@ static int save_dir_trusted_fd(int fd, const char *path)
     }
     if (!S_ISDIR(st.st_mode)) {
         fprintf(stderr,
-                "avctl: parent of %s is not a directory - refusing to save there\n",
-                path);
+                "avctl: parent of %s is not a directory - refusing to %s there\n",
+                path, op);
         return -1;
     }
     if (st.st_uid != euid && st.st_uid != 0) {
         fprintf(stderr,
-                "avctl: parent directory of %s is owned by uid %d - refusing to save there\n",
-                path, (int)st.st_uid);
+                "avctl: parent directory of %s is owned by uid %d - refusing to %s there\n",
+                path, (int)st.st_uid, op);
         return -1;
     }
     if ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)) {
         fprintf(stderr,
-                "avctl: parent directory of %s is writable by other users without the sticky bit - refusing to save there\n",
-                path);
+                "avctl: parent directory of %s is writable by other users without the sticky bit - refusing to %s there\n",
+                path, op);
         return -1;
     }
     return 0;
@@ -440,9 +441,11 @@ static int save_tmp_lstat(int parent_fd, const char *tmpbase, struct stat *st)
  * check-then-use gap for intermediate components at all. ".."
  * components are safe to pass through: under pinning they resolve to
  * the real parent without ever traversing a symlink (none is ever
- * followed). Fills d (parent_fd + base + tmpbase) and returns 0,
+ * followed). `op` is "save" or "load" for the refusal messages.
+ * Fills d (parent_fd + base + tmpbase) and returns 0,
  * or -1 (error printed, nothing held) on any failure. */
-static int pin_save_parent(const char *path, struct save_dest *d)
+static int pin_save_parent(const char *path, struct save_dest *d,
+                           const char *op)
 {
     const char *slash = strrchr(path, '/');
     const char *parent_part;
@@ -479,7 +482,7 @@ static int pin_save_parent(const char *path, struct save_dest *d)
                 path, strerror(errno));
         return -1;
     }
-    if (save_dir_trusted_fd(cur, path)) {
+    if (save_dir_trusted_fd(cur, path, op)) {
         close(cur);
         return -1;
     }
@@ -518,8 +521,8 @@ static int pin_save_parent(const char *path, struct save_dest *d)
         if (next < 0) {
             if (errno == ELOOP || errno == ENOTDIR)
                 fprintf(stderr,
-                        "avctl: parent directory of %s goes through a symlink - refusing to save there\n",
-                        path);
+                        "avctl: parent directory of %s goes through a symlink - refusing to %s there\n",
+                        path, op);
             else
                 fprintf(stderr,
                         "avctl: cannot open parent directory of %s: %s\n",
@@ -527,7 +530,7 @@ static int pin_save_parent(const char *path, struct save_dest *d)
             close(cur);
             return -1;
         }
-        if (save_dir_trusted_fd(next, path)) {
+        if (save_dir_trusted_fd(next, path, op)) {
             close(next);
             close(cur);
             return -1;
@@ -632,7 +635,7 @@ static int do_save(const char *path)
          * symlinked or untrusted ancestors and hands back a held-open
          * fd, so the create below cannot be redirected no matter what
          * happens to the namespace afterwards. */
-        if (pin_save_parent(path, &dest))
+        if (pin_save_parent(path, &dest, "save"))
             return 1;
 
         /* O_CREAT|O_EXCL|O_NOFOLLOW through the pinned parent, not
@@ -928,12 +931,87 @@ static int validate_sig_or_trust_fields(const char *kind, const char *rest)
 
 static int do_load(const char *path)
 {
-    FILE *f = fopen(path, "r");
+    struct save_dest src;
+    int fd;
+    FILE *f;
     char line[PATH_MAX + 16];
     int loaded = 0, skipped = 0, errors = 0;
 
+    /* Same trust model as do_save()'s destination, mirrored: every
+     * line below is replayed into kernel state as root, so the file
+     * must be proven root-written before a single line is parsed.
+     * pin_save_parent() refuses symlinked or attacker-writable
+     * ancestors, openat(O_NOFOLLOW) refuses a symlinked file itself,
+     * and the fstat() below refuses files root didn't write - all
+     * through held-open fds, so a namespace swap after any check
+     * cannot redirect the stream fdopen() reads. */
+    if (pin_save_parent(path, &src, "load"))
+        return 1;
+    fd = openat(src.parent_fd, src.base, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        if (errno == ELOOP || errno == ENOTDIR)
+            fprintf(stderr,
+                    "avctl: %s is a symlink - refusing to load it\n",
+                    path);
+        else
+            fprintf(stderr, "avctl: could not open %s: %s\n",
+                    path, strerror(errno));
+        close(src.parent_fd);
+        return 1;
+    }
+    close(src.parent_fd);
+    /* Provenance of the file itself: it must be a regular file owned
+     * by our euid or root, with no group/other write access and a
+     * single link (a second hardlink would let someone else hold the
+     * same content under a different name). Checked with fstat() on
+     * the already-open fd, so there is no check-then-use gap. Accepts
+     * euid-owned files - not just root-owned ones - so the check stays
+     * testable when avctl itself runs unprivileged (the /proc writes
+     * then fail on their own); under pkexec/sudo euid is root and only
+     * root-owned files pass. */
+    {
+        struct stat load_st;
+        uid_t load_euid = geteuid();
+
+        if (fstat(fd, &load_st) != 0) {
+            fprintf(stderr, "avctl: cannot stat %s: %s\n",
+                    path, strerror(errno));
+            close(fd);
+            return 1;
+        }
+        if (!S_ISREG(load_st.st_mode)) {
+            fprintf(stderr,
+                    "avctl: %s is not a regular file - refusing to load it\n",
+                    path);
+            close(fd);
+            return 1;
+        }
+        if (load_st.st_uid != load_euid && load_st.st_uid != 0) {
+            fprintf(stderr,
+                    "avctl: %s is owned by uid %d - refusing to load it\n",
+                    path, (int)load_st.st_uid);
+            close(fd);
+            return 1;
+        }
+        if (load_st.st_mode & (S_IWGRP | S_IWOTH)) {
+            fprintf(stderr,
+                    "avctl: %s is writable by other users - refusing to load it\n",
+                    path);
+            close(fd);
+            return 1;
+        }
+        if (load_st.st_nlink != 1) {
+            fprintf(stderr,
+                    "avctl: %s has multiple hardlinks - refusing to load it\n",
+                    path);
+            close(fd);
+            return 1;
+        }
+    }
+    f = fdopen(fd, "r");
     if (!f) {
         fprintf(stderr, "avctl: could not open %s: %s\n", path, strerror(errno));
+        close(fd);
         return 1;
     }
 
