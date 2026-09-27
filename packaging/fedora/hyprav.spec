@@ -68,7 +68,7 @@ Summary:        Kernel-level Linux antivirus (kprobe execve/file monitor + YARA/
 # releases (pre F38-ish) used the short name "GPLv3" instead - adjust
 # if targeting one of those.
 License:        GPL-3.0-only
-URL:            https://github.com/keanehatescoding/antivirus
+URL:            https://github.com/keanehatescoding/antivirus_x86-64
 Source0:        %{url}/archive/%{gitcommit}/antivirus-%{gitcommit}.tar.gz
 
 BuildRequires:  gcc
