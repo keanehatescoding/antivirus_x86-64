@@ -288,8 +288,8 @@ jobs:
           GITCOMMIT="$(git rev-parse --short=7 HEAD)"
           echo "GITCOMMIT=$GITCOMMIT" >> "$GITHUB_ENV"
           mkdir -p rpmbuild-sources
-          git archive --prefix="antivirus-$GITCOMMIT/" HEAD \
-            -o "rpmbuild-sources/antivirus-$GITCOMMIT.tar.gz"
+          git archive --prefix="antivirus_x86-64-$GITCOMMIT/" HEAD \
+            -o "rpmbuild-sources/antivirus_x86-64-$GITCOMMIT.tar.gz"
 
       - name: Install BuildRequires (dnf builddep)
         run: |
