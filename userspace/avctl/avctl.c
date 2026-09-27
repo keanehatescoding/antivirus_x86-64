@@ -947,7 +947,19 @@ static int do_load(const char *path)
      * cannot redirect the stream fdopen() reads. */
     if (pin_save_parent(path, &src, "load"))
         return 1;
-    fd = openat(src.parent_fd, src.base, O_RDONLY | O_NOFOLLOW);
+    /* Non-blocking open: if src.base names a FIFO, a plain blocking
+     * openat() would hang until a writer appears - and the S_ISREG
+     * rejection below would never run. In a sticky world-writable
+     * parent such as /tmp (which the ancestor walk accepts) any local
+     * user can plant that FIFO, turning a root `avctl load` into an
+     * indefinite hang; a device node would likewise run its driver's
+     * open handler before the type check. O_NOCTTY keeps the file from
+     * becoming our controlling terminal, O_CLOEXEC keeps the fd from
+     * leaking across exec. O_NONBLOCK is cleared again after the
+     * S_ISREG check below proves the fd is a regular file, so the
+     * read stream behaves normally. */
+    fd = openat(src.parent_fd, src.base,
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ELOOP || errno == ENOTDIR)
             fprintf(stderr,
@@ -1004,6 +1016,24 @@ static int do_load(const char *path)
             fprintf(stderr,
                     "avctl: %s has multiple hardlinks - refusing to load it\n",
                     path);
+            close(fd);
+            return 1;
+        }
+    }
+    /* Proven regular file above, so blocking reads are safe again:
+     * drop the O_NONBLOCK the open needed to get past FIFOs/devices. */
+    {
+        int flags = fcntl(fd, F_GETFL, 0);
+
+        if (flags < 0) {
+            fprintf(stderr, "avctl: fcntl(F_GETFL) failed: %s\n",
+                    strerror(errno));
+            close(fd);
+            return 1;
+        }
+        if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+            fprintf(stderr, "avctl: fcntl(O_NONBLOCK) failed: %s\n",
+                    strerror(errno));
             close(fd);
             return 1;
         }
