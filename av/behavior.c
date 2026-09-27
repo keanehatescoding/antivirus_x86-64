@@ -57,6 +57,7 @@
 #include <linux/workqueue.h>
 
 #include "behavior.h"
+#include "logfmt.h"
 
 #define BEHAVIOR_BITS 10          /* 1024 buckets */
 /* Hard cap on live behavior_table entries. Each entry is a
@@ -1300,14 +1301,17 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
                              const char *reason) {
   struct task_struct *task;
   char *protected_path;
-  /* PID-1 guard before any allocation: never spend a PATH_MAX kmalloc
-   * on a target that is unconditionally suppressed. */
+  /* av_log_escape() for path/protected_exe, not %s or %*pE (#166) -
+   * same log-injection reasoning as av_kill() in main.c, see its
+   * comment and logfmt.c. */
+  char *esc_path = av_log_escape(path, GFP_KERNEL);
+  /* PID-1 guard before the PATH_MAX allocation: never spend it on a
+   * target that is unconditionally suppressed. */
   if (pid_nr(target_pid) == 1) {
-    /* %*pE for path/protected_exe, not %s (#166) - same log-injection
-     * reasoning as av_kill() in main.c, see its comment. */
     pr_alert("kernel-av: event=suppressed action=none type=behavioral "
-             "path=\"%*pE\" reason=\"%s\" pid=1\n",
-             (int)strnlen(path, PATH_MAX), path, reason);
+             "path=\"%s\" reason=\"%s\" pid=1\n",
+             av_log_str(esc_path), reason);
+    kfree(esc_path);
     return;
   }
   /* PATH_MAX (4096) is far too large for the kernel stack (typically
@@ -1320,12 +1324,16 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
   protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
   if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
+    char *esc_exe =
+        protected_path ? av_log_escape(protected_path, GFP_KERNEL) : NULL;
+
     pr_alert("kernel-av: event=suppressed action=none type=behavioral "
-             "path=\"%*pE\" reason=\"%s\" pid=%d protected_exe=\"%*pE\"\n",
-             (int)strnlen(path, PATH_MAX), path, reason, pid_nr(target_pid),
-             (int)strnlen(protected_path ? protected_path : "?", PATH_MAX),
-             protected_path ? protected_path : "?");
+             "path=\"%s\" reason=\"%s\" pid=%d protected_exe=\"%s\"\n",
+             av_log_str(esc_path), reason, pid_nr(target_pid),
+             av_log_str(esc_exe));
+    kfree(esc_exe);
     kfree(protected_path);
+    kfree(esc_path);
     return;
   }
   kfree(protected_path);
@@ -1334,12 +1342,12 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
   task = pid_task(target_pid, PIDTYPE_PID);
   if (task) {
     pr_alert("kernel-av: event=detected action=kill type=behavioral "
-             "path=\"%*pE\" reason=\"%s\" pid=%d\n",
-             (int)strnlen(path, PATH_MAX), path, reason,
-             pid_nr(target_pid));
+             "path=\"%s\" reason=\"%s\" pid=%d\n",
+             av_log_str(esc_path), reason, pid_nr(target_pid));
     send_sig(SIGKILL, task, 0);
   }
   rcu_read_unlock();
+  kfree(esc_path);
 }
 
 /* Periodic sweep: reclaims behavior_table entries for processes that
