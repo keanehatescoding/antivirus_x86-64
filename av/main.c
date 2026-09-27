@@ -936,9 +936,15 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
   /* PID 1 checked before any allocation: killing init can panic the
    * kernel, so bail before spending a PATH_MAX kmalloc on it. */
   if (pid_nr(target_pid) == 1) {
+    /* path/protected_exe go through %*pE, not %s, in every log line
+     * here (#166): a filename can contain quotes or newlines, which
+     * would otherwise forge extra fields or whole log lines in these
+     * quoted key=value records. Ordinary paths render identically, so
+     * nothing greppable changes for them. Same idiom as the hash-error
+     * line in av_work_fn(). */
     pr_alert("kernel-av: event=suppressed action=none type=%s "
-             "path=\"%s\" reason=\"%s\" pid=1\n",
-             type, path, reason);
+             "path=\"%*pE\" reason=\"%s\" pid=1\n",
+             type, (int)strnlen(path, PATH_MAX), path, reason);
     return;
   }
   /* PATH_MAX (4096) is far too large for the kernel stack - heap-
@@ -954,8 +960,10 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
    * treatment as the PID-1 guard above. */
   if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
     pr_alert("kernel-av: event=suppressed action=none type=%s "
-             "path=\"%s\" reason=\"%s\" pid=%d protected_exe=\"%s\"\n",
-             type, path, reason, pid_nr(target_pid),
+             "path=\"%*pE\" reason=\"%s\" pid=%d protected_exe=\"%*pE\"\n",
+             type, (int)strnlen(path, PATH_MAX), path, reason,
+             pid_nr(target_pid),
+             (int)strnlen(protected_path ? protected_path : "?", PATH_MAX),
              protected_path ? protected_path : "?");
     kfree(protected_path);
     return;
@@ -977,13 +985,15 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
     if (ident) {
       pr_alert(
           "kernel-av: event=detected action=kill type=%s "
-          "path=\"%s\" reason=\"%s\" pid=%d dev=%u:%u ino=%lu size=%lld\n",
-          type, path, reason, pid_nr(target_pid), MAJOR(ident->dev),
-          MINOR(ident->dev), ident->ino, (long long)ident->size);
+          "path=\"%*pE\" reason=\"%s\" pid=%d dev=%u:%u ino=%lu size=%lld\n",
+          type, (int)strnlen(path, PATH_MAX), path, reason,
+          pid_nr(target_pid), MAJOR(ident->dev), MINOR(ident->dev), ident->ino,
+          (long long)ident->size);
     } else {
       pr_alert("kernel-av: event=detected action=kill type=%s "
-               "path=\"%s\" reason=\"%s\" pid=%d\n",
-               type, path, reason, pid_nr(target_pid));
+               "path=\"%*pE\" reason=\"%s\" pid=%d\n",
+               type, (int)strnlen(path, PATH_MAX), path, reason,
+               pid_nr(target_pid));
     }
     send_sig(SIGKILL, task, 0);
   }
@@ -1115,9 +1125,10 @@ static void av_work_fn(struct work_struct *w) {
        * keeps it visible at its current pr_info level while
        * capping it to the kernel's default rate limit
        * (10 msgs/5s) instead of one line per exec. */
-      pr_info_ratelimited("kernel-av: event=clean type=daemon path=\"%s\" "
+      pr_info_ratelimited("kernel-av: event=clean type=daemon path=\"%*pE\" "
                           "pid=%d md5=%s sha1=%s sha256=%s dev=%u:%u ino=%lu\n",
-                          abs_path, pid_nr(aw->target_pid), digest.md5,
+                          (int)strnlen(abs_path, PATH_MAX), abs_path,
+                          pid_nr(aw->target_pid), digest.md5,
                           digest.sha1, digest.sha256, MAJOR(ident.dev),
                           MINOR(ident.dev), ident.ino);
     } else if (aw->fail_closed) {
@@ -1139,9 +1150,10 @@ static void av_work_fn(struct work_struct *w) {
        * function), but log distinctly so this is visible/greppable
        * separately from a genuine daemon-confirmed clean verdict.
        * Same pr_info_ratelimited reasoning as above. */
-      pr_info_ratelimited("kernel-av: event=clean type=fail-open path=\"%s\" "
+      pr_info_ratelimited("kernel-av: event=clean type=fail-open path=\"%*pE\" "
                           "pid=%d md5=%s sha1=%s sha256=%s err=%d\n",
-                          abs_path, pid_nr(aw->target_pid), digest.md5,
+                          (int)strnlen(abs_path, PATH_MAX), abs_path,
+                          pid_nr(aw->target_pid), digest.md5,
                           digest.sha1, digest.sha256, nl_ret);
     }
   }

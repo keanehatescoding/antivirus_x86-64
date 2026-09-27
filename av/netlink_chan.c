@@ -363,7 +363,12 @@ err_free_skb:
     nlmsg_free(skb);
 err_remove_pending:
     spin_lock(&pending_lock);
-    list_del(&p->list);
+    /* list_del_init, not list_del: the timeout path re-inspects this
+     * node via list_empty() under the same lock, and after a bare
+     * list_del() (next/prev left as LIST_POISON) that check returns
+     * false, inviting a second list_del on a poisoned node. Same
+     * defensive pattern as the timeout path itself above. */
+    list_del_init(&p->list);
     spin_unlock(&pending_lock);
     kfree(p);
     return ret;
@@ -414,7 +419,14 @@ void av_netlink_exit(void)
      * fire in normal operation. */
     spin_lock(&pending_lock);
     list_for_each_entry_safe(p, tmp, &pending_list, list) {
-        list_del(&p->list);
+        /* list_del_init, not list_del: a waiter racing us at its
+         * timeout boundary checks list_empty() on this same node
+         * under this lock - a poisoned (merely list_del'd) node reads
+         * as non-empty and would get a second list_del on poisoned
+         * pointers. An emptied-to-self-loop node correctly reports
+         * "already dequeued", sending the waiter down its
+         * wait_for_completion() path for the complete() below. */
+        list_del_init(&p->list);
         complete(&p->done);
     }
     spin_unlock(&pending_lock);

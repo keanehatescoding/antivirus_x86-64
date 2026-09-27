@@ -33,6 +33,7 @@
  */
 
 #include <linux/capability.h>
+#include <linux/ctype.h>
 #include <linux/dcache.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
@@ -52,6 +53,7 @@
 #include <linux/string.h>
 #include <linux/stringhash.h>
 #include <linux/uaccess.h>
+#include <linux/user_namespace.h>
 #include <linux/workqueue.h>
 
 #include "behavior.h"
@@ -454,9 +456,19 @@ int av_behavior_trust_add(const char *sha256_hex, const char *name) {
   struct av_trust_entry *existing = NULL;
   struct av_trust_entry *e;
   char lower_hex[SHA256_HEX_LEN + 1];
+  size_t i;
 
   if (strlen(sha256_hex) != SHA256_HEX_LEN)
     return -EINVAL;
+
+  /* Length alone isn't enough: a non-hex 64-char string would be
+   * canonicalized by hex_tolower() below and stored, but could never
+   * match a real SHA-256 - same class #44/#54 closed for the
+   * signature table (av_sigtable_add() validates [0-9a-f]+), mirrored
+   * here for the trust table. */
+  for (i = 0; i < SHA256_HEX_LEN; i++)
+    if (!isxdigit(sha256_hex[i]))
+      return -EINVAL;
 
   strscpy(lower_hex, sha256_hex, sizeof(lower_hex));
   hex_tolower(lower_hex); /* canonicalize before hashing - see hex_key() */
@@ -548,8 +560,15 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf, size
    * UID actually holds - any root process, even one that dropped
    * CAP_SYS_ADMIN, could otherwise mutate the trust list. The
    * netlink channel gates the equivalent operation behind
-   * GENL_ADMIN_PERM; this proc handler needs the same bar. */
-  if (!capable(CAP_SYS_ADMIN))
+   * GENL_ADMIN_PERM; this proc handler needs the same bar.
+   *
+   * Checked against the OPENER's credentials (file->f_cred, captured
+   * at open), not the writer's current ones: an fd opened by an
+   * unprivileged process must stay unusable for privileged writes even
+   * if the writer has since gained privilege (e.g. an open fd
+   * inherited across a setuid exec), where a write-time capable()
+   * would wrongly pass. */
+  if (!file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN))
     return -EPERM;
 
   /* Reject anything but the first write to a freshly-opened fd - same
@@ -602,10 +621,19 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf, size
     return -EINVAL;
 
   if (!strcasecmp(cmd, "add")) {
+    int ret;
+
     if (n < 3)
       return -EINVAL;
-    if (av_behavior_trust_add(hex, name))
-      return -EINVAL;
+    /* Propagate the real error - specifically -EEXIST for a duplicate
+     * add - rather than flattening every failure to -EINVAL, same
+     * reasoning as sig_proc_write()'s identical fix in sigtable.c:
+     * avctl's load path keys its "already present, skipping" branch on
+     * -EEXIST, and genuine -ENOMEM should not look like malformed
+     * input. */
+    ret = av_behavior_trust_add(hex, name);
+    if (ret)
+      return ret;
   } else if (!strcasecmp(cmd, "del")) {
     /* cppcheck-suppress knownConditionTrueFalse
      * False positive: cppcheck can't expand hash_for_each_possible()
@@ -877,8 +905,9 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, 
   ssize_t ret;
 
   /* Same DAC-vs-capability gap as trust_proc_write() above - see its
-   * comment. */
-  if (!capable(CAP_SYS_ADMIN))
+   * comment. Checked against the opener's credentials (file->f_cred)
+   * for the same inherited-fd reason. */
+  if (!file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN))
     return -EPERM;
 
   /* Reject anything but the first write to a freshly-opened fd - a
@@ -1120,11 +1149,11 @@ static bool evict_lru_entry(void) {
   return true;
 }
 
-/* Finds or creates the entry for `pid`. Always called under
- * behavior_lock. Returns NULL only on allocation failure (kzalloc, or
- * the table was somehow at capacity with nothing evictable - see
- * evict_lru_entry()'s "can't happen in practice" note). */
-static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
+/* Read-only lookup for `pid`: returns the existing entry or NULL,
+ * never allocating or evicting. The create half lives in
+ * get_or_create_entry() below, which reuses this for its hit path.
+ * Always called under behavior_lock. */
+static struct av_behavior_entry *find_entry(pid_t pid) {
   /* Initialized to NULL only to satisfy static analyzers that can't
    * expand hash_for_each_possible() (a nested kernel macro requiring
    * full kernel headers to resolve) - the macro itself always
@@ -1139,6 +1168,18 @@ static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
       return e;
     }
   }
+  return NULL;
+}
+
+/* Finds or creates the entry for `pid`. Always called under
+ * behavior_lock. Returns NULL only on allocation failure (kzalloc, or
+ * the table was somehow at capacity with nothing evictable - see
+ * evict_lru_entry()'s "can't happen in practice" note). */
+static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
+  struct av_behavior_entry *e = find_entry(pid);
+
+  if (e)
+    return e;
 
   if (behavior_table_count >= MAX_BEHAVIOR_ENTRIES) {
     /* At capacity - kick GC to run as soon as possible (instead of
@@ -1262,9 +1303,11 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
   /* PID-1 guard before any allocation: never spend a PATH_MAX kmalloc
    * on a target that is unconditionally suppressed. */
   if (pid_nr(target_pid) == 1) {
+    /* %*pE for path/protected_exe, not %s (#166) - same log-injection
+     * reasoning as av_kill() in main.c, see its comment. */
     pr_alert("kernel-av: event=suppressed action=none type=behavioral "
-             "path=\"%s\" reason=\"%s\" pid=1\n",
-             path, reason);
+             "path=\"%*pE\" reason=\"%s\" pid=1\n",
+             (int)strnlen(path, PATH_MAX), path, reason);
     return;
   }
   /* PATH_MAX (4096) is far too large for the kernel stack (typically
@@ -1278,8 +1321,9 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
 
   if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
     pr_alert("kernel-av: event=suppressed action=none type=behavioral "
-             "path=\"%s\" reason=\"%s\" pid=%d protected_exe=\"%s\"\n",
-             path, reason, pid_nr(target_pid),
+             "path=\"%*pE\" reason=\"%s\" pid=%d protected_exe=\"%*pE\"\n",
+             (int)strnlen(path, PATH_MAX), path, reason, pid_nr(target_pid),
+             (int)strnlen(protected_path ? protected_path : "?", PATH_MAX),
              protected_path ? protected_path : "?");
     kfree(protected_path);
     return;
@@ -1290,8 +1334,9 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
   task = pid_task(target_pid, PIDTYPE_PID);
   if (task) {
     pr_alert("kernel-av: event=detected action=kill type=behavioral "
-             "path=\"%s\" reason=\"%s\" pid=%d\n",
-             path, reason, pid_nr(target_pid));
+             "path=\"%*pE\" reason=\"%s\" pid=%d\n",
+             (int)strnlen(path, PATH_MAX), path, reason,
+             pid_nr(target_pid));
     send_sig(SIGKILL, task, 0);
   }
   rcu_read_unlock();
@@ -1466,7 +1511,15 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
     return;
 
   mutex_lock(&behavior_lock);
-  e = get_or_create_entry(pid);
+  /* Read-only lookup, deliberately NOT get_or_create_entry(): every
+   * unlinker allocating a table slot meant routine unlink traffic
+   * (shells, build tools, package managers) churned through the
+   * capped table and its LRU eviction could drop the entry recording
+   * a real dropper's exec_path before it self-deleted, silently
+   * defeating this very check. A process that never exec'd through
+   * the hook has no exec_path to match anyway, so there is nothing to
+   * lose by only consulting an existing entry. */
+  e = find_entry(pid);
   /* Both sides must be genuinely-resolved absolute paths (path[0] ==
    * '/' is the same litmus test resolve_absolute_path() itself uses
    * for "already absolute") before trusting a strcmp() match as real
