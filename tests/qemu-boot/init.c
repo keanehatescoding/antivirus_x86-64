@@ -8,10 +8,10 @@
  * serial console, and power off. Statically linked.
  *
  * See also cold_launcher.c (same directory) - a dedicated companion
- * binary this one execs partway through, specifically to reproduce
- * and track a real, documented gap in av.ko's kprobe hook (cold
- * userspace pages in atomic context - see its own header comment,
- * and av/main.c's handler_pre()).
+ * binary this one execs partway through, as a regression test for
+ * #87 (cold userspace pathname pages missed by the old syscall-entry
+ * kprobe - see its own header comment, and av/main.c's
+ * handler_pre_bprm_check()).
  *
  * All output goes through outmsg() (vsnprintf into a buffer + a raw
  * write(2) to fd 1) rather than stdio - printf()+fflush() was tried
@@ -101,37 +101,14 @@ static void run_and_wait(const char *path, const char *arg1,
     char *const argv[] = {(char *)path, (char *)arg1, NULL};
 
     /* Touch `path`'s first byte before exec, forcing its page
-     * resident via a normal (sleepable) userspace fault. Without
-     * this, a freshly-started static binary whose .rodata page
-     * holding this exact string has never been referenced can hit a
-     * real, narrow gap in av.ko's kprobe hook: strncpy_from_user()
-     * in handler_pre() runs in atomic/kprobe context and CANNOT
-     * sleep to fault in a not-yet-resident page - it fails fast with
-     * -EFAULT instead, so the hook silently skips the exec (returns
-     * 0 without hashing/killing). The kernel's OWN later, in-process
-     * getname_flags() call on the exact same pointer runs in normal
-     * sleepable context and faults the page in fine, which is why
-     * execve() itself still proceeds normally afterward - it's only
-     * the kprobe's earlier, atomic-context copy that loses the race.
-     * A real shell invoking a real file essentially never hits this:
-     * by the time a shell calls execve(), its own memory (including
-     * wherever the pathname string lives) has had far too much prior
-     * activity for anything to still be a cold page. It took a
-     * minimal, just-booted static init calling execve() on its own
-     * literal string within milliseconds of process start to
-     * actually observe it - see av/main.c's handler_pre() comment for
-     * the same note on the production side. Confirmed via kprobe-side
-     * debug tracing that removing this touch reproduces the EFAULT
-     * and re-adding it fixes it, consistently, regardless of kernel
-     * config (tinyconfig/defconfig), KVM vs TCG, or SMAP/SMEP.
-     *
-     * This touch is what makes THIS check specifically exercise the
-     * common/intended case (detection working, given a realistic
-     * pathname) rather than the edge case - it is deliberately NOT
-     * applied to cold_launcher.c's own internal exec, which exists
-     * specifically to reproduce the untouched-page case instead of
-     * avoiding it (see main()'s cold-pathname regression block, and
-     * cold_launcher.c's own header comment). */
+     * resident. Historically required: the old syscall-entry kprobe
+     * copied the pathname in atomic context and silently skipped
+     * execs whose pathname sat on a cold page (#87). The
+     * security_bprm_check() hook no longer reads userspace memory, so
+     * this is now only belt-and-braces for the primary checks. It is
+     * deliberately NOT applied to cold_launcher.c's own internal exec,
+     * which exists to exercise the untouched-page case (see main()'s
+     * cold-pathname regression block). */
     {
       volatile char touch = path[0];
       (void)touch;
@@ -282,54 +259,38 @@ int main(int argc, char *const argv[]) {
   }
   outmsg("QEMU_TEST: EICAR detection check passed\n");
 
-  /* ---- KNOWN LIMITATION regression case: cold-pathname bypass ----
-   * See av/main.c's handler_pre() comment and README.md's CI section
-   * for the full mechanism. cold_launcher.c is a dedicated, separate
-   * binary specifically so its embedded pathname literal is
-   * guaranteed genuinely untouched at exec time (see its own header
-   * comment for why init.c itself can't offer that guarantee).
-   *
-   * This does NOT gate overall PASS/FAIL - both outcomes below are
-   * "fine" in the sense that neither indicates a bug in THIS CI job.
-   * The point is making this known, documented gap visible in every
-   * CI run instead of the primary EICAR check above silently
-   * sidestepping it (which is what the touch-before-exec in
-   * run_and_wait does, deliberately, so THAT check exercises the
-   * common/intended case) - not tracking it at all would let this
-   * gap go stale/unverified indefinitely. */
+  /* ---- regression case: cold-pathname exec (#87) ----
+   * The old syscall-entry kprobe copied the pathname with
+   * strncpy_from_user() in atomic context; a pathname on a
+   * not-yet-resident page failed with -EFAULT and the exec went
+   * unscanned. The hook now sits on security_bprm_check() and pins
+   * bprm->file directly, so the kprobe never reads userspace memory.
+   * cold_launcher.c is a separate binary so its embedded pathname
+   * literal is genuinely untouched at exec time (see its header
+   * comment). A kill is the expected outcome; anything else is a
+   * FAIL. */
   {
     int killed, exited, code;
 
     write_file("/tmp/eicar_cold.com", EICAR);
     run_and_wait("/cold_launcher", NULL, &killed, &exited, &code);
 
-    if (killed) {
-      outmsg("QEMU_TEST: cold-pathname bypass NOT reproduced this run "
-             "(process was killed) - either genuinely fixed upstream, or "
-             "environment-dependent; check av/main.c's handler_pre() "
-             "comment before assuming this gap is closed for good\n");
-    } else if (exited && code == 1) {
-      /* code == 1 is specifically cold_launcher.c's own `return 1`
-       * after its inner execve() fails ENOEXEC (the expected path -
-       * see its header comment). Any other non-killed outcome (e.g.
-       * code == 127, which is run_and_wait's OWN outer execv()
-       * failing - /cold_launcher missing or broken in the initramfs,
-       * not the bypass) is a real problem with this test, not the
-       * documented gap, so it must not be reported as "as
-       * documented". */
-      outmsg("QEMU_TEST: cold-pathname bypass reproduced as documented "
-             "(exited=%d code=%d, not killed) - known limitation, "
-             "tracked here, not a failure of this test\n",
-             exited, code);
-    } else {
-      outmsg("QEMU_TEST: cold-pathname bypass check INCONCLUSIVE - "
-             "/cold_launcher exited unexpectedly (exited=%d code=%d, not "
-             "killed) - this looks like a problem with the test itself "
-             "(e.g. /cold_launcher missing/broken), not the documented "
-             "av/main.c gap\n",
-             exited, code);
+    if (!killed) {
+      /* code == 1 is cold_launcher.c's own `return 1` after its inner
+       * execve() fails ENOEXEC without being killed - the #87 bypass
+       * regressing. code == 127 is run_and_wait's OWN outer execv()
+       * failing (/cold_launcher missing or broken in the initramfs). */
+      outmsg("QEMU_TEST: FAIL: cold-pathname exec was NOT killed "
+             "(exited=%d code=%d)%s\n",
+             exited, code,
+             (exited && code == 1) ? " - #87 bypass regressed"
+                                   : " - /cold_launcher itself looks broken");
+      outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
+      reboot(RB_POWER_OFF);
+      return 1;
     }
   }
+  outmsg("QEMU_TEST: cold-pathname check passed\n");
 
   pass_and_poweroff();
   return 0; /* unreached */

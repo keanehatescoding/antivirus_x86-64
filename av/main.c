@@ -1,11 +1,12 @@
 /*
- * main.c - av module entry point: kprobe on execve, workqueue-deferred
- * multi-algorithm hashing (MD5/SHA-1/SHA-256), lookup against the
- * runtime-managed signature table (sigtable.c), kill on match.
+ * main.c - av module entry point: kprobe on security_bprm_check (exec),
+ * workqueue-deferred multi-algorithm hashing (MD5/SHA-1/SHA-256),
+ * lookup against the runtime-managed signature table (sigtable.c),
+ * kill on match.
  *
  * ARCHITECTURE NOTE: kprobe pre-handlers run in an ATOMIC context - no
- * sleeping, no file I/O, no GFP_KERNEL. handler_pre() only copies the
- * exec path (GFP_ATOMIC) and schedules a work item; all file I/O,
+ * sleeping, no file I/O, no GFP_KERNEL. handler_pre_bprm_check() only
+ * pins the exec's struct file and schedules a work item; all file I/O,
  * hashing, and signature lookups happen in av_work_fn(), which runs in
  * a normal sleepable process context via a dedicated workqueue. See the
  * v0.1.0 changelog for the incident that made this non-negotiable: an
@@ -61,6 +62,7 @@
  */
 
 #include <crypto/hash.h>
+#include <linux/binfmts.h>
 #include <linux/crypto.h>
 #include <linux/dcache.h>
 #include <linux/fcntl.h>
@@ -89,8 +91,10 @@
 #include "netlink_proto.h"
 #include "sigtable.h"
 
-/* x86_64 only, for now (see CONTRIBUTING.md) - every hook below is
- * registered by hardcoded __x64_sys_* symbol name. On an arch using a
+/* x86_64 only, for now (see CONTRIBUTING.md) - every behavioral hook
+ * below (openat/unlink/rename) is registered by hardcoded __x64_sys_*
+ * symbol name. The exec hook is not: it probes security_bprm_check,
+ * which is arch-independent. On an arch using a
  * different wrapper naming (e.g. arm64's __arm64_sys_*), those symbols
  * don't exist: register_kprobe() would fail for each hook in turn and
  * av_init() unwinds and refuses to load, so this was never actually a
@@ -104,26 +108,34 @@
 #error "av.ko is x86_64-only for now - it resolves __x64_sys_* symbols by name; porting to another arch means finding the equivalent wrapper symbols throughout, not just relaxing this check (see CONTRIBUTING.md)"
 #endif
 
-#define HOOKED_SYSCALL_NAME "__x64_sys_execve" /* see README re: arch */
-#define HOOKED_SYSCALLAT_NAME                                                  \
-  "__x64_sys_execveat" /* see README re: arch -                                \
-                        * same x86_64-only caveat as                           \
-                        * HOOKED_SYSCALL_NAME; the arm64                       \
-                        * equivalent is __arm64_sys_execveat. */
+/* The exec hook probes security_bprm_check() (#87, #102), not the
+ * execve/execveat syscall entry points. By the time the kernel calls
+ * it, the pathname has already been copied in by getname() and the
+ * target is open as bprm->file, so the pre-handler never has to read
+ * user memory from atomic context. The old syscall-entry hook did, via
+ * strncpy_from_user(), and a pathname on a not-yet-resident page made
+ * that copy fail with -EFAULT and the exec go unscanned every time.
+ * Hashing bprm->file itself also means the file hashed is the file
+ * being executed, not whatever a later re-open of the path finds.
+ *
+ * Without CONFIG_SECURITY, security_bprm_check() is a static inline
+ * stub in <linux/security.h> with no symbol to probe, so
+ * register_kprobe() would fail at load with a bare -ENOENT/-EINVAL.
+ * Fail at build time instead. Every mainstream distro kernel sets it;
+ * CI's tinyconfig kernels enable it explicitly. */
+#ifndef CONFIG_SECURITY
+#error "av.ko needs CONFIG_SECURITY=y: the exec hook probes security_bprm_check(), which is an inline stub without it"
+#endif
+#define AV_EXEC_HOOK_SYMBOL "security_bprm_check"
 #define READ_CHUNK_SIZE 4096
 #define MAX_HASH_FILE_SIZE                                                     \
   (256 * 1024 * 1024) /* 256 MB cap on what                                    \
                        * hash_file_multi() will read - without                 \
                        * it, execve of a multi-GB binary hashes                \
                        * the whole thing inline in the worker,                 \
-                       * and execve of a FIFO/device (which                    \
-                       * fails in the exec syscall itself, but                 \
-                       * still reaches record_exec's queued                    \
-                       * work) blocks kernel_read() forever on                 \
-                       * a FIFO with no writer. Neither is                     \
-                       * fatal on its own, but both tie up a                   \
-                       * workqueue thread indefinitely; see                    \
-                       * the S_ISREG/i_size checks below. */
+                       * tying up a workqueue thread for as                    \
+                       * long as that takes; see the i_size                    \
+                       * and read-loop checks below. */
 #define DAEMON_TIMEOUT_MS                                                      \
   12000 /* fail-open if the daemon doesn't answer                              \
          * in time - see docs/netlink-protocol.md                              \
@@ -145,11 +157,8 @@
          * still gets to deliver its verdict                                   \
          * instead of racing this timeout. */
 
-static struct kprobe kp_execve = {
-    .symbol_name = HOOKED_SYSCALL_NAME,
-};
-static struct kprobe kp_execveat = {
-    .symbol_name = HOOKED_SYSCALLAT_NAME,
+static struct kprobe kp_bprm_check = {
+    .symbol_name = AV_EXEC_HOOK_SYMBOL,
 };
 static struct kprobe kp_openat = {
     .symbol_name = "__x64_sys_openat",
@@ -187,7 +196,7 @@ static struct workqueue_struct *av_wq;
  * load is a far smaller risk than exhausting atomic memory
  * system-wide, which affects every other kernel subsystem too. */
 #define AV_MAX_INFLIGHT_WORK 4096
-/* Slots reserved exclusively for execve/execveat: openat/unlink/
+/* Slots reserved exclusively for the exec hook: openat/unlink/
  * unlinkat/rename/renameat/renameat2 are capped at
  * (AV_MAX_INFLIGHT_WORK - AV_EXEC_RESERVED_WORK) via
  * av_work_admit_nonexec() below, so a burst of those (e.g. `rm -rf`
@@ -235,8 +244,8 @@ static inline bool av_work_admit_capped(unsigned int cap) {
   return true;
 }
 
-/* Call before allocating a *_work struct in an execve/execveat *_pre
- * handler. Returns true if under the cap (caller may proceed to
+/* Call before allocating a struct av_work in the exec (bprm_check)
+ * pre-handler. Returns true if under the cap (caller may proceed to
  * kmalloc); false if at or over it (caller must skip the event
  * without allocating). Must be paired with exactly one
  * av_work_release() call on every path that follows a true return,
@@ -259,8 +268,7 @@ static inline void av_work_release(void) {
 }
 
 /* Resolves a syscall's `dfd` argument into a struct path suitable as
- * the base for a later relative-path lookup, mirroring the get_fs_pwd()
- * capture execve's handler_pre() already did. Callable from ATOMIC
+ * the base for a later relative-path lookup. Callable from ATOMIC
  * (kprobe) context: AT_FDCWD is by far the common case (plain
  * openat/unlink/rename with no real base fd) and just reuses the same
  * cwd capture; a real fd only needs fget_raw() to look up the
@@ -277,7 +285,7 @@ static inline void av_work_release(void) {
  * reached behavior.c as bare "shadow", which trivially bypassed every
  * sensitive-path check. `out` is populated with a path reference the
  * caller must path_put() - released in each work_fn's cleanup, same
- * lifetime discipline as av_work's existing pwd field. Returns false
+ * lifetime discipline for every hook that uses it. Returns false
  * (nothing to put) if dfd is a real fd but doesn't resolve to an open
  * file - e.g. a bogus/already-closed fd racing the syscall itself. */
 static bool resolve_dfd_path(int dfd, struct path *out) {
@@ -378,10 +386,10 @@ static void normalize_abs_path(char *path, size_t path_len) {
  * safe operation in this file.
  *
  * Deliberately does NOT use vfs_path_lookup()/full canonicalization:
- * unlike open_exec_target() (which needs a real open fd and so must
- * fully resolve the target), rename's newpath and an O_CREAT openat
- * target may not exist yet, and unlink's target may be a symlink we
- * must NOT follow. Instead this resolves only the base directory (dfd)
+ * rename's newpath and an O_CREAT openat target may not exist yet, and
+ * unlink's target may be a symlink we must NOT follow. (The exec hook
+ * doesn't come through here at all - it has the kernel's own resolved
+ * struct file and d_path()s that directly, see av_work_fn().) Instead this resolves only the base directory (dfd)
  * to its absolute path via d_path() and string-concatenates the
  * (still possibly containing "." / ".." components) relative
  * remainder onto it. That's sufficient for behavior.c's prefix/
@@ -396,32 +404,6 @@ static void resolve_absolute_path(const char *path, const struct path *base,
                                   char *out, size_t out_len) {
   char *tmp;
   char *dirpath;
-
-  /* AT_EMPTY_PATH sentinel - see handler_pre_execveat() and
-   * open_exec_target() below. `path` is deliberately empty and `base`
-   * IS the exec target itself (resolve_dfd_path() resolved dfd
-   * directly to it, not to a directory `path` is relative to), so
-   * resolve base's own path directly rather than treating this as
-   * "empty relative component under base" (which would wrongly
-   * concatenate a trailing "/" onto base's own path below). Every
-   * OTHER caller's `path` is guaranteed non-empty (strncpy_from_user()
-   * rejects a zero-length copy everywhere else - see handler_pre() and
-   * friends), so an empty string is an unambiguous, safe sentinel for
-   * this one case. */
-  if (path[0] == '\0') {
-    tmp = kmalloc(PATH_MAX, GFP_KERNEL);
-    if (!tmp) {
-      out[0] = '\0';
-      return;
-    }
-    dirpath = d_path(base, tmp, PATH_MAX);
-    if (IS_ERR(dirpath))
-      out[0] = '\0';
-    else
-      strscpy(out, dirpath, out_len);
-    kfree(tmp);
-    return;
-  }
 
   if (path[0] == '/') {
     strscpy(out, path, out_len);
@@ -497,15 +479,12 @@ struct av_work {
                     * av_behavior_record_exec()'s comment for why this
                     * is needed to distinguish a genuine pid reuse from
                     * the same process exec'ing again. */
-  struct path pwd; /* the exec'ing process's cwd at the moment
-                    * handler_pre() ran, captured via get_fs_pwd()
-                    * (atomic-safe: it's just a refcount bump under
-                    * current->fs->lock, no I/O). A relative `path`
-                    * below must be resolved against THIS, not
-                    * against whatever the workqueue thread's own
-                    * cwd happens to be by the time av_work_fn()
-                    * runs - see open_exec_target(). Released with
-                    * path_put() in av_work_fn()'s cleanup. */
+  struct file *file; /* bprm->file - the file the kernel itself opened
+                      * for this exec - pinned with get_file() in
+                      * handler_pre_bprm_check() (a refcount bump,
+                      * atomic-safe) and fput() in av_work_fn()'s
+                      * cleanup. Hashing and path logging both go
+                      * through THIS, never a re-open of a pathname. */
   bool fail_closed; /* av_daemon_fail_closed, snapshotted here (kprobe
                      * time) rather than re-read in av_work_fn() at
                      * verdict time - see the policy-flip race note on
@@ -515,7 +494,6 @@ struct av_work {
                      * fail-closed mid-flight can no longer retroactively
                      * kill an exec that was already committed under
                      * fail-open. */
-  char path[PATH_MAX];
 };
 
 struct algo_ctx {
@@ -604,14 +582,11 @@ static void av_crypto_exit(void) {
   av_tfm_sha256 = NULL;
 }
 
-/* Captures the identity of the file that was ACTUALLY opened and
- * hashed by hash_file_multi(), so a signature/daemon verdict can be
- * logged against something more forensically specific than a path
- * string alone. This does NOT close the TOCTOU described on
- * av_work_fn() below - it's captured well after the real exec already
- * happened, from our own (possibly-already-raced) open - it just makes
- * a post-incident "was this really the file that ran" check possible
- * from the dmesg record instead of impossible. */
+/* Captures the identity of the file hash_file_multi() hashed, so a
+ * signature/daemon verdict can be logged against something more
+ * forensically specific than a path string alone. Since the exec hook
+ * moved to security_bprm_check, that file is the exec's own
+ * bprm->file, so dev/ino here identify the image that actually ran. */
 struct av_file_identity {
   dev_t dev;
   unsigned long ino;
@@ -626,59 +601,16 @@ static void bin_to_hex(const u8 *bin, size_t bin_len, char *hex_out) {
   hex_out[bin_len * 2] = '\0';
 }
 
-/* Resolves and opens the exec target, honoring `path` as relative to
- * `pwd` (the calling process's cwd at exec time - see the av_work
- * comment) rather than to whatever directory this happens to run in.
- * Called from av_work_fn(), i.e. sleepable process context, so
- * vfs_path_lookup()'s potential I/O is fine here even though it would
- * not have been back in handler_pre().
- *
- * An absolute path needs no resolution against pwd at all (and pwd may
- * be garbage/unused in that case - filp_open() ignores it). This is
- * also why plain filp_open(path, ...) worked "by accident" for every
- * absolute-path exec: glibc's execvp() always resolves PATH lookups to
- * an absolute path before the actual execve() syscall, so this bug
- * only ever showed up for a program calling execve() directly with a
- * relative filename. */
-static struct file *open_exec_target(const char *path, const struct path *pwd) {
-  struct file *f;
-
-  if (path[0] == '\0') {
-    /* AT_EMPTY_PATH sentinel - see resolve_absolute_path()'s matching
-     * comment and handler_pre_execveat() below. `pwd` IS the target
-     * file itself here, already opened once by resolve_dfd_path()'s
-     * fget_raw() back in the kprobe handler - dentry_open() opens a
-     * fresh fd against that same dentry/mnt directly, no lookup at
-     * all (there is nothing to look up: dfd already named the exact
-     * file). */
-    f = dentry_open(pwd, O_RDONLY, current_cred());
-  } else if (path[0] == '/') {
-    f = filp_open(path, O_RDONLY, 0);
-  } else {
-    struct path resolved;
-    int err;
-
-    err =
-        vfs_path_lookup(pwd->dentry, pwd->mnt, path, LOOKUP_FOLLOW, &resolved);
-    if (err)
-      return ERR_PTR(err);
-
-    f = dentry_open(&resolved, O_RDONLY, current_cred());
-    path_put(&resolved);
-  }
-
-  return f;
-}
-
-/* Computes MD5, SHA-1, and SHA-256 of the file at `path` in a single
- * read pass. MUST be called from a sleepable (process) context only.
- * `ident_out` (optional, may be NULL) is filled in with the identity
- * of the file actually opened - see struct av_file_identity above and
- * the TOCTOU note on av_work_fn(). */
-static int hash_file_multi(const char *path, const struct path *pwd,
-                           struct av_digest *out,
+/* Computes MD5, SHA-1, and SHA-256 of `f` in a single read pass. MUST
+ * be called from a sleepable (process) context only. `f` is the exec's
+ * own bprm->file (see struct av_work) - borrowed, not opened or closed
+ * here. The kernel opened it for exec with O_RDONLY, so FMODE_READ is
+ * set even for an execute-only (--x) binary, and kernel_read() with a
+ * local `pos` never touches f->f_pos, which the binfmt loader may be
+ * using concurrently. `ident_out` (optional, may be NULL) is filled in
+ * with `f`'s identity - see struct av_file_identity above. */
+static int hash_file_multi(struct file *f, struct av_digest *out,
                            struct av_file_identity *ident_out) {
-  struct file *f;
   u8 md5_bin[16], sha1_bin[20], sha256_bin[32];
   /* SHA-256 is always computed - av_behavior_record_exec()'s
    * self-delete correlation and the netlink scan request to avd
@@ -711,16 +643,11 @@ static int hash_file_multi(const char *path, const struct path *pwd,
    * out-of-bounds read waiting to happen. */
 
   memset(out, 0, sizeof(*out));
-  f = open_exec_target(path, pwd);
-  if (IS_ERR(f))
-    return PTR_ERR(f);
 
   /* Only hash regular files, and only up to MAX_HASH_FILE_SIZE - see
-   * the macro comment. A FIFO/device/socket reaching here means the
-   * execve() that triggered this work already failed for the caller
-   * (you can't exec a FIFO), but av_work_fn() queued the work before
-   * that failure was knowable, so we still have to guard against it
-   * here rather than assume the caller filtered it out. */
+   * the macro comment. The exec path's own open already refuses a
+   * non-regular file (-EACCES) before security_bprm_check() runs, so
+   * the S_ISREG check is defense in depth rather than a live case. */
   if (!S_ISREG(file_inode(f)->i_mode)) {
     ret = -EINVAL;
     goto out;
@@ -818,7 +745,6 @@ out:
   kfree(buf);
   for (i = 0; i < 3; i++)
     kfree(ctx[i].desc);
-  filp_close(f, NULL);
   return ret;
 }
 
@@ -847,9 +773,9 @@ out:
  * be killed if an operator flipped it to fail-closed before that
  * specific exec's work item was processed - the process saw the
  * policy as of *verdict* time, not launch time, and that window grew
- * with workqueue backlog. handler_pre()/handler_pre_execveat() now
- * snapshot this into struct av_work's fail_closed field at kprobe
- * time instead, so av_work_fn() enforces the policy that was in
+ * with workqueue backlog. handler_pre_bprm_check() now snapshots
+ * this into struct av_work's fail_closed field at kprobe time
+ * instead, so av_work_fn() enforces the policy that was in
  * effect when the exec was actually observed - flipping this
  * interactively no longer risks retroactively killing execs (including
  * your own shell's) that already committed under the old policy. */
@@ -1012,33 +938,17 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
  * GFP_KERNEL. This is where all "heavy" work happens.
  *
- * KNOWN TOCTOU (see review item #3 / README): by the time this runs,
- * the real execve() already completed and the target process is
- * already running - the kernel resolved and mapped ITS OWN copy of
- * the executable well before this workqueue item was even scheduled.
- * hash_file_multi() below does a SEPARATE, LATER open of `aw->path`
- * (resolved against the cwd captured back in handler_pre() - see
- * av_work's pwd field) to compute a hash for the signature/daemon
- * check. Nothing guarantees these are the same inode: an attacker who
- * can win the race (replace the file, or repoint a symlink in the
- * path, between the real exec and this open) can make the signature
- * check run against a swapped-in decoy while their actual malicious
- * code is already executing, undetected. This is inherent to the
- * defer-to-workqueue design (see the ARCHITECTURE NOTE at the top of
- * this file - hashing can't happen in the atomic kprobe path) and
- * can't be closed from a kprobe on the syscall boundary; genuinely
- * closing it means moving to a hook with access to the kernel's own
- * already-resolved struct file for the exec (e.g. an LSM
- * bprm_check_security hook), which is a real redesign, not a patch.
- * Two things this file does instead, short of that redesign: (1)
- * av_file_identity below records exactly which inode was hashed, so a
- * post-incident dmesg review can at least tell whether that inode
- * still matches what's on disk; (2) O_NOFOLLOW was deliberately NOT
- * added to open_exec_target() - it would only guard the narrow case
- * where the final path component itself is a symlink, at the cost of
- * breaking hashing for every LEGITIMATELY symlinked binary (/usr/bin/
- * python and friends), while doing nothing for a same-path file
- * replacement, which is the more general form of this race. */
+ * What's hashed is aw->file, the exec's own bprm->file pinned in
+ * handler_pre_bprm_check(), so the digest is of the exact image the
+ * kernel is executing. An earlier design hashed a SEPARATE, LATER
+ * open of the pathname and could be raced by swapping the file or a
+ * symlink in between; with no second open, there's nothing to swap.
+ *
+ * STILL KILL-AFTER-EXEC: this runs asynchronously, so the exec has
+ * usually already committed and the new image may run briefly before
+ * a verdict kills it. Holding the exec until a verdict exists is the
+ * fanotify FAN_OPEN_EXEC_PERM work in avd (#176), not something a
+ * kprobe can do. */
 static void av_work_fn(struct work_struct *w) {
   struct av_work *aw = container_of(w, struct av_work, work);
   struct av_digest digest;
@@ -1049,26 +959,33 @@ static void av_work_fn(struct work_struct *w) {
   char *esc_path;
   int ret;
 
-  /* hash_file_multi()/open_exec_target() already resolve a relative
-   * aw->path against aw->pwd correctly for the purpose of opening the
-   * right file. But what gets RECORDED as this process's exec_path
-   * (for the unlink hook's self-delete comparison, av_behavior_check_
-   * unlink()) was still the raw, possibly-relative string - so
-   * `./payload` exec'd and `payload` unlinked from the same cwd never
-   * matched. Resolve once here so exec_path and the (now also
-   * resolved - see resolve_dfd_path()/resolve_absolute_path() above)
-   * unlink path are directly comparable strings. */
+  /* Recorded as this process's exec_path (for the unlink hook's
+   * self-delete comparison, av_behavior_check_unlink()) and used in
+   * every log line below. d_path() of the kernel's own resolved
+   * f_path: absolute, with symlinks already followed (so a
+   * /usr/bin/python symlink exec records the real target's path),
+   * and " (deleted)"-suffixed if the file was unlinked after the
+   * exec opened it. A d_path() failure leaves an empty string, which
+   * av_behavior_check_unlink() never matches (it requires a leading
+   * '/'), rather than a misleading partial path. */
   abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!abs_path) {
-    path_put(&aw->pwd);
+    fput(aw->file);
     put_pid(aw->target_pid);
     kfree(aw);
     av_work_release();
     return;
   }
-  resolve_absolute_path(aw->path, &aw->pwd, abs_path, PATH_MAX);
+  {
+    char *p = d_path(&aw->file->f_path, abs_path, PATH_MAX);
 
-  ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
+    if (IS_ERR(p))
+      abs_path[0] = '\0';
+    else
+      memmove(abs_path, p, strlen(p) + 1);
+  }
+
+  ret = hash_file_multi(aw->file, &digest, &ident);
   if (ret) {
     /* A hash failure skips both the signature match and the daemon
      * scan below, i.e. the exec is allowed without any verdict -
@@ -1174,73 +1091,49 @@ static void av_work_fn(struct work_struct *w) {
 
 out:
   kfree(abs_path);
-  path_put(&aw->pwd);
+  fput(aw->file);
   put_pid(aw->target_pid);
   kfree(aw);
   av_work_release();
 }
 
-/* Atomic context - the ONLY things allowed here: copying small amounts
- * of data with GFP_ATOMIC, reading regs, and scheduling work.
+/* Atomic context - the ONLY things allowed here: taking references,
+ * GFP_ATOMIC allocation, reading regs, and scheduling work.
  *
- * KNOWN GAP - COLD-PATHNAME BYPASS (found via tests/qemu-boot/,
- * tracked by tests/qemu-boot/cold_launcher.c's dedicated regression
- * case, not previously documented): strncpy_from_user() below runs in
- * this atomic/kprobe context, so it can't sleep to fault in a
- * userspace page that isn't resident yet - it fails fast with -EFAULT
- * instead, and this handler then returns 0 without hashing/killing
- * (silent skip, same as any other early-bail path here). The real
- * execve() syscall's own later, in-process getname_flags() call on
- * the exact same pointer runs in normal sleepable context and CAN
- * fault the page in, which is why the syscall itself still proceeds
- * normally either way - only this kprobe's earlier copy can lose that
- * race.
+ * Probes security_bprm_check(struct linux_binprm *bprm), which the
+ * exec path calls from search_binary_handler() after opening the
+ * target and before trying any binfmt loader. That one call site
+ * covers execve, execveat (including AT_EMPTY_PATH and memfd fileless
+ * exec, where bprm->file is the fd's own file), fexecve, and
+ * kernel-initiated execs (kernel_execve(), usermode helpers), with no
+ * syscall-specific argument decoding.
  *
- * Unlike this file's other risk-reduction-not-elimination notes (e.g.
- * Has_RWX_Segment's scope note, or the quarantine TOCTOU note in
- * avd.c), this one is NOT a narrow timing race that needs a
- * well-positioned attacker to exploit - it's deterministically
- * reproducible by any process whose exec's pathname argument has
- * simply never been touched before, e.g. a freshly execve()'d static
- * binary whose entire body is "exec this literal path, nothing else
- * first" (exactly what cold_launcher.c is, and 100% reliable in
- * testing). A real shell essentially never hits this by accident -
- * too much prior memory activity for anything to still be a cold page
- * by the time it calls execve() - but a deliberately minimal launcher
- * doesn't need to work hard to trigger it on purpose.
+ * This replaces kprobes on __x64_sys_execve/__x64_sys_execveat, which
+ * had to strncpy_from_user() the pathname from atomic context. That
+ * copy can't fault in a non-resident page, so a pathname on a cold
+ * page made it fail with -EFAULT and the exec went unscanned
+ * deterministically (#87, reproduced every CI run by
+ * tests/qemu-boot/cold_launcher.c). Here the pathname is already in
+ * kernel memory and nothing reads user memory at all.
  *
- * Considered and NOT done here:
- *   - Deferring the copy entirely to av_work_fn() (sleepable
- *     workqueue context) doesn't work: by the time that runs, a
- *     successful exec has already replaced this process's address
- *     space, so there's nothing left to copy from.
- *   - Failing closed (kill on -EFAULT) trades this for a new,
- *     meaningful false-positive class: -EFAULT alone can't
- *     distinguish "genuinely cold but valid page" from "actually bad
- *     pointer" (the latter would fail the real exec too, so killing
- *     there is harmless; the former would have execve()'d
- *     successfully and harmlessly, so killing it is a real false
- *     positive) - and "cold pathname page" is not exotic for
- *     legitimate minimal/embedded/statically-linked launchers, not
- *     just malicious ones.
- *   - A different hook mechanism entirely (e.g. an LSM
- *     security_bprm_check hook, which runs in normal sleepable
- *     context) would close this properly, but is a much larger
- *     architectural change than fits alongside adding a CI job.
- * Closing this for real needs one of those (or something better),
- * with more thought than fits here - tracked, not silently left
- * unverified: see the regression case's comment for how it stays
- * visible in every CI run instead. */
-static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
-  const char __user *user_filename;
+ * search_binary_handler() runs again for each interpreter level: a
+ * "#!/bin/sh" script calls this once for the script, then again with
+ * bprm->file = /bin/sh. Only the first level is scanned, matching the
+ * old syscall-entry hook, which saw only the path passed to execve().
+ * Scanning the interpreter too would hash /bin/sh on every script
+ * exec, and av_behavior_record_exec() would overwrite the script's
+ * exec_path with the interpreter's, breaking self-delete correlation
+ * for scripts. alloc_bprm() sets bprm->interp = bprm->filename, and
+ * only bprm_change_interp() (binfmt_script, binfmt_misc) repoints
+ * interp, so pointer equality identifies the first level. */
+static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
+  struct linux_binprm *bprm =
+      (struct linux_binprm *)regs_get_kernel_argument(regs, 0);
   struct av_work *aw;
 
-  if (!real_regs)
+  if (!bprm || !bprm->file)
     return 0;
-
-  user_filename = (const char __user *)real_regs->di;
-  if (!user_filename)
+  if (bprm->interp != bprm->filename)
     return 0;
 
   if (!av_work_admit())
@@ -1252,155 +1145,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
     return 0;
   }
 
-  /* strncpy_from_user() returns the copied length (excluding NUL) on
-   * success, a negative errno on fault - but if the source string is
-   * >= PATH_MAX bytes, it returns exactly PATH_MAX with NO guarantee
-   * the destination is NUL-terminated. Checking only "<= 0" lets that
-   * truncation case through as "success", leaving aw->path as a
-   * non-NUL-terminated buffer that filp_open()/strcmp()/strstr()
-   * further down would read past. Reject anything that fills the
-   * whole buffer, not just outright failures. */
-  {
-    ssize_t path_len = strncpy_from_user(aw->path, user_filename, PATH_MAX);
-
-    if (path_len <= 0 || path_len >= PATH_MAX) {
-      kfree(aw);
-      av_work_release();
-      return 0;
-    }
-  }
-
-  aw->target_pid = get_task_pid(current, PIDTYPE_PID);
-  aw->tgid = task_tgid_nr(current);
-  aw->start_time = current->start_time;
-  aw->fail_closed = atomic_read(&av_daemon_fail_closed);
-  /* get_fs_pwd() takes fs->lock and bumps refcounts under it - no
-   * sleeping, so this is fine in this atomic kprobe context. This is
-   * the fix for the relative-path evasion: capture the calling
-   * process's cwd HERE, while we're still running in its context,
-   * so a relative aw->path can be resolved correctly later even
-   * though av_work_fn() runs on a workqueue thread with an unrelated
-   * cwd of its own. Released via path_put() in av_work_fn(). */
-  get_fs_pwd(current->fs, &aw->pwd);
-  INIT_WORK(&aw->work, av_work_fn);
-  queue_work(av_wq, &aw->work);
-
-  return 0;
-}
-/* execveat(2): int execveat(int dirfd, const char *pathname,
- * char *const argv[], char *const envp[], int flags). x86_64 syscall
- * argument order puts dirfd in the first slot (real_regs->di) and
- * pathname in the second (real_regs->si) - same slot pattern as
- * openat's dfd/filename below, NOT the same as execve's filename-only
- * first slot. Reuses struct av_work / av_work_fn unchanged: the only
- * difference from handler_pre() is that the base directory for a
- * relative pathname comes from resolving `dirfd` (AT_FDCWD or a real
- * fd, via resolve_dfd_path() - see openat/unlink for the identical
- * pattern) instead of unconditionally being the calling process's cwd.
- *
- * Without this hook, execveat() was a complete bypass of every
- * exec-based check: no hash/signature match, no daemon scan, and no
- * av_behavior_record_exec() call - so the self-delete heuristic lost
- * its exec_path key for anything launched this way too. This is the
- * syscall containers, some language runtimes, and memfd_create()+
- * execveat() fileless-exec loaders actually use, so it's not a
- * theoretical gap.
- *
- * AT_EMPTY_PATH (flags argument, real_regs->r8) IS special-cased, but
- * only when the pathname is ALSO actually empty: per execveat(2), an
- * empty pathname with AT_EMPTY_PATH set means dfd names the target
- * file directly (typically an anonymous memfd) - exactly the
- * fileless-exec shape this hook exists to close. `dfd` has already
- * been resolved to the target's own struct path by resolve_dfd_path()
- * above (there is no separate "directory" to look a name up under -
- * dfd already names the whole target), so aw->path is set to the
- * empty-string sentinel in that case (see resolve_absolute_path()'s
- * and open_exec_target()'s matching comments in this file).
- *
- * AT_EMPTY_PATH set together with a NON-empty pathname is NOT that
- * case, though, and must not be treated as one: per execveat(2), the
- * flag only changes anything when the pathname is empty - a non-empty
- * pathname is resolved exactly as it would be without the flag
- * (relative to dfd, or absolute), and that resolution succeeds
- * normally. Bailing out here on that combination (as an earlier
- * version of this hook did, prompted by a review comment that assumed
- * the syscall fails in that case) would have made AT_EMPTY_PATH a
- * free detection bypass: set the flag on an otherwise-ordinary
- * dfd-relative execveat() and this hook skips scanning entirely while
- * the kernel executes the file anyway. So the only combination that's
- * actually invalid - and skipped below - is an empty pathname WITHOUT
- * AT_EMPTY_PATH (generic path resolution rejects a zero-length name
- * unless LOOKUP_EMPTY is set, so that syscall fails with ENOENT and
- * there is nothing to scan). Every other combination copies the real
- * pathname into aw->path and proceeds - empty+flag through the
- * sentinel branch above, non-empty (flag or not) through the normal
- * relative/absolute resolution every other pathname-taking hook in
- * this file already uses.
- *
- * Shares handler_pre()'s cold-pathname bypass (see that function's
- * comment): the strncpy_from_user() call(s) below run in this same
- * atomic/kprobe context and can silently skip a pathname argument
- * whose page isn't resident yet, for the same reasons and with the
- * same considered-and-rejected fix directions. Not independently
- * tracked by a separate cold_launcher.c case - it's the same
- * underlying mechanism, one write-up covers both call sites. */
-static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
-  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
-  const char __user *user_filename;
-  struct av_work *aw;
-  struct path base;
-  int dfd;
-  bool empty_path;
-
-  if (!real_regs)
-    return 0;
-
-  user_filename = (const char __user *)real_regs->si;
-  if (!user_filename)
-    return 0;
-
-  dfd = (int)real_regs->di;
-  empty_path = ((unsigned int)real_regs->r8 & AT_EMPTY_PATH) != 0;
-
-  /* Resolve dfd BEFORE allocating/copying anything else - same
-   * ordering as handler_pre_openat() and for the same reason: a
-   * bogus/already-closed fd racing the syscall leaves nothing
-   * useful to queue work for. */
-  if (!resolve_dfd_path(dfd, &base))
-    return 0;
-
-  if (!av_work_admit()) {
-    path_put(&base);
-    return 0;
-  }
-
-  aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
-  if (!aw) {
-    path_put(&base);
-    av_work_release();
-    return 0;
-  }
-  aw->pwd = base;
-
-  {
-    /* Copy unconditionally - a non-empty pathname is scanned via the
-     * normal relative/absolute branch below regardless of empty_path
-     * (see the doc comment above: AT_EMPTY_PATH only changes anything
-     * when the pathname is actually empty). The only combination
-     * that's genuinely invalid is an empty pathname WITHOUT
-     * AT_EMPTY_PATH - that syscall fails with ENOENT before doing
-     * anything, so dfd must not be scanned/killed over it. */
-    ssize_t path_len = strncpy_from_user(aw->path, user_filename, PATH_MAX);
-
-    if (path_len < 0 || path_len >= PATH_MAX ||
-        (path_len == 0 && !empty_path)) {
-      path_put(&aw->pwd);
-      kfree(aw);
-      av_work_release();
-      return 0;
-    }
-  }
-
+  aw->file = get_file(bprm->file);
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
   aw->start_time = current->start_time;
@@ -2002,25 +1747,19 @@ static int __init av_init(void) {
     goto err_wq;
   }
 
-  kp_execve.pre_handler = handler_pre;
-  ret = register_kprobe(&kp_execve);
+  kp_bprm_check.pre_handler = handler_pre_bprm_check;
+  ret = register_kprobe(&kp_bprm_check);
   if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(execve) failed: %d\n", ret);
+    pr_err("kernel-av: register_kprobe(" AV_EXEC_HOOK_SYMBOL ") failed: %d\n",
+           ret);
     goto err_netlink;
-  }
-
-  kp_execveat.pre_handler = handler_pre_execveat;
-  ret = register_kprobe(&kp_execveat);
-  if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(execveat) failed: %d\n", ret);
-    goto err_kp_execve;
   }
 
   kp_openat.pre_handler = handler_pre_openat;
   ret = register_kprobe(&kp_openat);
   if (ret < 0) {
     pr_err("kernel-av: register_kprobe(openat) failed: %d\n", ret);
-    goto err_kp_execveat;
+    goto err_kp_bprm_check;
   }
 
   kp_unlink.pre_handler = handler_pre_unlink;
@@ -2071,10 +1810,8 @@ err_kp_unlink:
   unregister_kprobe(&kp_unlink);
 err_kp_openat:
   unregister_kprobe(&kp_openat);
-err_kp_execveat:
-  unregister_kprobe(&kp_execveat);
-err_kp_execve:
-  unregister_kprobe(&kp_execve);
+err_kp_bprm_check:
+  unregister_kprobe(&kp_bprm_check);
 err_netlink:
   av_netlink_exit();
 err_wq:
@@ -2100,8 +1837,7 @@ static void __exit av_exit(void) {
   unregister_kprobe(&kp_unlinkat);
   unregister_kprobe(&kp_unlink);
   unregister_kprobe(&kp_openat);
-  unregister_kprobe(&kp_execveat);
-  unregister_kprobe(&kp_execve);
+  unregister_kprobe(&kp_bprm_check);
   /* destroy_workqueue() flushes all pending work first, so no work
    * item can run against unloaded module .text after this returns. */
   destroy_workqueue(av_wq);
