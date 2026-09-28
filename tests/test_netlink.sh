@@ -405,10 +405,7 @@ cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 AVD_MARK="$(dmesg_mark)"
 (
     cd "$REPO_ROOT" || exit 1
-    # stdbuf -oL: avd's stdout is a file here, so without it avd's
-    # per-request "scan request" lines sit in a full stdio buffer - the
-    # clean round-trip check below falls back to reading them.
-    exec stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -449,29 +446,22 @@ chmod +x "$CLEAN_PATH"
 # bar or monitor polling curl/grep/python) can use a whole window up
 # before this test's exec lands in it. Each attempt therefore re-runs
 # the exec and polls for longer than one window, so the next attempt
-# starts in a fresh one. If the host is busy enough that every window
-# is still used up, fall back to avd's own (unrate-limited) record of
-# the request: avd received it, reported no verdict-send failure, and
-# the script ran to completion instead of being killed.
+# starts in a fresh one. There is deliberately no fallback to avd's
+# own log here: avd receiving the request and sending a verdict doesn't
+# show the kernel received it (a timeout fails open without a kill
+# too), and this line is the kernel's only record of a completed clean
+# verdict.
 CLEAN_OK=0
-CLEAN_VIA=""
 for _ in 1 2 3 4; do
     CLEAN_MARK="$(dmesg_mark)"
     "$CLEAN_PATH" >/dev/null 2>&1
-    CLEAN_RC=$?
     if wait_dmesg_since "$CLEAN_MARK" "event=clean type=daemon path=\"$CLEAN_PATH\"" 6; then
         CLEAN_OK=1
         break
     fi
 done
-if [ "$CLEAN_OK" -eq 0 ] && [ "$CLEAN_RC" -eq 0 ] &&
-   grep -F "scan request" "$AVD_LOG" | grep -qF "path=\"$CLEAN_PATH\"" &&
-   ! grep -F "failed to send" "$AVD_LOG" | grep -qF "\"$CLEAN_PATH\""; then
-    CLEAN_OK=1
-    CLEAN_VIA=" (kernel clean line rate-limited by other host execs - confirmed via avd's log)"
-fi
 if [ "$CLEAN_OK" -eq 1 ]; then
-    pass "clean exec round-tripped through avd and logged clean$CLEAN_VIA"
+    pass "clean exec round-tripped through avd and logged clean"
 else
     fail "expected daemon-path clean log line not found in dmesg after retries"
     dmesg | tail -10
