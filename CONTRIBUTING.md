@@ -22,8 +22,8 @@ bypass on the netlink or control-socket channel)? That goes through
 ## Getting set up
 
 ```bash
-git clone https://github.com/keanehatescoding/antivirus.git
-cd antivirus
+git clone https://github.com/keanehatescoding/antivirus_x86-64.git
+cd antivirus_x86-64
 scripts/setup-hooks.sh    # one-time: wires git to .githooks/
 ```
 

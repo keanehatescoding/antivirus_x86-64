@@ -24,7 +24,7 @@ Build-Depends: debhelper-compat (= 13),
                python3-gi,
                gir1.2-gtk-4.0
 Standards-Version: 4.6.2
-Homepage: https://github.com/keanehatescoding/antivirus
+Homepage: https://github.com/keanehatescoding/antivirus_x86-64
 Rules-Requires-Root: no
 
 Package: hyprav-dkms

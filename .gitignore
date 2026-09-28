@@ -35,3 +35,6 @@ packaging/appimage/*.AppImage
 /build-dir/
 /repo/
 /*.flatpak
+# Python bytecode from running the GTK GUI / tooling from source.
+__pycache__/
+*.pyc

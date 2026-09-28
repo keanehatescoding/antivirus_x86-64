@@ -1,5 +1,5 @@
 obj-m += av.o
-av-y := main.o sigtable.o netlink_chan.o behavior.o
+av-y := main.o sigtable.o netlink_chan.o behavior.o logfmt.o
 
 # No ccflags-y hardening here, deliberately: an out-of-tree module built
 # via `make -C $(KDIR) M=$(PWD) modules` inherits the target kernel's own

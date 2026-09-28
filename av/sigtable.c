@@ -26,6 +26,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/user_namespace.h>
 
 #include "sigtable.h"
 
@@ -252,8 +253,10 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
    * CAP_SYS_ADMIN, could otherwise mutate the signature table. The
    * netlink channel gates the equivalent operation behind
    * GENL_ADMIN_PERM; this proc handler needs the same bar. Matches
-   * trust_proc_write() (behavior.c) and protected_proc_write(). */
-  if (!capable(CAP_SYS_ADMIN))
+   * trust_proc_write() (behavior.c) and protected_proc_write().
+   * Checked against the opener's credentials (file->f_cred, captured
+   * at open) - see trust_proc_write()'s comment for why. */
+  if (!file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN))
     return -EPERM;
 
   /* Reject oversized writes instead of silently truncating them.

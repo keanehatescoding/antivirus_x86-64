@@ -9,7 +9,7 @@
 # Tracks the git repo directly (no tagged release covers av-gui yet -
 # see the top-level README). Pin to a specific commit/tag instead by
 # changing the `source` line below to
-# git+https://github.com/keanehatescoding/antivirus.git#tag=vX.Y.Z
+# git+https://github.com/keanehatescoding/antivirus_x86-64.git#tag=vX.Y.Z
 # if you'd rather not build off the moving master branch.
 #
 # HYPRAV_CI_SOURCE overrides the git URL below (default: the real
@@ -26,7 +26,7 @@ pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
 pkgver=0.9.0.r134.g849b462
 pkgrel=1
 arch=('x86_64')
-url="https://github.com/keanehatescoding/antivirus"
+url="https://github.com/keanehatescoding/antivirus_x86-64"
 license=('GPL3')
 # python-gobject/gtk4 are needed at BUILD time, not just runtime:
 # package_hyprav-gui()'s `make install` (userspace/av-gui/Makefile)
@@ -38,7 +38,7 @@ license=('GPL3')
 # for (python3-gi/gir1.2-gtk-4.0 there) and packaging/fedora/hyprav.spec
 # (python3-gobject/gtk4) - this file just hadn't caught up.
 makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4')
-source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus.git}")
+source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus_x86-64.git}")
 sha256sums=('SKIP')
 
 pkgver() {

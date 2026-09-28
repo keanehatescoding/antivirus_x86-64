@@ -42,8 +42,8 @@
     </p>
   </description>
   <launchable type="desktop-id">org.hyprav.avgui.desktop</launchable>
-  <url type="homepage">https://github.com/keanehatescoding/antivirus</url>
-  <url type="bugtracker">https://github.com/keanehatescoding/antivirus/issues</url>
+  <url type="homepage">https://github.com/keanehatescoding/antivirus_x86-64</url>
+  <url type="bugtracker">https://github.com/keanehatescoding/antivirus_x86-64/issues</url>
   <icon type="stock">org.hyprav.avgui</icon>
   <categories>
     <category>System</category>

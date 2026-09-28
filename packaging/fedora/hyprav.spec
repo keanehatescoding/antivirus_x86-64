@@ -68,8 +68,8 @@ Summary:        Kernel-level Linux antivirus (kprobe execve/file monitor + YARA/
 # releases (pre F38-ish) used the short name "GPLv3" instead - adjust
 # if targeting one of those.
 License:        GPL-3.0-only
-URL:            https://github.com/keanehatescoding/antivirus
-Source0:        %{url}/archive/%{gitcommit}/antivirus-%{gitcommit}.tar.gz
+URL:            https://github.com/keanehatescoding/antivirus_x86-64
+Source0:        %{url}/archive/%{gitcommit}/antivirus_x86-64-%{gitcommit}.tar.gz
 
 BuildRequires:  gcc
 BuildRequires:  make
@@ -141,7 +141,7 @@ on demand. Privileged actions go through pkexec avctl, gated by the
 per-verb org.hyprav.avctl.* polkit actions installed by the base package.
 
 %prep
-%autosetup -n antivirus-%{gitcommit}
+%autosetup -n antivirus_x86-64-%{gitcommit}
 
 %build
 make -C userspace/avd

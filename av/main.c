@@ -84,6 +84,7 @@
 #include <linux/workqueue.h>
 
 #include "behavior.h"
+#include "logfmt.h"
 #include "netlink_chan.h"
 #include "netlink_proto.h"
 #include "sigtable.h"
@@ -933,12 +934,23 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
                     const char *reason, const struct av_file_identity *ident) {
   struct task_struct *task;
   char *protected_path;
-  /* PID 1 checked before any allocation: killing init can panic the
-   * kernel, so bail before spending a PATH_MAX kmalloc on it. */
+  char *esc_path;
+  /* path/protected_exe go through av_log_escape() (logfmt.c), not a
+   * bare %s or %*pE, in every log line here (#166): a filename can
+   * contain quotes or newlines, which would otherwise forge extra
+   * fields or whole log lines in these quoted key=value records -
+   * and %*pE leaves '"' unescaped, see logfmt.c. Ordinary paths
+   * render identically, so nothing greppable changes for them. Same
+   * idiom as the hash-error/clean lines in av_work_fn(). A kmalloc
+   * failure logs "?" for the field, never skips the check or kill. */
+  esc_path = av_log_escape(path, GFP_KERNEL);
+  /* PID 1 checked before the PATH_MAX allocation below: killing init
+   * can panic the kernel, so bail before spending it. */
   if (pid_nr(target_pid) == 1) {
     pr_alert("kernel-av: event=suppressed action=none type=%s "
              "path=\"%s\" reason=\"%s\" pid=1\n",
-             type, path, reason);
+             type, av_log_str(esc_path), reason);
+    kfree(esc_path);
     return;
   }
   /* PATH_MAX (4096) is far too large for the kernel stack - heap-
@@ -953,11 +965,16 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
    * an operator-managed allow-list, same suppressed-not-skipped
    * treatment as the PID-1 guard above. */
   if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
+    char *esc_exe =
+        protected_path ? av_log_escape(protected_path, GFP_KERNEL) : NULL;
+
     pr_alert("kernel-av: event=suppressed action=none type=%s "
              "path=\"%s\" reason=\"%s\" pid=%d protected_exe=\"%s\"\n",
-             type, path, reason, pid_nr(target_pid),
-             protected_path ? protected_path : "?");
+             type, av_log_str(esc_path), reason, pid_nr(target_pid),
+             av_log_str(esc_exe));
+    kfree(esc_exe);
     kfree(protected_path);
+    kfree(esc_path);
     return;
   }
   kfree(protected_path);
@@ -978,16 +995,18 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
       pr_alert(
           "kernel-av: event=detected action=kill type=%s "
           "path=\"%s\" reason=\"%s\" pid=%d dev=%u:%u ino=%lu size=%lld\n",
-          type, path, reason, pid_nr(target_pid), MAJOR(ident->dev),
-          MINOR(ident->dev), ident->ino, (long long)ident->size);
+          type, av_log_str(esc_path), reason, pid_nr(target_pid),
+          MAJOR(ident->dev), MINOR(ident->dev), ident->ino,
+          (long long)ident->size);
     } else {
       pr_alert("kernel-av: event=detected action=kill type=%s "
                "path=\"%s\" reason=\"%s\" pid=%d\n",
-               type, path, reason, pid_nr(target_pid));
+               type, av_log_str(esc_path), reason, pid_nr(target_pid));
     }
     send_sig(SIGKILL, task, 0);
   }
   rcu_read_unlock();
+  kfree(esc_path);
 }
 
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
@@ -1027,6 +1046,7 @@ static void av_work_fn(struct work_struct *w) {
   char sig_name[AV_SIG_NAME_LEN];
   char reason[AV_SIG_NAME_LEN + 32];
   char *abs_path;
+  char *esc_path;
   int ret;
 
   /* hash_file_multi()/open_exec_target() already resolve a relative
@@ -1062,15 +1082,17 @@ static void av_work_fn(struct work_struct *w) {
      * executables unscanned. pr_warn_ratelimited, not pr_info: an
      * unscanned exec is worth a warning, and _ratelimited caps the
      * flood if this ever fires per-exec under memory pressure.
-     * Path goes through %*pE, not %s: a filename can contain quotes
-     * or newlines, which would otherwise forge extra fields or whole
-     * log lines in this quoted key=value record. Ordinary paths
-     * render identically, so nothing greppable changes for them.
-     * No behavior change - still skips to out. */
-    pr_warn_ratelimited("kernel-av: event=skip reason=hash-error path=\"%*pE\" "
+     * Path goes through av_log_escape(), not %s or %*pE: a filename
+     * can contain quotes or newlines, which would otherwise forge
+     * extra fields or whole log lines in this quoted key=value
+     * record (see logfmt.c for why %*pE isn't enough). Ordinary
+     * paths render identically, so nothing greppable changes for
+     * them. No behavior change - still skips to out. */
+    esc_path = av_log_escape(abs_path, GFP_KERNEL);
+    pr_warn_ratelimited("kernel-av: event=skip reason=hash-error path=\"%s\" "
                         "pid=%d err=%d\n",
-                        (int)strnlen(abs_path, PATH_MAX), abs_path,
-                        pid_nr(aw->target_pid), ret);
+                        av_log_str(esc_path), pid_nr(aw->target_pid), ret);
+    kfree(esc_path);
     goto out;
   }
 
@@ -1115,11 +1137,13 @@ static void av_work_fn(struct work_struct *w) {
        * keeps it visible at its current pr_info level while
        * capping it to the kernel's default rate limit
        * (10 msgs/5s) instead of one line per exec. */
+      esc_path = av_log_escape(abs_path, GFP_KERNEL);
       pr_info_ratelimited("kernel-av: event=clean type=daemon path=\"%s\" "
                           "pid=%d md5=%s sha1=%s sha256=%s dev=%u:%u ino=%lu\n",
-                          abs_path, pid_nr(aw->target_pid), digest.md5,
-                          digest.sha1, digest.sha256, MAJOR(ident.dev),
-                          MINOR(ident.dev), ident.ino);
+                          av_log_str(esc_path), pid_nr(aw->target_pid),
+                          digest.md5, digest.sha1, digest.sha256,
+                          MAJOR(ident.dev), MINOR(ident.dev), ident.ino);
+      kfree(esc_path);
     } else if (aw->fail_closed) {
       /* Operator had opted into fail-closed via
        * /proc/kernel_av_daemon_policy as of THIS exec's kprobe time
@@ -1139,10 +1163,12 @@ static void av_work_fn(struct work_struct *w) {
        * function), but log distinctly so this is visible/greppable
        * separately from a genuine daemon-confirmed clean verdict.
        * Same pr_info_ratelimited reasoning as above. */
+      esc_path = av_log_escape(abs_path, GFP_KERNEL);
       pr_info_ratelimited("kernel-av: event=clean type=fail-open path=\"%s\" "
                           "pid=%d md5=%s sha1=%s sha256=%s err=%d\n",
-                          abs_path, pid_nr(aw->target_pid), digest.md5,
-                          digest.sha1, digest.sha256, nl_ret);
+                          av_log_str(esc_path), pid_nr(aw->target_pid),
+                          digest.md5, digest.sha1, digest.sha256, nl_ret);
+      kfree(esc_path);
     }
   }
 
