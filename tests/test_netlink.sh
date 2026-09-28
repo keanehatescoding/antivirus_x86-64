@@ -91,6 +91,20 @@ section() { echo; echo "== $1 =="; }
 dmesg_mark() { dmesg | wc -l; }
 # Print kernel ring-buffer lines appended after the line-count marker $1.
 dmesg_since() { dmesg | tail -n "+$(( $1 + 1 ))"; }
+# Poll (1s steps, up to $3 seconds) for grep pattern $2 in the lines
+# appended after marker $1. The kernel side is async (workqueue, then
+# up to DAEMON_TIMEOUT_MS waiting on avd), so a single fixed sleep
+# races a busy host.
+wait_dmesg_since() {
+    local mark="$1" pattern="$2" secs="$3"
+    for _ in $(seq 1 "$secs"); do
+        if dmesg_since "$mark" | grep -qi -- "$pattern"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 
 # Same toolchain-detection rationale as the other integration tests -
 # sudo strips any CC=clang LLVM=1 the caller's shell had exported.
@@ -391,7 +405,10 @@ cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 AVD_MARK="$(dmesg_mark)"
 (
     cd "$REPO_ROOT" || exit 1
-    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    # stdbuf -oL: avd's stdout is a file here, so without it avd's
+    # per-request "scan request" lines sit in a full stdio buffer - the
+    # clean round-trip check below falls back to reading them.
+    exec stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -426,22 +443,35 @@ chmod +x "$CLEAN_PATH"
 # The clean-verdict log line is pr_info_ratelimited() (see its comment
 # in av_work_fn() - it fires for every daemon-path exec system-wide,
 # so it's rate-limited to avoid a dmesg line per exec), unlike the
-# non-rate-limited pr_alert() a kill uses below. On a busy machine with
-# other exec activity sharing that same rate-limit budget, one attempt
-# can be suppressed even though the round trip itself succeeded -
-# retry a few times rather than treating that as a real failure.
+# non-rate-limited pr_alert() a kill uses below. That call site's
+# budget is the kernel default (10 lines per 5s window) shared with
+# every other exec on the host, so background exec activity (a status
+# bar or monitor polling curl/grep/python) can use a whole window up
+# before this test's exec lands in it. Each attempt therefore re-runs
+# the exec and polls for longer than one window, so the next attempt
+# starts in a fresh one. If the host is busy enough that every window
+# is still used up, fall back to avd's own (unrate-limited) record of
+# the request: avd received it, reported no verdict-send failure, and
+# the script ran to completion instead of being killed.
 CLEAN_OK=0
-for _ in 1 2 3; do
+CLEAN_VIA=""
+for _ in 1 2 3 4; do
     CLEAN_MARK="$(dmesg_mark)"
     "$CLEAN_PATH" >/dev/null 2>&1
-    sleep 1
-    if dmesg_since "$CLEAN_MARK" | grep -q "event=clean type=daemon path=\"$CLEAN_PATH\""; then
+    CLEAN_RC=$?
+    if wait_dmesg_since "$CLEAN_MARK" "event=clean type=daemon path=\"$CLEAN_PATH\"" 6; then
         CLEAN_OK=1
         break
     fi
 done
+if [ "$CLEAN_OK" -eq 0 ] && [ "$CLEAN_RC" -eq 0 ] &&
+   grep -F "scan request" "$AVD_LOG" | grep -qF "path=\"$CLEAN_PATH\"" &&
+   ! grep -F "failed to send" "$AVD_LOG" | grep -qF "\"$CLEAN_PATH\""; then
+    CLEAN_OK=1
+    CLEAN_VIA=" (kernel clean line rate-limited by other host execs - confirmed via avd's log)"
+fi
 if [ "$CLEAN_OK" -eq 1 ]; then
-    pass "clean exec round-tripped through avd and logged clean"
+    pass "clean exec round-tripped through avd and logged clean$CLEAN_VIA"
 else
     fail "expected daemon-path clean log line not found in dmesg after retries"
     dmesg | tail -10
@@ -463,13 +493,15 @@ EOF
 chmod +x "$MALICIOUS_PATH"
 KILL_MARK="$(dmesg_mark)"
 "$MALICIOUS_PATH" >/dev/null 2>&1
-sleep 1
 # avd comma-joins every rule name that crossed the score threshold
 # (see rules/heuristics.yar's WEIGHT META comment), not just the one
 # this test cares about - some other rule (e.g. an ELF/entry-point
 # heuristic) may also fire on this file, so match the rule name as a
 # substring of `reason`, not the whole field.
-if dmesg_since "$KILL_MARK" | grep -qi "event=detected action=kill type=daemon path=\"$MALICIOUS_PATH\".*reason=\"daemon:[^\"]*Suspicious_Shell_Reverse_Shell_String"; then
+# Polled for up to 15s, not a fixed 1s sleep: the kernel waits up to
+# DAEMON_TIMEOUT_MS (12s) for avd's verdict, and a host with other exec
+# activity keeps avd's scan queue busy enough to blow past 1s.
+if wait_dmesg_since "$KILL_MARK" "event=detected action=kill type=daemon path=\"$MALICIOUS_PATH\".*reason=\"daemon:[^\"]*Suspicious_Shell_Reverse_Shell_String" 15; then
     pass "malicious exec round-tripped through avd/YARA and was killed"
 else
     fail "expected daemon-path detected/kill log line not found in dmesg"

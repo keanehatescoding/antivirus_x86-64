@@ -96,8 +96,21 @@ sleep 1
 
 section "clean-file sanity check (should NOT be killed, should log as clean)"
 dmesg -C  # clear dmesg so we only see events from this point on
-/bin/ls >/dev/null
-if wait_for_dmesg 'event=clean.*path="/bin/ls"' 5; then
+# No avd here, so /bin/ls logs through the fail-open clean line - a
+# pr_info_ratelimited() call site (kernel default: 10 lines per 5s
+# window) shared with every other exec on the host. Background exec
+# activity can use a whole window up before this exec lands in it, so
+# each attempt re-runs the exec and waits longer than one window,
+# letting the next attempt start in a fresh one.
+CLEAN_OK=0
+for _ in 1 2 3 4; do
+    /bin/ls >/dev/null
+    if wait_for_dmesg 'event=clean.*path="/bin/ls"' 6; then
+        CLEAN_OK=1
+        break
+    fi
+done
+if [ "$CLEAN_OK" -eq 1 ]; then
     pass "clean file logged as clean"
 else
     fail "expected clean-file log line not found in dmesg"
