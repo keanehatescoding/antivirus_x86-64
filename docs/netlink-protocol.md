@@ -97,8 +97,8 @@ fail-closed before that exec's work item was processed, since the
 check read the *current* value, not the value at launch time, and it
 wasn't scoped to some other process either — flipping this from an
 interactive shell with no daemon running could get that shell's own
-recent exec caught by it too. **Fixed:** `handler_pre()`/
-`handler_pre_execveat()` now snapshot the policy into `struct
+recent exec caught by it too. **Fixed:** the exec kprobe handler
+(now `handler_pre_bprm_check()`) snapshots the policy into `struct
 av_work`'s `fail_closed` field at kprobe time, and `av_work_fn()`
 enforces that snapshot instead of re-reading the live value — an
 operator toggling the policy now only affects execs observed *after*

@@ -99,9 +99,11 @@ best avoided — particularly right before a tag.
   are both kernel-version-sensitive. That's exactly what the
   `build-matrix.yml` matrix exists to catch — "works on my kernel" isn't
   enough on its own.
-- x86_64 only, for now — the module resolves `__x64_sys_execve` by
-  symbol name. Porting to arm64 means finding the equivalent
-  `__arm64_sys_*` symbols throughout, not just a `Makefile` tweak.
+- x86_64 only, for now — the behavioral hooks (openat, unlink, rename)
+  resolve `__x64_sys_*` by symbol name. Porting to arm64 means finding
+  the equivalent `__arm64_sys_*` symbols throughout, not just a
+  `Makefile` tweak. The exec hook probes `security_bprm_check`, which is
+  arch-neutral but needs `CONFIG_SECURITY=y`.
 
 ## Adding or changing YARA rules
 

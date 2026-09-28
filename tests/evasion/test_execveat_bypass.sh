@@ -2,11 +2,14 @@
 #
 # test_execveat_bypass.sh - execveat() coverage test (post-fix
 # regression, not really an "evasion" in the adversarial sense the
-# other scripts in this dir test - included here because until the
+# other scripts in this dir test - included here because until an
 # execveat kprobe was added, calling execveat() instead of execve()
 # was a complete, trivial bypass of every exec-based check: no
 # hash/signature match, no daemon scan, no av_behavior_record_exec()
-# call at all).
+# call at all). The exec hook is now a single kprobe on
+# security_bprm_check() (#87), which both syscalls reach with the
+# kernel's own already-opened bprm->file, so these cases now guard
+# against a regression back to per-syscall pathname handling.
 #
 # Technique: glibc has no execveat() wrapper, so this calls the raw
 # syscall directly via syscall(SYS_execveat, ...). Covers six cases
@@ -19,17 +22,14 @@
 #   3. real dfd + relative path       - dfd resolution (openat's bug, for exec)
 #   4. memfd_create() + AT_EMPTY_PATH - fileless exec (fexecve()-style):
 #      pathname is empty and dfd names the target directly, no
-#      filesystem path to resolve at all. Previously a documented gap
-#      (open_exec_target() had nothing to open); handler_pre_execveat()
-#      now special-cases AT_EMPTY_PATH and resolves the target via
-#      dfd's own struct path directly - see main.c's comments on the
-#      empty-string sentinel in resolve_absolute_path()/
-#      open_exec_target().
+#      filesystem path to resolve at all. Previously a documented gap,
+#      then special-cased in the old execveat kprobe; with the
+#      security_bprm_check() hook, bprm->file is the memfd itself.
 #   5. real dfd + non-empty relative path + AT_EMPTY_PATH set anyway -
 #      per execveat(2), AT_EMPTY_PATH only changes anything when the
 #      pathname is actually empty; a non-empty pathname resolves
 #      exactly as it would without the flag, and that resolution
-#      succeeds. Regression case for a bug this hook briefly had:
+#      succeeds. Regression case for a bug the old execveat hook briefly had:
 #      treating "AT_EMPTY_PATH is set" as "trust the flag, skip
 #      scanning" would have made the flag a free bypass for an
 #      otherwise-ordinary dfd-relative exec. Must be detected exactly
@@ -167,8 +167,8 @@ if check_detected "$TESTDIR/eicar.com"; then
 	echo "PASS: detected via AT_FDCWD + absolute path"
 	PASS=$((PASS + 1))
 else
-	echo "FAIL: no detection - check the execveat kprobe symbol/register"
-	echo "      mapping first (sudo cat /proc/kallsyms | grep sys_execveat)"
+	echo "FAIL: no detection - check that the security_bprm_check kprobe"
+	echo "      registered (sudo grep security_bprm_check /sys/kernel/debug/kprobes/list)"
 	FAIL=$((FAIL + 1))
 fi
 echo
@@ -184,7 +184,7 @@ if check_detected "$TESTDIR/eicar.com"; then
 	PASS=$((PASS + 1))
 else
 	echo "FAIL: relative path not resolved (or resolved to the wrong string) -"
-	echo "      check that aw->pwd is actually being set from resolve_dfd_path()"
+	echo "      check the d_path() of aw->file in av_work_fn()"
 	FAIL=$((FAIL + 1))
 fi
 echo
@@ -202,8 +202,8 @@ if check_detected "$TESTDIR/subdir/eicar.com"; then
 	PASS=$((PASS + 1))
 else
 	echo "FAIL: dfd was ignored/mishandled - this is openat's dfd-ignored bug's"
-	echo "      exact counterpart for exec; check resolve_dfd_path()'s return"
-	echo "      value path in handler_pre_execveat(), not the hashing logic"
+	echo "      exact counterpart for exec; check handler_pre_bprm_check() and"
+	echo "      the d_path() of aw->file in av_work_fn(), not the hashing logic"
 	FAIL=$((FAIL + 1))
 fi
 echo
@@ -224,10 +224,8 @@ if dmesg | tail -10 | grep -q 'event=detected.*action=kill.*path="/memfd:execvea
 	echo "PASS: fileless exec (memfd + AT_EMPTY_PATH) detected and killed"
 	PASS=$((PASS + 1))
 else
-	echo "FAIL: memfd + AT_EMPTY_PATH exec was not detected - check the"
-	echo "      AT_EMPTY_PATH branch in handler_pre_execveat() and the"
-	echo "      empty-string sentinel handling in resolve_absolute_path()/"
-	echo "      open_exec_target() in main.c"
+	echo "FAIL: memfd + AT_EMPTY_PATH exec was not detected - check"
+	echo "      handler_pre_bprm_check() and hash_file_multi() in main.c"
 	dmesg | tail -10
 	FAIL=$((FAIL + 1))
 fi
@@ -249,9 +247,9 @@ if check_detected "$TESTDIR/subdir/eicar.com"; then
 	echo "PASS: AT_EMPTY_PATH + non-empty path still resolved/detected normally"
 	PASS=$((PASS + 1))
 else
-	echo "FAIL: AT_EMPTY_PATH + non-empty path was NOT detected - handler_pre_execveat()"
+	echo "FAIL: AT_EMPTY_PATH + non-empty path was NOT detected - the exec hook"
 	echo "      is treating the flag as authoritative and skipping the scan instead of"
-	echo "      only special-casing an actually-empty pathname"
+	echo "      scanning whatever file the kernel actually opened"
 	FAIL=$((FAIL + 1))
 fi
 echo
@@ -262,7 +260,7 @@ echo
 # syscall fails before executing anything, so no kill event should
 # ever appear for it. Absence of a kill event alone doesn't prove
 # that, though - the helper could have died before ever reaching the
-# syscall, or (if handler_pre_execveat() regressed some other way) the
+# syscall, or (if the exec hook regressed some other way) the
 # syscall could have unexpectedly succeeded without being detected.
 # execveat_runner exits with errno itself on failure (see the C source
 # above), so assert the specific failure this case requires: ENOENT
@@ -279,7 +277,7 @@ if [ "$rc" -ne "$ENOENT" ]; then
 	FAIL=$((FAIL + 1))
 elif dmesg | tail -10 | grep -q 'event=detected.*action=kill'; then
 	echo "FAIL: a kill event fired for a syscall that should have failed with ENOENT -"
-	echo "      handler_pre_execveat() scanned dfd despite empty_path being false"
+	echo "      the exec hook scanned something for an exec that never opened a file"
 	dmesg | tail -10
 	FAIL=$((FAIL + 1))
 else

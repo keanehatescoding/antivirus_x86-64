@@ -78,25 +78,17 @@ not oversights. A *new* way to defeat one of them is still very welcome:
   kernel module lets the exec through rather than blocking it, so a
   crashed daemon can't become a system-wide DoS. `avctl policy set
   fail-closed` opts out of this. See `docs/netlink-protocol.md`.
-- **Two known exec-interception gaps** (kernel side). Both stem from
-  intercepting exec via a kprobe on `__x64_sys_execve`, and neither is
-  fixable at the kprobe level — they're tracked together for migration to
-  an LSM `security_bprm_check` hook in #102.
-  - **Deterministic fail-open on cold pathnames** (#87). `handler_pre()`
-    runs in atomic context, so `strncpy_from_user()` can't fault in a
-    not-resident pathname page: it returns `-EFAULT` and the handler
-    returns 0 without scanning. This is deterministic, not a race — it's
-    reproduced on every CI run via `tests/qemu-boot/cold_launcher.c`.
-    Three fixes were considered and rejected; full writeup in the
-    `KNOWN GAP - COLD-PATHNAME BYPASS` comment above `handler_pre()` in
-    `av/main.c`.
-  - **TOCTOU on the re-opened exec target** (#88). `av_work_fn()` hashes
-    the target via its own separate, later open, which isn't guaranteed to
-    be the inode the kernel actually executed. `struct av_file_identity`
-    records what was hashed for post-incident review but does not close
-    the race. Writeup in the comment above `av_work_fn()`.
-- **x86_64 only.** The module hooks `__x64_sys_execve` by symbol name and
-  will not build or load on arm64.
+- **Kill-after-exec, not exec-time blocking** (kernel side). Exec is
+  intercepted by a kprobe on `security_bprm_check`, which pins the
+  kernel's own `bprm->file` and hashes that exact file on a workqueue —
+  so there is no pathname copy to fail (#87's cold-pathname bypass) and
+  no path re-open that could hash a different inode (half of #88). But a
+  kprobe can't veto the exec, and the verdict is asynchronous, so a
+  malicious binary still runs briefly before it's killed. Exec-time prevention via
+  fanotify `FAN_OPEN_EXEC_PERM` in `avd` is tracked in #176, under #102.
+  Writeup in the comment above `av_work_fn()` in `av/main.c`.
+- **x86_64 only.** The behavioral hooks probe `__x64_sys_*` by symbol
+  name, so the module will not build or load on arm64.
 
 ## Reporting
 

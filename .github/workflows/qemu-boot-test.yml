@@ -124,6 +124,14 @@ jobs:
           ./scripts/config --enable CONFIG_CRYPTO_SHA256
           ./scripts/config --enable CONFIG_PROC_FS
           ./scripts/config --enable CONFIG_NET
+          # av.ko probes security_bprm_check() for exec (#87/#102),
+          # which is only a real, probe-able symbol with
+          # CONFIG_SECURITY=y (main.c #errors without it).
+          # SECURITY depends on SYSFS and MULTIUSER, both of
+          # which tinyconfig (allnoconfig-based) turns off.
+          ./scripts/config --enable CONFIG_SYSFS
+          ./scripts/config --enable CONFIG_MULTIUSER
+          ./scripts/config --enable CONFIG_SECURITY
           # ... plus what's needed to actually BOOT to a working init
           # and exec things, on top of just compiling: a console to
           # see anything at all, initramfs support, ELF exec (without
