@@ -102,10 +102,15 @@ dmesg -C  # clear dmesg so we only see events from this point on
 # activity can use a whole window up before this exec lands in it, so
 # each attempt re-runs the exec and waits longer than one window,
 # letting the next attempt start in a fresh one.
+#
+# The module logs the canonical d_path() of the file actually executed,
+# so on usr-merged distros (/bin -> usr/bin) /bin/ls shows up as
+# /usr/bin/ls - match on the resolved path, not the one typed here.
+CLEAN_BIN="$(readlink -f /bin/ls)"
 CLEAN_OK=0
 for _ in 1 2 3 4; do
     /bin/ls >/dev/null
-    if wait_for_dmesg 'event=clean.*path="/bin/ls"' 6; then
+    if wait_for_dmesg "event=clean.*path=\"$CLEAN_BIN\"" 6; then
         CLEAN_OK=1
         break
     fi
@@ -115,7 +120,7 @@ if [ "$CLEAN_OK" -eq 1 ]; then
 else
     fail "expected clean-file log line not found in dmesg"
 fi
-if dmesg | grep -q 'event=detected.*path="/bin/ls"'; then
+if dmesg | grep -q "event=detected.*path=\"$CLEAN_BIN\""; then
     fail "clean file was incorrectly flagged as a detection"
 else
     pass "clean file was not flagged"
