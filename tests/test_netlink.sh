@@ -552,11 +552,12 @@ else
     # poll(). Read its syscall number (x86-64: 47 = recvmsg) and require
     # it to leave recvmsg within 2s; a scan request from the host's own
     # execs can pass through recvmsg briefly, so only a thread that
-    # never leaves it counts.
+    # never leaves it counts. A failed read (avd gone, /proc unreadable)
+    # proves nothing, so it never counts as leaving.
     AVD_MAIN_LEFT_RECV=0
     for _ in $(seq 1 20); do
         AVD_MAIN_SYSCALL="$(cut -d' ' -f1 "/proc/$AVD_PID/task/$AVD_PID/syscall" 2>/dev/null)"
-        if [ "$AVD_MAIN_SYSCALL" != 47 ]; then
+        if [ -n "$AVD_MAIN_SYSCALL" ] && [ "$AVD_MAIN_SYSCALL" != 47 ]; then
             AVD_MAIN_LEFT_RECV=1
             break
         fi
@@ -564,6 +565,8 @@ else
     done
     if [ "$AVD_MAIN_LEFT_RECV" -eq 1 ]; then
         pass "avd's main thread is not parked in recvmsg() on the unfinished multipart"
+    elif [ -z "$AVD_MAIN_SYSCALL" ]; then
+        fail "could not read avd's main-thread syscall from /proc - did avd exit? See $AVD_LOG"
     else
         fail "avd's main thread is stuck in recvmsg() waiting for NLMSG_DONE"
     fi
