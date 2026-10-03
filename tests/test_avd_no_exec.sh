@@ -90,10 +90,12 @@ else
 fi
 
 echo "=== sources ==="
-# Word-boundary call sites only: comments mentioning exec*() are fine
-# as long as they are not calls - strip // and /* */ lines crudely by
-# requiring an opening parenthesis right after the name.
-hits="$(grep -nEw "($SYMS)[[:space:]]*\(" "$AVD_DIR"/*.c "$AVD_DIR"/*.h |
+# Call sites only: the name must start at a word boundary and be
+# followed by an opening parenthesis; lines that start as comments are
+# then dropped crudely. Not grep -w: that also demands a non-word
+# character after the match, which ends in "(", so it would miss
+# execve(path, ...) and system(cmd) and only catch fork().
+hits="$(grep -nE "(^|[^[:alnum:]_])($SYMS)[[:space:]]*\(" "$AVD_DIR"/*.c "$AVD_DIR"/*.h |
         grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
 if [ -z "$hits" ]; then
     pass "no exec/fork/spawn-family call in userspace/avd sources"
