@@ -82,6 +82,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -452,9 +453,22 @@ struct quarantine_meta {
 static const char *control_sock_path = DEFAULT_CONTROL_SOCK_PATH;
 static int control_sock_fd = -1;
 
+/* Self-pipe the termination handler writes to, polled alongside the
+ * netlink socket by the main receive loop. Needed because libnl's
+ * nl_recv() retries recvmsg() on EINTR internally, so a signal alone
+ * never makes nl_recvmsgs_default() return - shutdown would otherwise
+ * wait for the next kernel scan request, which on an idle system may
+ * never come. */
+static int sig_wake_pipe[2] = {-1, -1};
+
 static void handle_sigint(int signum) {
+  int saved_errno = errno;
+
   (void)signum;
   running = 0;
+  if (sig_wake_pipe[1] >= 0)
+    (void)!write(sig_wake_pipe[1], "x", 1);
+  errno = saved_errno;
 }
 
 /*
@@ -3600,6 +3614,11 @@ int main(int argc, char **argv) {
    * pins exactly what we need - persistent handler, no SA_RESTART so a
    * blocking accept()/recv() EINTRs out promptly and the shutdown path
    * observes `running == 0` instead of hanging past it. */
+  if (pipe2(sig_wake_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+    fprintf(stderr, "avd: failed to create the shutdown wake pipe: %s\n",
+            strerror(errno));
+    return 1;
+  }
   {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -3613,13 +3632,15 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  /* Route SIGINT/SIGTERM to the main thread's nl_recvmsgs_default()
-   * loop below. All threads inherit their creator's signal mask, so a
+  /* Route SIGINT/SIGTERM to the main thread's netlink receive loop
+   * below. All threads inherit their creator's signal mask, so a
    * process-directed SIGINT/SIGTERM arriving with the mask unblocked
    * could run handle_sigint() on a worker or control thread instead:
    * `running` would go to 0 there while the main thread stayed blocked
-   * in nl_recvmsgs_default() with nothing to EINTR it out, hanging
-   * shutdown. Blocking both signals here (before any pthread_create())
+   * in its poll() with nothing to EINTR it out, hanging shutdown (the
+   * handler's sig_wake_pipe write would still wake it, but the main
+   * thread is the one place delivery is guaranteed to be observed).
+   * Blocking both signals here (before any pthread_create())
    * makes every subsequently spawned thread inherit them blocked; the
    * main thread unblocks them again just before entering the receive
    * loop, so termination is always delivered to the one thread whose
@@ -3824,14 +3845,42 @@ int main(int argc, char **argv) {
       }
     }
 
-    while (running) {
-      int ret = nl_recvmsgs_default(sock);
-      if (ret < 0 && ret != -NLE_INTR) {
-        fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n",
-                nl_geterror(ret));
-        break;
+    /* Wait in poll(), not inside libnl: nl_recvmsgs_default() retries
+     * an EINTR'd recvmsg() itself, so it is only entered once the
+     * socket is readable. A termination signal both EINTRs the poll()
+     * and, via sig_wake_pipe, wakes it if it lands just before the
+     * call - no window where `running == 0` goes unobserved. */
+    {
+      struct pollfd pfds[2] = {
+          {.fd = nl_socket_get_fd(sock), .events = POLLIN},
+          {.fd = sig_wake_pipe[0], .events = POLLIN},
+      };
+
+      while (running) {
+        int ret;
+
+        if (poll(pfds, 2, -1) < 0) {
+          if (errno == EINTR)
+            continue;
+          fprintf(stderr, "avd: poll on the netlink socket failed: %s\n",
+                  strerror(errno));
+          break;
+        }
+        if (!pfds[0].revents)
+          continue;
+        ret = nl_recvmsgs_default(sock);
+        if (ret < 0 && ret != -NLE_INTR) {
+          fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n",
+                  nl_geterror(ret));
+          break;
+        }
       }
     }
+    /* Leaving on an error rather than a signal: clear `running` too,
+     * or control_accept_main() takes the shutdown wake-up connection
+     * below as a real one, parks in accept() again and the join hangs
+     * (seen when a second avd lost the REGISTER race - NLE_BUSY). */
+    running = 0;
 
     printf("avd: shutting down, draining %zu queued scan(s)...\n", queue_len);
     pthread_mutex_lock(&queue_lock);
