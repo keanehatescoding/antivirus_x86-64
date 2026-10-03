@@ -91,9 +91,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/fanotify.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -109,6 +111,7 @@
 
 #include "../../av/netlink_proto.h"
 #include "control_parse.h"
+#include "fan_parse.h"
 #include "sha256.h"
 #include "tlsh_shim.h"
 
@@ -340,6 +343,11 @@ struct scan_result {
   int score; /* YARA aggregate score - 0 for a fuzzy/TLSH-only match or
              * a clean result; supplementary info, not authoritative */
   char sha256_hex[65];
+  /* True when the verdict is CLEAN only because the pipeline failed
+   * open (no rules loaded, rewind or YARA error/timeout) rather than
+   * because every check ran and came back clean. The fanotify verdict
+   * cache refuses to remember such a result - see fan_cache_store(). */
+  bool inconclusive;
 };
 
 /* Bounded producer/consumer queue between the scan producers (the single
@@ -373,6 +381,11 @@ struct scan_task {
    * returning). The worker fills it in under `lock` and signals `done`
    * exactly once, then never touches it again. */
   struct scan_completion *completion;
+  /* Non-NULL: a held fanotify exec (#176), scanned through the event's
+   * own fd and answered with FAN_ALLOW/FAN_DENY by fan_run_task(). The
+   * fd and every other field live in the pending record, which the
+   * listener shares - see struct fan_pending. */
+  struct fan_pending *fan;
 };
 
 struct scan_completion {
@@ -1876,6 +1889,179 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
            linked ? "" : " (copy fallback)");
 }
 
+/* ---- fanotify exec-permission enforcement: shared state (#176) ----
+ *
+ * Phase 2 of #102. With AVD_FANOTIFY=1, avd holds every exec on a
+ * marked local filesystem (FAN_OPEN_EXEC_PERM) until it has a verdict,
+ * and answers FAN_DENY for a malicious image - prevention, where the
+ * kernel module's bprm_check kprobe can only kill after the fact. The
+ * kprobe stays loaded as the fallback detector for when avd is down.
+ * The listener itself lives further down (fan_listener_main()); this
+ * block is the state perform_scan() and handle_scan_request() consult,
+ * so it has to be declared before them. */
+
+/* Set once in main() before any thread starts, read-only after (same
+ * reasoning as avd_scan_threads). fan_active is true only once
+ * fanotify_init() and at least one filesystem mark succeeded. */
+static bool fan_enabled; /* AVD_FANOTIFY=1 */
+static bool fan_active;
+static int fan_fd = -1;
+static int avd_fan_timeout_ms;
+#define AVD_FAN_TIMEOUT_MS_DEFAULT ((SCAN_TIMEOUT_SECS + 1) * 1000)
+#define AVD_FAN_TIMEOUT_MS_MIN 100
+#define AVD_FAN_TIMEOUT_MS_MAX 60000
+
+/* Counters for STATUS, under metrics_lock like the scan metrics. */
+static uint64_t fan_events_total;
+static uint64_t fan_cache_hits;
+static uint64_t fan_denied;
+static uint64_t fan_fallbacks; /* answered by policy, not by a verdict */
+
+/* SHA-256 snapshot of /proc/kernel_av_signatures, sorted by hex for
+ * bsearch(). Replaced wholesale by fan_sigs_refresh() (listener thread)
+ * under the write lock; perform_scan() reads it under the read lock
+ * from any worker. Empty unless fanotify enforcement is active. */
+#define AVD_SIG_NAME_LEN 64 /* AV_SIG_NAME_LEN in av/sigtable.h */
+struct fan_sig {
+  char hex[65];
+  char name[AVD_SIG_NAME_LEN];
+};
+static struct fan_sig *fan_sigs;
+static size_t fan_sig_count;
+static pthread_rwlock_t fan_sig_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static int fan_sig_cmp(const void *a, const void *b) {
+  return strcmp(((const struct fan_sig *)a)->hex,
+                ((const struct fan_sig *)b)->hex);
+}
+
+static bool fan_sig_lookup(const char *sha256_hex, char *name_out,
+                           size_t name_out_len) {
+  struct fan_sig key;
+  const struct fan_sig *hit = NULL;
+
+  if (strlen(sha256_hex) != 64)
+    return false;
+  memcpy(key.hex, sha256_hex, sizeof(key.hex));
+  pthread_rwlock_rdlock(&fan_sig_lock);
+  if (fan_sig_count)
+    hit = bsearch(&key, fan_sigs, fan_sig_count, sizeof(*fan_sigs),
+                  fan_sig_cmp);
+  if (hit)
+    snprintf(name_out, name_out_len, "%s", hit->name);
+  pthread_rwlock_unlock(&fan_sig_lock);
+  return hit != NULL;
+}
+
+/* Verdict cache, so /bin/sh isn't run through YARA on every exec.
+ * Direct-mapped on (dev, ino); an entry only answers for the exact
+ * (size, mtime, ctime) it was scanned at. ctime is the change cookie:
+ * userspace can set mtime back with utimensat() but cannot set ctime,
+ * and every write, truncate, chmod or rename-over bumps it. On kernels
+ * with multigrain timestamps (6.13+, ext4/xfs/btrfs/tmpfs) the fstat()
+ * done here at event time guarantees the next change gets a distinct
+ * ctime even within the same timer tick; on older kernels a same-size
+ * rewrite inside one coarse tick (~1-4 ms) of the cached scan is the
+ * residual window - see docs/fanotify-enforcement.md.
+ *
+ * `gen` ties each entry to the signature snapshot it was judged
+ * against: fan_sigs_refresh() bumps fan_cache_gen whenever the
+ * sigtable content changes, which invalidates every entry at once, so
+ * an `avctl sig add` takes effect on already-cached files. */
+#define FAN_CACHE_SLOTS 4096
+struct fan_cache_entry {
+  bool valid;
+  uint64_t gen;
+  dev_t dev;
+  ino_t ino;
+  off_t size;
+  struct timespec mtim;
+  struct timespec ctim;
+  uint8_t verdict;
+  char rule_name[AV_RULE_NAME_MAXLEN + 1];
+};
+static struct fan_cache_entry *fan_cache;
+static uint64_t fan_cache_gen = 1;
+static pthread_mutex_t fan_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t fan_cache_slot(dev_t dev, ino_t ino) {
+  uint64_t h = (uint64_t)ino * 0x9E3779B97F4A7C15ULL ^ (uint64_t)dev;
+
+  h ^= h >> 29;
+  return (size_t)(h % FAN_CACHE_SLOTS);
+}
+
+static bool fan_stat_same(const struct stat *a, const struct stat *b) {
+  return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+         a->st_size == b->st_size &&
+         a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
+         a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+         a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
+         a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+
+static uint64_t fan_cache_current_gen(void) {
+  uint64_t gen;
+
+  pthread_mutex_lock(&fan_cache_lock);
+  gen = fan_cache_gen;
+  pthread_mutex_unlock(&fan_cache_lock);
+  return gen;
+}
+
+/* True with *verdict_out / rule_out filled when `st` matches a cached
+ * verdict from the current signature generation. */
+static bool fan_cache_lookup(const struct stat *st, uint8_t *verdict_out,
+                             char *rule_out, size_t rule_out_len) {
+  const struct fan_cache_entry *e;
+  bool hit = false;
+
+  if (!fan_cache)
+    return false;
+  pthread_mutex_lock(&fan_cache_lock);
+  e = &fan_cache[fan_cache_slot(st->st_dev, st->st_ino)];
+  if (e->valid && e->gen == fan_cache_gen && e->dev == st->st_dev &&
+      e->ino == st->st_ino && e->size == st->st_size &&
+      e->mtim.tv_sec == st->st_mtim.tv_sec &&
+      e->mtim.tv_nsec == st->st_mtim.tv_nsec &&
+      e->ctim.tv_sec == st->st_ctim.tv_sec &&
+      e->ctim.tv_nsec == st->st_ctim.tv_nsec) {
+    *verdict_out = e->verdict;
+    if (rule_out)
+      snprintf(rule_out, rule_out_len, "%s", e->rule_name);
+    hit = true;
+  }
+  pthread_mutex_unlock(&fan_cache_lock);
+  return hit;
+}
+
+/* Remembers a verdict only when it is safe to: the scan was conclusive,
+ * the file's identity did not change between the fstat() taken when
+ * the event arrived (`before`) and the one after the scan (`after` -
+ * a change means the bytes scanned may not be the bytes on disk now),
+ * and the signature snapshot did not change mid-scan (`gen`). */
+static void fan_cache_store(const struct stat *before, const struct stat *after,
+                            uint64_t gen, const struct scan_result *res) {
+  struct fan_cache_entry *e;
+
+  if (!fan_cache || res->inconclusive || !fan_stat_same(before, after))
+    return;
+  pthread_mutex_lock(&fan_cache_lock);
+  if (gen == fan_cache_gen) {
+    e = &fan_cache[fan_cache_slot(before->st_dev, before->st_ino)];
+    e->valid = true;
+    e->gen = gen;
+    e->dev = before->st_dev;
+    e->ino = before->st_ino;
+    e->size = before->st_size;
+    e->mtim = before->st_mtim;
+    e->ctim = before->st_ctim;
+    e->verdict = res->verdict;
+    snprintf(e->rule_name, sizeof(e->rule_name), "%s", res->rule_name);
+  }
+  pthread_mutex_unlock(&fan_cache_lock);
+}
+
 /*
  * Shared core of file analysis - YARA, then fuzzy/TLSH fallback,
  * quarantine on MALICIOUS, and a verdict_history record either way.
@@ -1929,8 +2115,28 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                * proceed without one rather than failing the scan
                * over it */
 
-  if (!compiled_rules)
+  /* Exact-hash signatures first (#176): the kernel's sigtable is
+   * normally matched post-exec by the bprm_check kprobe, which can only
+   * kill. With the fanotify listener holding the exec, avd matches the
+   * same SHA-256 entries here so a known-bad image is refused before it
+   * runs. The snapshot is empty unless fanotify enforcement is active
+   * (see fan_sigs_refresh()), so this is a no-op otherwise. */
+  if (hash[0]) {
+    char sig_name[AV_RULE_NAME_MAXLEN + 1];
+
+    if (fan_sig_lookup(hash, sig_name, sizeof(sig_name))) {
+      out->verdict = AV_VERDICT_MALICIOUS;
+      snprintf(out->rule_name, sizeof(out->rule_name), "Sig:%.58s", sig_name);
+      printf("avd: SIGNATURE MATCH \"%s\" -> \"%s\"\n", path, sig_name);
+      quarantine_file(fd, path, out->rule_name, hash);
+      goto record;
+    }
+  }
+
+  if (!compiled_rules) {
+    out->inconclusive = true;
     goto record;
+  }
 
   printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
          on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
@@ -1947,6 +2153,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
     fprintf(stderr, "avd: lseek(\"%s\", SEEK_SET) before YARA scan failed: "
                     "%s - failing open\n",
             path, strerror(errno));
+    out->inconclusive = true;
     goto record;
   }
 
@@ -1958,6 +2165,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
      * stance on inconclusive information (see docs/netlink-protocol.md). */
     fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
             ret);
+    out->inconclusive = true;
     goto record;
   }
 
@@ -2152,6 +2360,25 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
       send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
       return;
     }
+
+    /* With fanotify enforcement active this exec was already held and
+     * judged by fan_run_task() moments ago (FAN_OPEN_EXEC_PERM fires in
+     * open_exec(), before security_bprm_check()), so the kernel's
+     * fallback request is answered from the verdict cache instead of
+     * scanning the same image twice. A miss (cache disabled, the
+     * fanotify verdict timed out, an unmarked filesystem) falls
+     * through to a normal scan. */
+    if (fan_active) {
+      uint8_t cached;
+      char cached_rule[AV_RULE_NAME_MAXLEN + 1];
+
+      if (fan_cache_lookup(&st, &cached, cached_rule, sizeof(cached_rule))) {
+        send_verdict(reqid, cached,
+                     cached == AV_VERDICT_MALICIOUS ? cached_rule : NULL);
+        close(fd);
+        return;
+      }
+    }
   }
 
   perform_scan(fd, path, sha256_hex, pid, false, &result);
@@ -2174,17 +2401,21 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
  * fail-open stance). `task` is always consumed here - freed on the
  * failure paths, owned by the queue on success - so callers must not
  * touch it afterwards either way. */
-static bool queue_push(struct scan_task *task) {
+static bool queue_push(struct scan_task *task, bool may_block) {
   if (!task)
     return false;
 
   task->next = NULL;
 
   pthread_mutex_lock(&queue_lock);
-  while (queue_len >= (size_t)avd_scan_queue_max && !shutting_down)
+  while (may_block && queue_len >= (size_t)avd_scan_queue_max &&
+         !shutting_down)
     pthread_cond_wait(&queue_not_full, &queue_lock);
 
-  if (shutting_down) {
+  /* !may_block (the fanotify listener): a full queue is a refusal, not
+   * a wait - that thread answers every held exec on the system and
+   * must never park behind the scan backlog. */
+  if (shutting_down || queue_len >= (size_t)avd_scan_queue_max) {
     pthread_mutex_unlock(&queue_lock);
     free(task);
     return false;
@@ -2220,8 +2451,9 @@ static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
            sha256_hex ? sha256_hex : "");
   task->fd = -1;
   task->completion = NULL;
+  task->fan = NULL;
 
-  return queue_push(task);
+  return queue_push(task, true);
 }
 
 /* Producer side for the control socket's SCAN command (called from
@@ -2249,8 +2481,738 @@ static bool enqueue_ondemand_scan(int fd, const char *path,
   task->sha256_hex[0] = '\0';
   task->fd = fd;
   task->completion = completion;
+  task->fan = NULL;
 
-  return queue_push(task);
+  return queue_push(task, true);
+}
+
+/* ---- fanotify exec-permission enforcement: listener (#176) ----
+ *
+ * One dedicated thread (fan_listener_main()) reads FAN_OPEN_EXEC_PERM
+ * events. Each event carries an fd for the exact image the kernel is
+ * about to exec - the spike (spike/fanotify/, phase 5) showed renaming
+ * a decoy over the path mid-event changes neither what that fd reads
+ * nor what runs - so the scan goes through that fd and there is no
+ * path to re-open or race. Cache hits are answered on the listener
+ * thread itself; misses go to the shared worker pool as a scan_task.
+ *
+ * The kernel has no timeout for permission events: an unanswered one
+ * holds that exec forever. So the listener is also the watchdog. Every
+ * miss gets a deadline (AVD_FANOTIFY_TIMEOUT_MS); if no worker has
+ * answered by then, the listener answers with the operator's daemon
+ * policy - FAN_ALLOW under the default fail-open, FAN_DENY only when
+ * /proc/kernel_av_daemon_policy says fail-closed - exactly as the
+ * kernel does for a netlink request avd never answers. A full scan
+ * queue is answered the same way, immediately: this thread must never
+ * block behind the backlog, or one slow scan stalls every exec on the
+ * system.
+ *
+ * Re-entrancy: avd never execs anything (enforced by
+ * tests/test_avd_no_exec.sh), and FAN_OPEN_EXEC_PERM fires only on
+ * exec opens - not on avd's own read-opens of rules, corpora or
+ * quarantine files, and not on ld.so's library mmap - so nothing avd
+ * does while answering an event can raise another one it would have
+ * to answer. Events from avd's own pid are allowed unconditionally
+ * anyway, as a belt-and-braces guard. */
+
+/* One held exec. Shared by the listener (which keeps it on its list
+ * until answered, for the watchdog) and, on a cache miss, the worker
+ * that scans it. `responded` decides who answers: whoever flips it
+ * under fan_pending_lock writes the one response, the other side then
+ * never writes for this fd. `refs` (also under the lock) frees the
+ * record when both sides are done with it.
+ *
+ * The event fd is owned by the task once it is queued - the worker
+ * closes it after answering (or after finding the watchdog already
+ * answered). It must stay open until then: a response names the event
+ * by fd number, so closing it early would let the number be reused by
+ * the next event and a late write could answer the wrong exec. */
+struct fan_pending {
+  struct fan_pending *next; /* listener's list, listener thread only */
+  int fd;
+  pid_t pid;
+  struct stat st; /* at event time - the cache key */
+  uint64_t gen;   /* fan_cache_gen at event time */
+  struct timespec deadline;
+  bool responded;
+  int refs;
+};
+static pthread_mutex_t fan_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct fan_pending *fan_pending_head;
+static bool fan_stop; /* under fan_pending_lock */
+
+/* Caller holds fan_pending_lock, so exactly one response is ever
+ * written per event. */
+static void fan_respond(int event_fd, bool allow) {
+  struct fanotify_response r = {.fd = event_fd,
+                                .response = allow ? FAN_ALLOW : FAN_DENY};
+
+  if (write(fan_fd, &r, sizeof(r)) != (ssize_t)sizeof(r))
+    fprintf(stderr, "avd: fanotify response write failed: %s\n",
+            strerror(errno));
+}
+
+/* The kernel's daemon-unavailable policy (see daemon_policy_proc_write()
+ * in av/main.c), re-read each time it is needed so `avctl policy set`
+ * applies to the next timeout without restarting avd. Unreadable (module
+ * not loaded) means the default: fail-open. */
+static bool fan_policy_fail_closed(void) {
+  char buf[32] = "";
+  int fd = open("/proc/kernel_av_daemon_policy", O_RDONLY | O_CLOEXEC);
+  ssize_t n;
+
+  if (fd < 0)
+    return false;
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0)
+    return false;
+  buf[n] = '\0';
+  return strncmp(buf, "fail-closed", 11) == 0;
+}
+
+static void fan_fd_path(int fd, char *out, size_t out_len) {
+  char link[64];
+  ssize_t n;
+
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  n = readlink(link, out, out_len - 1);
+  if (n < 0)
+    snprintf(out, out_len, "(fd %d)", fd);
+  else
+    out[n] = '\0';
+}
+
+static void fan_unref(struct fan_pending *p) {
+  bool last;
+
+  pthread_mutex_lock(&fan_pending_lock);
+  last = --p->refs == 0;
+  pthread_mutex_unlock(&fan_pending_lock);
+  if (last)
+    free(p);
+}
+
+static void fan_count(uint64_t *counter) {
+  pthread_mutex_lock(&metrics_lock);
+  (*counter)++;
+  pthread_mutex_unlock(&metrics_lock);
+}
+
+/* Worker side of a cache miss. */
+static void fan_run_task(struct fan_pending *p) {
+  struct scan_result res;
+  struct stat after;
+  char path[PATH_MAX];
+  bool late;
+
+  fan_fd_path(p->fd, path, sizeof(path));
+  perform_scan(p->fd, path, NULL, (uint32_t)p->pid, false, &res);
+  /* Stored before answering: the kernel's own bprm_check request for
+   * this exec can only arrive after FAN_ALLOW, and should find it. */
+  if (fstat(p->fd, &after) == 0)
+    fan_cache_store(&p->st, &after, p->gen, &res);
+
+  pthread_mutex_lock(&fan_pending_lock);
+  late = p->responded;
+  if (!late) {
+    fan_respond(p->fd, res.verdict != AV_VERDICT_MALICIOUS);
+    p->responded = true;
+  }
+  pthread_mutex_unlock(&fan_pending_lock);
+
+  if (late)
+    fprintf(stderr,
+            "avd: %s verdict for exec of \"%s\" (pid %d) arrived after the "
+            "watchdog had already answered by policy%s\n",
+            res.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN", path,
+            (int)p->pid,
+            res.verdict == AV_VERDICT_MALICIOUS
+                ? " - left to the kernel's post-exec check"
+                : "");
+  else if (res.verdict == AV_VERDICT_MALICIOUS) {
+    fan_count(&fan_denied);
+    printf("avd: BLOCKED exec of \"%s\" (pid %d): %s\n", path, (int)p->pid,
+           res.rule_name);
+  }
+
+  close(p->fd);
+  fan_unref(p);
+}
+
+/* Listener side: answer every pending exec a worker has not answered
+ * by its deadline, and drop answered ones from the list. With
+ * `force_all`, everything still unanswered is answered now (shutdown).
+ * Returns ms until the next unanswered deadline, or -1 if none. */
+static long fan_expire(bool force_all) {
+  struct fan_pending **pp = &fan_pending_head;
+  struct timespec now;
+  long next = -1;
+  bool fail_closed = false, policy_read = false;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  pthread_mutex_lock(&fan_pending_lock);
+  while (*pp) {
+    struct fan_pending *p = *pp;
+    long left = (long)(p->deadline.tv_sec - now.tv_sec) * 1000 +
+                (p->deadline.tv_nsec - now.tv_nsec) / 1000000L;
+
+    if (!p->responded && (force_all || left <= 0)) {
+      char path[PATH_MAX];
+
+      if (!policy_read) {
+        /* A small proc read under the lock - acceptable, since this
+         * only runs once per sweep and only when a scan is overdue. */
+        fail_closed = fan_policy_fail_closed();
+        policy_read = true;
+      }
+      fan_respond(p->fd, !fail_closed);
+      p->responded = true;
+      fan_count(&fan_fallbacks);
+      fan_fd_path(p->fd, path, sizeof(path));
+      fprintf(stderr,
+              "avd: no verdict for exec of \"%s\" (pid %d) within %d ms - "
+              "%s by daemon policy (%s)\n",
+              path, (int)p->pid, avd_fan_timeout_ms,
+              fail_closed ? "DENIED" : "allowed",
+              fail_closed ? "fail-closed" : "fail-open");
+    }
+    if (p->responded) {
+      *pp = p->next;
+      if (--p->refs == 0)
+        free(p);
+      continue;
+    }
+    if (next < 0 || left < next)
+      next = left;
+    pp = &p->next;
+  }
+  pthread_mutex_unlock(&fan_pending_lock);
+  return next;
+}
+
+static void fan_handle_event(const struct fanotify_event_metadata *m) {
+  struct fan_pending *p;
+  struct scan_task *task;
+  struct stat st;
+  uint8_t cached;
+  char cached_rule[AV_RULE_NAME_MAXLEN + 1];
+
+  if (m->fd < 0) /* FAN_NOFD: queue overflow notice, nothing to answer */
+    return;
+  if (!(m->mask & FAN_OPEN_EXEC_PERM)) {
+    close(m->fd);
+    return;
+  }
+  fan_count(&fan_events_total);
+
+  /* Allowed without a scan: our own pid (see the re-entrancy note
+   * above), and anything that is not a regular file (the exec itself
+   * refuses those with EACCES regardless). */
+  if (m->pid == getpid() || fstat(m->fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    pthread_mutex_lock(&fan_pending_lock);
+    fan_respond(m->fd, true);
+    pthread_mutex_unlock(&fan_pending_lock);
+    close(m->fd);
+    return;
+  }
+
+  if (fan_cache_lookup(&st, &cached, cached_rule, sizeof(cached_rule))) {
+    pthread_mutex_lock(&fan_pending_lock);
+    fan_respond(m->fd, cached != AV_VERDICT_MALICIOUS);
+    pthread_mutex_unlock(&fan_pending_lock);
+    fan_count(&fan_cache_hits);
+    if (cached == AV_VERDICT_MALICIOUS) {
+      char path[PATH_MAX];
+
+      fan_count(&fan_denied);
+      fan_fd_path(m->fd, path, sizeof(path));
+      printf("avd: BLOCKED exec of \"%s\" (pid %d): %s (cached verdict)\n",
+             path, (int)m->pid, cached_rule);
+    }
+    close(m->fd);
+    return;
+  }
+
+  p = calloc(1, sizeof(*p));
+  task = p ? calloc(1, sizeof(*task)) : NULL;
+  if (task) {
+    p->fd = m->fd;
+    p->pid = m->pid;
+    p->st = st;
+    p->gen = fan_cache_current_gen();
+    p->refs = 2;
+    clock_gettime(CLOCK_MONOTONIC, &p->deadline);
+    p->deadline.tv_sec += avd_fan_timeout_ms / 1000;
+    p->deadline.tv_nsec += (long)(avd_fan_timeout_ms % 1000) * 1000000L;
+    if (p->deadline.tv_nsec >= 1000000000L) {
+      p->deadline.tv_sec++;
+      p->deadline.tv_nsec -= 1000000000L;
+    }
+    task->fd = -1;
+    task->fan = p;
+    /* Linked before the push: once queued, a worker may answer and
+     * drop its reference at any moment, and the listener's reference
+     * has to already be on the list for fan_expire() to reap it. */
+    p->next = fan_pending_head;
+    fan_pending_head = p;
+    if (queue_push(task, false))
+      return;
+    /* queue_push() freed the task. Unlink and answer here. */
+    fan_pending_head = p->next;
+  } else {
+    free(p);
+    p = NULL;
+  }
+
+  {
+    bool fail_closed = fan_policy_fail_closed();
+    char path[PATH_MAX];
+
+    pthread_mutex_lock(&fan_pending_lock);
+    fan_respond(m->fd, !fail_closed);
+    pthread_mutex_unlock(&fan_pending_lock);
+    fan_count(&fan_fallbacks);
+    fan_fd_path(m->fd, path, sizeof(path));
+    fprintf(stderr,
+            "avd: scan queue full or shutting down - exec of \"%s\" (pid %d) "
+            "%s by daemon policy (%s)\n",
+            path, (int)m->pid, fail_closed ? "DENIED" : "allowed",
+            fail_closed ? "fail-closed" : "fail-open");
+    close(m->fd);
+    free(p);
+  }
+}
+
+/* Reads a whole /proc file into a NUL-terminated heap buffer (proc
+ * files report st_size 0, so read until EOF). From offset 0 via
+ * pread(), so the same fd can be re-read (mountinfo). Returns NULL on
+ * error or past `cap` bytes. */
+static char *fan_read_all(int fd, size_t cap, size_t *len_out) {
+  size_t len = 0, size = 16384;
+  char *buf = malloc(size);
+
+  if (!buf)
+    return NULL;
+  for (;;) {
+    ssize_t n;
+
+    if (len + 1 >= size) {
+      char *nb;
+
+      if (size >= cap) {
+        free(buf);
+        return NULL;
+      }
+      size *= 2;
+      nb = realloc(buf, size);
+      if (!nb) {
+        free(buf);
+        return NULL;
+      }
+      buf = nb;
+    }
+    n = pread(fd, buf + len, size - len - 1, (off_t)len);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      free(buf);
+      return NULL;
+    }
+    if (n == 0)
+      break;
+    len += (size_t)n;
+  }
+  buf[len] = '\0';
+  if (len_out)
+    *len_out = len;
+  return buf;
+}
+
+/* Filesystems marked as of the last pass - only used to log new ones
+ * once, not for dedupe across passes: every pass re-issues
+ * FAN_MARK_ADD for every markable mount (idempotent - it ORs the mask
+ * into the existing mark), so a filesystem unmounted and remounted
+ * between two mountinfo wakeups, which reuses its dev number on a new
+ * superblock, is still marked. */
+static dev_t *fan_marked_devs;
+static size_t fan_marked_count;
+
+static bool fan_dev_in(const dev_t *devs, size_t n, dev_t dev) {
+  size_t i;
+
+  for (i = 0; i < n; i++)
+    if (devs[i] == dev)
+      return true;
+  return false;
+}
+
+/* (Re-)marks every local, exec-capable filesystem in this mount
+ * namespace. Returns the number of filesystems marked, -1 if mountinfo
+ * itself could not be read. */
+static int fan_mark_mounts(int mi_fd) {
+  char *buf = fan_read_all(mi_fd, 16 * 1024 * 1024, NULL);
+  char *line, *save = NULL;
+  dev_t *seen = NULL;
+  size_t seen_count = 0, seen_cap = 0;
+  int marked = 0;
+
+  if (!buf) {
+    fprintf(stderr, "avd: could not read /proc/self/mountinfo: %s\n",
+            strerror(errno));
+    return -1;
+  }
+
+  for (line = strtok_r(buf, "\n", &save); line;
+       line = strtok_r(NULL, "\n", &save)) {
+    unsigned maj, min;
+    char *mp, *fstype;
+    bool noexec;
+    dev_t dev;
+
+    if (fan_mountinfo_parse_line(line, &maj, &min, &mp, &fstype, &noexec) != 0)
+      continue;
+    if (noexec || !fan_fstype_markable(fstype))
+      continue;
+    dev = makedev(maj, min);
+    if (fan_dev_in(seen, seen_count, dev))
+      continue;
+    if (seen_count == seen_cap) {
+      size_t ncap = seen_cap ? seen_cap * 2 : 32;
+      dev_t *ns = realloc(seen, ncap * sizeof(*seen));
+
+      if (!ns)
+        break;
+      seen = ns;
+      seen_cap = ncap;
+    }
+    seen[seen_count++] = dev;
+
+    if (fanotify_mark(fan_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                      FAN_OPEN_EXEC_PERM, AT_FDCWD, mp) != 0) {
+      if (!fan_dev_in(fan_marked_devs, fan_marked_count, dev))
+        fprintf(stderr,
+                "avd: fanotify: could not mark %s (%s, %u:%u): %s - execs "
+                "there are left to the kernel's post-exec check\n",
+                mp, fstype, maj, min, strerror(errno));
+      continue;
+    }
+    marked++;
+    if (!fan_dev_in(fan_marked_devs, fan_marked_count, dev))
+      printf("avd: fanotify: enforcing pre-exec scans on %s (%s, %u:%u)\n", mp,
+             fstype, maj, min);
+  }
+
+  free(fan_marked_devs);
+  fan_marked_devs = seen;
+  fan_marked_count = seen_count;
+  free(buf);
+  return marked;
+}
+
+/* Re-reads /proc/kernel_av_signatures and, only if its content changed,
+ * swaps in a new SHA-256 snapshot and invalidates the verdict cache.
+ * Listener thread only (plus once in main() before it starts). A
+ * missing entry (module not loaded) reads as an empty table. */
+static void fan_sigs_refresh(void) {
+  static unsigned char last_digest[SHA256_DIGEST_SIZE];
+  static bool have_last;
+  unsigned char digest[SHA256_DIGEST_SIZE];
+  struct sha256_ctx ctx;
+  struct fan_sig *sigs = NULL, *old;
+  size_t len = 0, count = 0, cap = 0, kernel_only = 0;
+  char *buf = NULL, *line, *save = NULL;
+  int fd = open("/proc/kernel_av_signatures", O_RDONLY | O_CLOEXEC);
+
+  if (fd >= 0) {
+    buf = fan_read_all(fd, 16 * 1024 * 1024, &len);
+    close(fd);
+    if (!buf) {
+      fprintf(stderr, "avd: could not read /proc/kernel_av_signatures - "
+                      "keeping the previous signature snapshot\n");
+      return;
+    }
+  }
+
+  sha256_init(&ctx);
+  if (buf)
+    sha256_update(&ctx, (const unsigned char *)buf, len);
+  sha256_final(&ctx, digest);
+  if (have_last && memcmp(digest, last_digest, sizeof(digest)) == 0) {
+    free(buf);
+    return;
+  }
+
+  for (line = buf ? strtok_r(buf, "\n", &save) : NULL; line;
+       line = strtok_r(NULL, "\n", &save)) {
+    char *algo, *hex, *name;
+    int r = fan_sig_parse_line(line, &algo, &hex, &name);
+
+    if (r == 0) {
+      kernel_only++;
+      continue;
+    }
+    if (r < 0)
+      continue;
+    if (count == cap) {
+      size_t ncap = cap ? cap * 2 : 64;
+      struct fan_sig *ns = realloc(sigs, ncap * sizeof(*sigs));
+
+      if (!ns) {
+        fprintf(stderr, "avd: out of memory loading signature snapshot - "
+                        "keeping the previous one\n");
+        free(sigs);
+        free(buf);
+        return;
+      }
+      sigs = ns;
+      cap = ncap;
+    }
+    snprintf(sigs[count].hex, sizeof(sigs[count].hex), "%s", hex);
+    snprintf(sigs[count].name, sizeof(sigs[count].name), "%s", name);
+    count++;
+  }
+  free(buf);
+  if (count)
+    qsort(sigs, count, sizeof(*sigs), fan_sig_cmp);
+
+  pthread_rwlock_wrlock(&fan_sig_lock);
+  old = fan_sigs;
+  fan_sigs = sigs;
+  fan_sig_count = count;
+  pthread_rwlock_unlock(&fan_sig_lock);
+  free(old);
+
+  /* After the swap, so any scan that sees the new generation also sees
+   * the new signatures. */
+  pthread_mutex_lock(&fan_cache_lock);
+  fan_cache_gen++;
+  pthread_mutex_unlock(&fan_cache_lock);
+
+  memcpy(last_digest, digest, sizeof(digest));
+  have_last = true;
+  printf("avd: signature snapshot: %zu sha256 entr%s enforced pre-exec",
+         count, count == 1 ? "y" : "ies");
+  if (kernel_only)
+    printf(", %zu md5/sha1 entr%s left to the kernel's post-exec check",
+           kernel_only, kernel_only == 1 ? "y" : "ies");
+  printf("\n");
+}
+
+#define FAN_SIG_REFRESH_MS 2000
+
+static void *fan_listener_main(void *arg) {
+  int mi_fd = (int)(intptr_t)arg;
+  /* Aligned for the metadata struct the buffer is read as. */
+  char buf[8192] __attribute__((aligned(__alignof__(
+      struct fanotify_event_metadata))));
+  struct timespec last_refresh;
+
+  clock_gettime(CLOCK_MONOTONIC, &last_refresh);
+  for (;;) {
+    struct pollfd pfd[2] = {{.fd = fan_fd, .events = POLLIN},
+                            {.fd = mi_fd, .events = POLLPRI}};
+    struct timespec now;
+    long timeout, next;
+    bool stop;
+    int pr;
+
+    pthread_mutex_lock(&fan_pending_lock);
+    stop = fan_stop;
+    pthread_mutex_unlock(&fan_pending_lock);
+    if (stop)
+      break;
+
+    next = fan_expire(false);
+    /* Capped at 200 ms so fan_stop and the signature refresh are
+     * noticed promptly even with nothing pending. */
+    timeout = (next >= 0 && next < 200) ? next : 200;
+    pr = poll(pfd, mi_fd >= 0 ? 2 : 1, (int)timeout);
+    if (pr < 0 && errno != EINTR) {
+      fprintf(stderr, "avd: fanotify poll failed: %s\n", strerror(errno));
+      nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 100000000L}, NULL);
+      continue;
+    }
+
+    if (pr > 0 && mi_fd >= 0 && (pfd[1].revents & (POLLPRI | POLLERR)))
+      fan_mark_mounts(mi_fd);
+
+    if (pr > 0 && (pfd[0].revents & POLLIN)) {
+      for (;;) {
+        ssize_t n = read(fan_fd, buf, sizeof(buf));
+        struct fanotify_event_metadata *m;
+
+        if (n <= 0) {
+          if (n < 0 && errno != EAGAIN && errno != EINTR)
+            fprintf(stderr, "avd: fanotify read failed: %s\n",
+                    strerror(errno));
+          break;
+        }
+        for (m = (struct fanotify_event_metadata *)buf; FAN_EVENT_OK(m, n);
+             m = FAN_EVENT_NEXT(m, n)) {
+          if (m->vers != FANOTIFY_METADATA_VERSION) {
+            fprintf(stderr, "avd: fanotify metadata version %u, expected %u "
+                            "- ignoring event\n",
+                    m->vers, FANOTIFY_METADATA_VERSION);
+            if (m->fd >= 0)
+              close(m->fd);
+            continue;
+          }
+          fan_handle_event(m);
+        }
+      }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if ((now.tv_sec - last_refresh.tv_sec) * 1000 +
+            (now.tv_nsec - last_refresh.tv_nsec) / 1000000L >=
+        FAN_SIG_REFRESH_MS) {
+      fan_sigs_refresh();
+      last_refresh = now;
+    }
+  }
+
+  /* main() sets fan_stop only after joining every worker, so every
+   * queued exec has been answered; this only sweeps the list (and
+   * answers anything that somehow is not, rather than leave it held
+   * until the fd closes). */
+  fan_expire(true);
+  return NULL;
+}
+
+/* Called from main() before any worker starts. Returns the mountinfo fd
+ * the listener should watch (or -1), with fan_active set on success. */
+static int fan_setup(void) {
+  int mi_fd, marked;
+
+  fan_fd = fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK,
+                         O_RDONLY | O_LARGEFILE | O_CLOEXEC);
+  if (fan_fd < 0) {
+    fprintf(stderr,
+            "avd: fanotify_init failed: %s - pre-exec enforcement disabled, "
+            "the kernel module's post-exec check still applies\n",
+            strerror(errno));
+    return -1;
+  }
+
+  fan_cache = calloc(FAN_CACHE_SLOTS, sizeof(*fan_cache));
+  if (!fan_cache) {
+    fprintf(stderr, "avd: could not allocate the fanotify verdict cache - "
+                    "pre-exec enforcement disabled\n");
+    close(fan_fd);
+    fan_fd = -1;
+    return -1;
+  }
+
+  /* Snapshot before marking: the first held exec should already be
+   * judged against the signature table. */
+  fan_sigs_refresh();
+
+  mi_fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+  marked = mi_fd >= 0 ? fan_mark_mounts(mi_fd) : -1;
+  if (marked <= 0) {
+    fprintf(stderr, "avd: fanotify: no filesystem could be marked - "
+                    "pre-exec enforcement disabled\n");
+    if (mi_fd >= 0)
+      close(mi_fd);
+    close(fan_fd); /* drops any mark that did get placed */
+    fan_fd = -1;
+    free(fan_cache);
+    fan_cache = NULL;
+    return -1;
+  }
+
+  fan_active = true;
+  printf("avd: fanotify pre-exec enforcement active on %d filesystem(s), "
+         "verdict deadline %d ms\n",
+         marked, avd_fan_timeout_ms);
+  return mi_fd;
+}
+
+/* Called from main() after every worker has been joined. */
+static void fan_teardown(pthread_t listener, bool listener_started, int mi_fd) {
+  if (listener_started) {
+    pthread_mutex_lock(&fan_pending_lock);
+    fan_stop = true;
+    pthread_mutex_unlock(&fan_pending_lock);
+    pthread_join(listener, NULL);
+  }
+  /* Closing the group fd releases every mark; any permission event
+   * still unread at this point is allowed by the kernel. */
+  if (fan_fd >= 0)
+    close(fan_fd);
+  fan_fd = -1;
+  if (mi_fd >= 0)
+    close(mi_fd);
+}
+
+/* Test-only hold gate (see avd_test_scan_hold_path's comment), shared
+ * by on-demand and fanotify scans - the fanotify watchdog test pins the
+ * single worker here so a held exec provably outlives its deadline. */
+static void test_scan_hold_gate(void) {
+  /* The first scan to arrive sets an "entered" flag and then
+   * polls for a "release" flag, holding the single worker so the
+   * test's second SCAN provably queues behind it. Flag files, not
+   * a FIFO: FIFOs deadlock this exact setup (writer-open blocks
+   * for a reader that only appears after scan 1 arrives; a dummy
+   * reader of its own defeats the EOF release). No-op when the
+   * env var is unset (production). Only the first scan takes the
+   * gate - a per-process flag, reset never, so the held scan plus
+   * every scan after it proceeds normally once the release file
+   * appears. The entered file has a fixed name (hold dir +
+   * "/entered") so the test can poll for arrival without parsing
+   * the daemon log past its block buffering. */
+  if (avd_test_scan_hold_path) {
+    static bool hold_taken;
+    static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
+    bool take = false;
+
+    pthread_mutex_lock(&hold_lock);
+    if (!hold_taken) {
+      hold_taken = true;
+      take = true;
+    }
+    pthread_mutex_unlock(&hold_lock);
+
+    if (take) {
+      char entered[PATH_MAX];
+      char release[PATH_MAX];
+      int n;
+
+      n = snprintf(entered, sizeof(entered), "%s/entered",
+                   avd_test_scan_hold_path);
+      if (n > 0 && (size_t)n < sizeof(entered)) {
+        int efd = open(entered, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (efd >= 0)
+          close(efd);
+      }
+      n = snprintf(release, sizeof(release), "%s/release",
+                   avd_test_scan_hold_path);
+      if (n > 0 && (size_t)n < sizeof(release)) {
+        /* Poll, don't block: a blocking primitive here is what
+         * made every earlier revision of this gate hang the
+         * suite on a missed wakeup instead of failing loudly.
+         * Shutdown-aware: main sets shutting_down and joins
+         * this worker, so polling release forever here would
+         * hang that join if the test exits without releasing. */
+        for (;;) {
+          struct stat st;
+          struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+          bool stop;
+
+          pthread_mutex_lock(&queue_lock);
+          stop = shutting_down;
+          pthread_mutex_unlock(&queue_lock);
+          if (!atomic_load(&running) || stop)
+            break;
+          if (stat(release, &st) == 0)
+            break;
+          nanosleep(&ts, NULL);
+        }
+      }
+    }
+  }
+
 }
 
 /* Consumer side - runs on each of the avd_scan_threads worker
@@ -2284,6 +3246,16 @@ static void *scan_worker_main(void *arg) {
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
 
+    if (task->fan) {
+      test_scan_hold_gate();
+      fan_run_task(task->fan);
+      pthread_mutex_lock(&queue_lock);
+      scan_in_flight--;
+      pthread_mutex_unlock(&queue_lock);
+      free(task);
+      continue;
+    }
+
     if (task->on_demand) {
       /* Control-socket SCAN: same shared core as the kernel path, but
        * the result goes back to the waiting connection thread rather
@@ -2296,70 +3268,7 @@ static void *scan_worker_main(void *arg) {
       struct scan_completion *c;
       struct scan_result result;
 
-      /* Test-only hold gate (see avd_test_scan_hold_path's comment):
-       * the first scan to arrive sets an "entered" flag and then
-       * polls for a "release" flag, holding the single worker so the
-       * test's second SCAN provably queues behind it. Flag files, not
-       * a FIFO: FIFOs deadlock this exact setup (writer-open blocks
-       * for a reader that only appears after scan 1 arrives; a dummy
-       * reader of its own defeats the EOF release). No-op when the
-       * env var is unset (production). Only the first scan takes the
-       * gate - a per-process flag, reset never, so the held scan plus
-       * every scan after it proceeds normally once the release file
-       * appears. The entered file has a fixed name (hold dir +
-       * "/entered") so the test can poll for arrival without parsing
-       * the daemon log past its block buffering. */
-      if (avd_test_scan_hold_path) {
-        static bool hold_taken;
-        static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
-        bool take = false;
-
-        pthread_mutex_lock(&hold_lock);
-        if (!hold_taken) {
-          hold_taken = true;
-          take = true;
-        }
-        pthread_mutex_unlock(&hold_lock);
-
-        if (take) {
-          char entered[PATH_MAX];
-          char release[PATH_MAX];
-          int n;
-
-          n = snprintf(entered, sizeof(entered), "%s/entered",
-                       avd_test_scan_hold_path);
-          if (n > 0 && (size_t)n < sizeof(entered)) {
-            int efd = open(entered, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (efd >= 0)
-              close(efd);
-          }
-          n = snprintf(release, sizeof(release), "%s/release",
-                       avd_test_scan_hold_path);
-          if (n > 0 && (size_t)n < sizeof(release)) {
-            /* Poll, don't block: a blocking primitive here is what
-             * made every earlier revision of this gate hang the
-             * suite on a missed wakeup instead of failing loudly.
-             * Shutdown-aware: main sets shutting_down and joins
-             * this worker, so polling release forever here would
-             * hang that join if the test exits without releasing. */
-            for (;;) {
-              struct stat st;
-              struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
-              bool stop;
-
-              pthread_mutex_lock(&queue_lock);
-              stop = shutting_down;
-              pthread_mutex_unlock(&queue_lock);
-              if (!atomic_load(&running) || stop)
-                break;
-              if (stat(release, &st) == 0)
-                break;
-              nanosleep(&ts, NULL);
-            }
-          }
-        }
-      }
-
+      test_scan_hold_gate();
       c = task->completion;
       perform_scan(task->fd, task->path, NULL, 0, true, &result);
       close(task->fd);
@@ -2548,6 +3457,7 @@ static void cmd_status(int fd) {
    * scan_threads, so field indices 0-5 are byte-stable for existing
    * parsers (notably tests/test_avd_socket.sh's $5 queueing poll). */
   uint64_t total, malicious, time_total, time_max, last_ms, avg_ms;
+  uint64_t f_events, f_hits, f_denied, f_fallbacks;
 
   pthread_mutex_lock(&queue_lock);
   qlen = queue_len + scan_in_flight;
@@ -2559,17 +3469,27 @@ static void cmd_status(int fd) {
   time_total = scan_time_total_ms;
   time_max = scan_time_max_ms;
   last_ms = last_scan_ms;
+  f_events = fan_events_total;
+  f_hits = fan_cache_hits;
+  f_denied = fan_denied;
+  f_fallbacks = fan_fallbacks;
   pthread_mutex_unlock(&metrics_lock);
   avg_ms = total ? time_total / total : 0;
 
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
-  snprintf(row, sizeof(row), "%ld\t%d\t%zu\t%zu\t%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+  /* fanotify fields (#176) appended after last_scan_ms for the same
+   * byte-stability reason as the scan metrics above. */
+  snprintf(row, sizeof(row),
+           "%ld\t%d\t%zu\t%zu\t%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu"
+           "\t%d\t%llu\t%llu\t%llu\t%llu\n",
            (long)(time(NULL) - start_time), compiled_rules ? 1 : 0,
            fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads,
            (unsigned long long)total, (unsigned long long)malicious,
            (unsigned long long)avg_ms, (unsigned long long)time_max,
-           (unsigned long long)last_ms);
+           (unsigned long long)last_ms, fan_active ? 1 : 0,
+           (unsigned long long)f_events, (unsigned long long)f_hits,
+           (unsigned long long)f_denied, (unsigned long long)f_fallbacks);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
 }
@@ -3610,6 +4530,17 @@ int main(int argc, char **argv) {
   /* Test-only: never set in production (see avd_test_scan_hold_path's
    * comment). getenv() once at startup, not per scan. */
   avd_test_scan_hold_path = getenv("AVD_TEST_SCAN_HOLD_PATH");
+  /* Opt-in (#176): holding every exec on the machine behind avd is a
+   * different risk class from scanning after the fact, so it stays off
+   * unless the operator turns it on - see docs/fanotify-enforcement.md. */
+  {
+    const char *fan_env = getenv("AVD_FANOTIFY");
+
+    fan_enabled = fan_env && strcmp(fan_env, "1") == 0;
+  }
+  avd_fan_timeout_ms = parse_tunable_env(
+      "AVD_FANOTIFY_TIMEOUT_MS", AVD_FAN_TIMEOUT_MS_DEFAULT,
+      AVD_FAN_TIMEOUT_MS_MIN, AVD_FAN_TIMEOUT_MS_MAX);
 
   printf("avd: quarantine directory: %s\n", quarantine_dir);
   printf("avd: control socket: %s\n", control_sock_path);
@@ -3750,6 +4681,9 @@ int main(int argc, char **argv) {
     pthread_t *workers = calloc((size_t)avd_scan_threads, sizeof(*workers));
     pthread_t control_thread;
     bool control_started;
+    pthread_t fan_thread;
+    bool fan_started = false;
+    int fan_mi_fd = -1;
     int i, spawned = 0;
 
     if (!workers) {
@@ -3758,6 +4692,12 @@ int main(int argc, char **argv) {
       nl_socket_free(sock);
       return 1;
     }
+
+    /* Before the workers, so fan_active is settled before any thread
+     * that reads it exists. Execs on marked filesystems are held from
+     * here until the listener starts below - milliseconds. */
+    if (fan_enabled)
+      fan_mi_fd = fan_setup();
 
     for (i = 0; i < avd_scan_threads; i++) {
       if (pthread_create(&workers[i], NULL, scan_worker_main, NULL) != 0) {
@@ -3769,6 +4709,7 @@ int main(int argc, char **argv) {
     }
     if (spawned == 0) {
       fprintf(stderr, "avd: no scan workers could be started - aborting\n");
+      fan_teardown(fan_thread, false, fan_mi_fd);
       free(workers);
       nl_socket_free(sock);
       return 1;
@@ -3778,6 +4719,23 @@ int main(int argc, char **argv) {
               "avd: only %d/%d scan workers started - continuing with "
               "reduced concurrency\n",
               spawned, avd_scan_threads);
+
+    if (fan_active) {
+      if (pthread_create(&fan_thread, NULL, fan_listener_main,
+                         (void *)(intptr_t)fan_mi_fd) == 0) {
+        fan_started = true;
+      } else {
+        /* Closing the group releases the marks and every exec held
+         * since fan_setup(). The cache stays allocated but is never
+         * written again, so lookups just miss. */
+        fprintf(stderr,
+                "avd: pthread_create failed for the fanotify listener: %s - "
+                "pre-exec enforcement disabled\n",
+                strerror(errno));
+        fan_teardown(fan_thread, false, fan_mi_fd);
+        fan_mi_fd = -1;
+      }
+    }
 
     /* Not fatal if this fails (permissions, read-only /run, etc.) -
      * the daemon's actual job (kernel-triggered scanning) doesn't
@@ -3803,8 +4761,8 @@ int main(int argc, char **argv) {
 
     /* Main thread only: unblock the termination signals blocked above
      * so they are delivered here - the one thread parked in the
-     * EINTR-able nl_recvmsgs_default() loop - rather than on a worker
-     * or control thread that could never wake that loop up. Workers and
+     * EINTR-able poll() of the netlink receive loop - rather than on a
+     * worker or control thread that could never wake that loop up. Workers and
      * the control accept thread (plus every per-connection thread it
      * spawns) keep the inherited blocked mask for the life of the
      * process. On the unlikely pthread_sigmask() failure, abort startup
@@ -3825,6 +4783,7 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&queue_lock);
         for (i = 0; i < spawned; i++)
           pthread_join(workers[i], NULL);
+        fan_teardown(fan_thread, fan_started, fan_mi_fd);
         if (control_started) {
           /* Same self-connect wake-up as the normal shutdown path
            * below: joining the accept thread without it hangs. */
@@ -3909,6 +4868,11 @@ int main(int argc, char **argv) {
     for (i = 0; i < spawned; i++)
       pthread_join(workers[i], NULL);
 
+    /* After the workers: every held exec they were scanning has been
+     * answered, so stopping the listener and closing the group now
+     * cannot strand one - see fan_listener_main()'s exit comment. */
+    fan_teardown(fan_thread, fan_started, fan_mi_fd);
+
     if (control_started) {
       /* Closing control_sock_fd out from under control_accept_main()'s
        * blocked accept() call does NOT reliably unblock it - verified
@@ -3954,5 +4918,8 @@ int main(int argc, char **argv) {
   yr_finalize();
   free(fuzzy_corpus);
   free(tlsh_corpus);
+  free(fan_cache);
+  free(fan_sigs);
+  free(fan_marked_devs);
   return 0;
 }
