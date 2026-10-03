@@ -12,6 +12,9 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091 # sourced at runtime; lint it on its own
+. "$REPO_ROOT/tests/avd_guard.sh"
+avd_guard || exit 1
 FAIL=0
 
 echo "### building avctl ###"
