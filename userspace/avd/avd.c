@@ -85,6 +85,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -295,7 +296,12 @@ static const char *quarantine_dir = DEFAULT_QUARANTINE_DIR;
 
 static struct nl_sock *sock;
 static int family_id;
-static volatile sig_atomic_t running = 1;
+/* Read by the control and scan threads, written by the signal handler
+ * and main(): must be a lock-free atomic, not volatile sig_atomic_t,
+ * for both the handler (only lock-free atomics are async-signal-safe)
+ * and the cross-thread accesses. */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "running must be lock-free");
+static atomic_int running = 1;
 static YR_RULES *compiled_rules;
 
 /* Runtime-tunable pool sizes - see AVD_SCAN_THREADS_DEFAULT's comment
@@ -465,7 +471,7 @@ static void handle_sigint(int signum) {
   int saved_errno = errno;
 
   (void)signum;
-  running = 0;
+  atomic_store(&running, 0);
   if (sig_wake_pipe[1] >= 0)
     (void)!write(sig_wake_pipe[1], "x", 1);
   errno = saved_errno;
@@ -2344,7 +2350,7 @@ static void *scan_worker_main(void *arg) {
               pthread_mutex_lock(&queue_lock);
               stop = shutting_down;
               pthread_mutex_unlock(&queue_lock);
-              if (!running || stop)
+              if (!atomic_load(&running) || stop)
                 break;
               if (stat(release, &st) == 0)
                 break;
@@ -3424,7 +3430,7 @@ static int start_control_socket(void) {
 static void *control_accept_main(void *arg) {
   (void)arg;
 
-  while (running) {
+  while (atomic_load(&running)) {
     struct control_conn_ctx *ctx;
     pthread_t tid;
     uid_t peer_uid = (uid_t)-1;
@@ -3435,8 +3441,9 @@ static void *control_accept_main(void *arg) {
     if (cfd < 0) {
       if (errno == EINTR)
         continue;
-      if (!running) /* expected - see main()'s shutdown sequence, which
-                    * closes control_sock_fd to unblock this accept() */
+      /* Expected - see main()'s shutdown sequence, which closes
+       * control_sock_fd to unblock this accept(). */
+      if (!atomic_load(&running))
         break;
       fprintf(stderr, "avd: control accept() failed: %s\n", strerror(errno));
       continue;
@@ -3849,14 +3856,24 @@ int main(int argc, char **argv) {
      * an EINTR'd recvmsg() itself, so it is only entered once the
      * socket is readable. A termination signal both EINTRs the poll()
      * and, via sig_wake_pipe, wakes it if it lands just before the
-     * call - no window where `running == 0` goes unobserved. */
+     * call - no window where `running == 0` goes unobserved.
+     *
+     * The socket is nonblocking too: a message flagged NLM_F_MULTI
+     * keeps libnl reading until NLMSG_DONE, so a peer that never sends
+     * one would otherwise park this thread in that EINTR-retrying
+     * recvmsg(). Nonblocking, libnl returns -NLE_AGAIN instead, drops
+     * the unfinished multipart and we go back to poll(). Set only now:
+     * genl_ctrl_resolve() above waits for its reply. */
+    if (nl_socket_set_nonblocking(sock) < 0)
+      fprintf(stderr, "avd: could not make the netlink socket nonblocking - "
+                      "a malformed multipart message can delay shutdown\n");
     {
       struct pollfd pfds[2] = {
           {.fd = nl_socket_get_fd(sock), .events = POLLIN},
           {.fd = sig_wake_pipe[0], .events = POLLIN},
       };
 
-      while (running) {
+      while (atomic_load(&running)) {
         int ret;
 
         if (poll(pfds, 2, -1) < 0) {
@@ -3869,7 +3886,7 @@ int main(int argc, char **argv) {
         if (!pfds[0].revents)
           continue;
         ret = nl_recvmsgs_default(sock);
-        if (ret < 0 && ret != -NLE_INTR) {
+        if (ret < 0 && ret != -NLE_INTR && ret != -NLE_AGAIN) {
           fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n",
                   nl_geterror(ret));
           break;
@@ -3880,7 +3897,7 @@ int main(int argc, char **argv) {
      * or control_accept_main() takes the shutdown wake-up connection
      * below as a real one, parks in accept() again and the join hangs
      * (seen when a second avd lost the REGISTER race - NLE_BUSY). */
-    running = 0;
+    atomic_store(&running, 0);
 
     printf("avd: shutting down, draining %zu queued scan(s)...\n", queue_len);
     pthread_mutex_lock(&queue_lock);

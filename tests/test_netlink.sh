@@ -501,14 +501,103 @@ else
     dmesg | tail -10
 fi
 
-section "unload"
-if kill "$AVD_PID" 2>/dev/null; then
-    wait "$AVD_PID" 2>/dev/null
-    AVD_PID=""
-    pass "avd stopped"
+section "SIGTERM with an unterminated multipart message pending"
+# One NLM_F_MULTI message with no NLMSG_DONE makes libnl's recvmsgs()
+# go back to the socket for the rest of the multipart. On a blocking
+# socket that recvmsg() retries EINTR, so SIGTERM could not stop avd
+# until some other netlink message arrived - msg_handler() skipping a
+# non-kernel SCAN_REQUEST does not end the multipart. Unicasting to a
+# userspace portid needs CAP_NET_ADMIN (NETLINK_GENERIC has no
+# NL_CFG_F_NONROOT_SEND), so only a privileged or buggy peer can do
+# this; the test checks that boundary, then sends as root.
+#
+# avd's netlink portid(s): its socket inodes matched against
+# /proc/net/netlink (Eth 16 = NETLINK_GENERIC, column 10 = inode).
+# Not avd's pid - libnl picks its own local port.
+AVD_INODES="$(find "/proc/$AVD_PID/fd" -lname 'socket:*' -printf '%l\n' 2>/dev/null | tr -dc '0-9\n' | tr '\n' ' ')"
+AVD_PORTIDS="$(awk -v ino="$AVD_INODES" 'BEGIN { n = split(ino, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    NR > 1 && $2 == 16 && ($10 in want) { print $3 }' /proc/net/netlink)"
+# nlmsghdr (len, type, flags = NLM_F_MULTI, seq, pid) + genlmsghdr
+# (cmd = AV_C_SCAN_REQUEST, version 1). Exits 3 on EPERM.
+MULTI_SENDER='import socket, struct, sys
+s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 16)  # NETLINK_GENERIC
+g = struct.pack("BBH", 2, 1, 0)
+try:
+    s.sendto(struct.pack("=IHHII", 16 + len(g), 0x10, 0x2, 1, 0) + g, (int(sys.argv[1]), 0))
+except PermissionError:
+    sys.exit(3)'
+if [ -z "$AVD_PORTIDS" ] || ! command -v python3 >/dev/null 2>&1; then
+    echo "  SKIP: avd's netlink portid not found, or python3 missing"
 else
-    fail "could not stop avd"
+    if [ -n "${NOBODY_UID:-}" ] && [ -n "${NOBODY_GID:-}" ]; then
+        setpriv --reuid="$NOBODY_UID" --regid="$NOBODY_GID" --clear-groups \
+            python3 -c "$MULTI_SENDER" "${AVD_PORTIDS%%[!0-9]*}" 2>/dev/null
+        if [ $? -eq 3 ]; then
+            pass "unprivileged unicast to avd's portid refused (EPERM)"
+        else
+            fail "unprivileged process could unicast to avd's portid"
+        fi
+    fi
+    for portid in $AVD_PORTIDS; do
+        python3 -c "$MULTI_SENDER" "$portid"
+    done
+    sleep 0.5
+    if grep -q "SCAN_REQUEST from non-kernel portid" "$AVD_LOG"; then
+        pass "avd received the unterminated multipart message"
+    else
+        fail "avd did not log the spoofed multipart SCAN_REQUEST - see $AVD_LOG"
+    fi
+    # The bug shows before any signal: libnl stays in recvmsg() waiting
+    # for the rest of the multipart. Fixed, the main thread is back in
+    # poll(). Read its syscall number (x86-64: 47 = recvmsg) and require
+    # it to leave recvmsg within 2s; a scan request from the host's own
+    # execs can pass through recvmsg briefly, so only a thread that
+    # never leaves it counts.
+    AVD_MAIN_LEFT_RECV=0
+    for _ in $(seq 1 20); do
+        AVD_MAIN_SYSCALL="$(cut -d' ' -f1 "/proc/$AVD_PID/task/$AVD_PID/syscall" 2>/dev/null)"
+        if [ "$AVD_MAIN_SYSCALL" != 47 ]; then
+            AVD_MAIN_LEFT_RECV=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$AVD_MAIN_LEFT_RECV" -eq 1 ]; then
+        pass "avd's main thread is not parked in recvmsg() on the unfinished multipart"
+    else
+        fail "avd's main thread is stuck in recvmsg() waiting for NLMSG_DONE"
+    fi
 fi
+
+# Bounded stop: a bare `wait` would hang the suite on exactly the bug
+# above. The bound is loose on purpose - avd drains queued scans before
+# exiting, and with the module loaded every exec on the host queues
+# one, each up to SCAN_TIMEOUT_SECS (10s). kill -0 succeeds on a
+# zombie, so read the state from /proc.
+kill "$AVD_PID" 2>/dev/null
+AVD_EXITED=0
+for _ in $(seq 1 600); do
+    AVD_STATE="$(awk '{print $3}' "/proc/$AVD_PID/stat" 2>/dev/null)"
+    if [ -z "$AVD_STATE" ] || [ "$AVD_STATE" = Z ]; then
+        AVD_EXITED=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$AVD_EXITED" -eq 1 ]; then
+    pass "avd stopped on SIGTERM"
+else
+    fail "avd still running 60s after SIGTERM"
+    for t in "/proc/$AVD_PID/task/"*; do
+        echo "        thread ${t##*/} ($(cat "$t/comm" 2>/dev/null)): $(cat "$t/wchan" 2>/dev/null)"
+    done
+    tail -n 5 "$AVD_LOG" | sed 's/^/        /'
+    kill -KILL "$AVD_PID" 2>/dev/null
+fi
+wait "$AVD_PID" 2>/dev/null
+AVD_PID=""
+
+section "unload"
 if rmmod av 2>"$RMMOD_LOG"; then
     pass "module unloaded cleanly"
 else
