@@ -4693,11 +4693,31 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    /* Before the workers, so fan_active is settled before any thread
-     * that reads it exists. Execs on marked filesystems are held from
-     * here until the listener starts below - milliseconds. */
+    /* Setup and listener both before the workers, so fan_active is
+     * settled - including being cleared again if the listener cannot
+     * start - before any thread that reads it exists. Misses the
+     * listener queues before a worker is up are answered by its
+     * watchdog if no worker takes them in time. */
     if (fan_enabled)
       fan_mi_fd = fan_setup();
+    if (fan_active) {
+      if (pthread_create(&fan_thread, NULL, fan_listener_main,
+                         (void *)(intptr_t)fan_mi_fd) == 0) {
+        fan_started = true;
+      } else {
+        /* Closing the group releases the marks and every exec held
+         * since fan_setup(). The cache stays allocated but is never
+         * written again; fan_active = false keeps status honest and
+         * handle_scan_request() off the cache. */
+        fprintf(stderr,
+                "avd: pthread_create failed for the fanotify listener: %s - "
+                "pre-exec enforcement disabled\n",
+                strerror(errno));
+        fan_teardown(fan_thread, false, fan_mi_fd);
+        fan_mi_fd = -1;
+        fan_active = false;
+      }
+    }
 
     for (i = 0; i < avd_scan_threads; i++) {
       if (pthread_create(&workers[i], NULL, scan_worker_main, NULL) != 0) {
@@ -4709,7 +4729,7 @@ int main(int argc, char **argv) {
     }
     if (spawned == 0) {
       fprintf(stderr, "avd: no scan workers could be started - aborting\n");
-      fan_teardown(fan_thread, false, fan_mi_fd);
+      fan_teardown(fan_thread, fan_started, fan_mi_fd);
       free(workers);
       nl_socket_free(sock);
       return 1;
@@ -4719,23 +4739,6 @@ int main(int argc, char **argv) {
               "avd: only %d/%d scan workers started - continuing with "
               "reduced concurrency\n",
               spawned, avd_scan_threads);
-
-    if (fan_active) {
-      if (pthread_create(&fan_thread, NULL, fan_listener_main,
-                         (void *)(intptr_t)fan_mi_fd) == 0) {
-        fan_started = true;
-      } else {
-        /* Closing the group releases the marks and every exec held
-         * since fan_setup(). The cache stays allocated but is never
-         * written again, so lookups just miss. */
-        fprintf(stderr,
-                "avd: pthread_create failed for the fanotify listener: %s - "
-                "pre-exec enforcement disabled\n",
-                strerror(errno));
-        fan_teardown(fan_thread, false, fan_mi_fd);
-        fan_mi_fd = -1;
-      }
-    }
 
     /* Not fatal if this fails (permissions, read-only /run, etc.) -
      * the daemon's actual job (kernel-triggered scanning) doesn't
