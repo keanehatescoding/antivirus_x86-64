@@ -258,6 +258,10 @@ for i in $(seq 1 "$N_COLD"); do
     fresh_true "$FIX/cold_b_$i"; COLD_B+=("$FIX/cold_b_$i")
     fresh_true "$FIX/cold_c_$i"; COLD_C+=("$FIX/cold_c_$i")
 done
+# avd only caches a verdict for a file whose ctime is over 3 s old
+# (FAN_CACHE_SETTLE_SECS) - let the fixtures the cache checks rely on
+# settle.
+nap 3.5
 
 section "baseline: avd running, enforcement off"
 if start_avd AVD_FANOTIFY=0; then
@@ -324,6 +328,21 @@ if [ -n "$HITS0" ] && [ -n "$HITS1" ] && [ "$HITS1" -ge $((HITS0 + 5)) ]; then
 else
     fail "fan_cache_hits did not move by 5: '$HITS0' -> '$HITS1'"
 fi
+# A binary whose ctime is under FAN_CACHE_SETTLE_SECS old is never
+# cached, so every exec of it is a miss (fan_events - fan_cache_hits).
+# Hits alone can't show that: each exec also raises a (cached) event
+# for ld.so, and other execs run alongside.
+FRESH="$FIX/fresh_true"
+fresh_true "$FRESH"
+EV0="$(status_field 13)"; HITS0="$(status_field 14)"
+for _ in $(seq 1 20); do "$FRESH"; done
+EV1="$(status_field 13)"; HITS1="$(status_field 14)"
+if [ -n "$EV0" ] && [ -n "$HITS1" ] &&
+   [ $(( (EV1 - HITS1) - (EV0 - HITS0) )) -ge 20 ]; then
+    pass "freshly written binary rescanned on every exec ($(( (EV1 - HITS1) - (EV0 - HITS0) )) misses for 20 execs)"
+else
+    fail "freshly written binary answered from the cache: misses $((EV0 - HITS0)) -> $((EV1 - HITS1)) for 20 execs"
+fi
 
 section "malicious execs refused before they run"
 printf '%s' "$EICAR" > "$FIX/eicar.com"
@@ -358,6 +377,7 @@ fi
 section "signature added at runtime overrides a cached clean verdict"
 SIGBIN="$FIX/sig_true"
 fresh_true "$SIGBIN"
+nap 3.5     # settle, so the next two execs can be cached
 R="$(try_exec "$SIGBIN")"
 "$SIGBIN"   # second exec: cached
 if [ "$R" = "rc=0" ]; then

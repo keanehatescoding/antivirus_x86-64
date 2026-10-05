@@ -1961,18 +1961,28 @@ static bool fan_sig_lookup(const char *sha256_hex, char *name_out,
  * Direct-mapped on (dev, ino); an entry only answers for the exact
  * (size, mtime, ctime) it was scanned at. ctime is the change cookie:
  * userspace can set mtime back with utimensat() but cannot set ctime,
- * and every write, truncate, chmod or rename-over bumps it. On kernels
- * with multigrain timestamps (6.13+, ext4/xfs/btrfs/tmpfs) the fstat()
- * done here at event time guarantees the next change gets a distinct
- * ctime even within the same timer tick; on older kernels a same-size
- * rewrite inside one coarse tick (~1-4 ms) of the cached scan is the
- * residual window - see docs/fanotify-enforcement.md.
+ * and every write, truncate, chmod or rename-over bumps it.
+ *
+ * A bump is only visible if it lands in a later timestamp tick than
+ * the ctime we cached. Multigrain timestamps (6.13+, ext4/xfs/btrfs/
+ * tmpfs) guarantee that once the file has been fstat()ed, but older
+ * kernels and other filesystems do not: a same-size rewrite inside one
+ * coarse tick (~1-4 ms, or the filesystem's own granularity) would keep
+ * the key and be served the stale verdict. So a verdict is only stored
+ * once the file has settled - its ctime was more than
+ * FAN_CACHE_SETTLE_SECS old when the event arrived, before any of the
+ * scanned bytes were read. Every later change then gets a ctime in a
+ * newer tick, whatever the kernel. A freshly written file is rescanned
+ * on each exec until it settles.
  *
  * `gen` ties each entry to the signature snapshot it was judged
  * against: fan_sigs_refresh() bumps fan_cache_gen whenever the
  * sigtable content changes, which invalidates every entry at once, so
  * an `avctl sig add` takes effect on already-cached files. */
 #define FAN_CACHE_SLOTS 4096
+/* Above the coarsest ctime granularity of a markable local filesystem
+ * (2 s on the FAT family) plus a tick of slack. */
+#define FAN_CACHE_SETTLE_SECS 3
 struct fan_cache_entry {
   bool valid;
   uint64_t gen;
@@ -2039,16 +2049,31 @@ static bool fan_cache_lookup(const struct stat *st, uint8_t *verdict_out,
   return hit;
 }
 
+/* True when `st`'s ctime was more than FAN_CACHE_SETTLE_SECS older
+ * than `seen` (CLOCK_REALTIME, the clock file timestamps come from). A
+ * ctime in the future - the clock was set back - is never settled. */
+static bool fan_ctime_settled(const struct stat *st,
+                              const struct timespec *seen) {
+  time_t sec = st->st_ctim.tv_sec + FAN_CACHE_SETTLE_SECS;
+
+  return seen->tv_sec > sec ||
+         (seen->tv_sec == sec && seen->tv_nsec > st->st_ctim.tv_nsec);
+}
+
 /* Remembers a verdict only when it is safe to: the scan was conclusive,
- * the file's identity did not change between the fstat() taken when
- * the event arrived (`before`) and the one after the scan (`after` -
- * a change means the bytes scanned may not be the bytes on disk now),
- * and the signature snapshot did not change mid-scan (`gen`). */
+ * the file had settled when the event arrived (`seen`, taken before
+ * the `before` fstat() - see the cache comment above), its identity
+ * did not change between that fstat() and the one after the scan
+ * (`after` - a change means the bytes scanned may not be the bytes on
+ * disk now), and the signature snapshot did not change mid-scan
+ * (`gen`). */
 static void fan_cache_store(const struct stat *before, const struct stat *after,
-                            uint64_t gen, const struct scan_result *res) {
+                            const struct timespec *seen, uint64_t gen,
+                            const struct scan_result *res) {
   struct fan_cache_entry *e;
 
-  if (!fan_cache || res->inconclusive || !fan_stat_same(before, after))
+  if (!fan_cache || res->inconclusive || !fan_ctime_settled(before, seen) ||
+      !fan_stat_same(before, after))
     return;
   pthread_mutex_lock(&fan_cache_lock);
   if (gen == fan_cache_gen) {
@@ -2535,8 +2560,9 @@ struct fan_pending {
   struct fan_pending *next; /* listener's list, listener thread only */
   int fd;
   pid_t pid;
-  struct stat st; /* at event time - the cache key */
-  uint64_t gen;   /* fan_cache_gen at event time */
+  struct stat st;       /* at event time - the cache key */
+  struct timespec seen; /* CLOCK_REALTIME just before that fstat() */
+  uint64_t gen;         /* fan_cache_gen at event time */
   struct timespec deadline;
   bool responded;
   int refs;
@@ -2619,7 +2645,7 @@ static void fan_run_task(struct fan_pending *p) {
   /* Stored before answering: the kernel's own bprm_check request for
    * this exec can only arrive after FAN_ALLOW, and should find it. */
   if (fstat(p->fd, &after) == 0)
-    fan_cache_store(&p->st, &after, p->gen, &res);
+    fan_cache_store(&p->st, &after, &p->seen, p->gen, &res);
 
   pthread_mutex_lock(&fan_pending_lock);
   late = p->responded;
@@ -2708,6 +2734,7 @@ static void fan_handle_event(const struct fanotify_event_metadata *m) {
   struct fan_pending *p;
   struct scan_task *task;
   struct stat st;
+  struct timespec seen;
   uint8_t cached;
   char cached_rule[AV_RULE_NAME_MAXLEN + 1];
 
@@ -2722,6 +2749,7 @@ static void fan_handle_event(const struct fanotify_event_metadata *m) {
   /* Allowed without a scan: our own pid (see the re-entrancy note
    * above), and anything that is not a regular file (the exec itself
    * refuses those with EACCES regardless). */
+  clock_gettime(CLOCK_REALTIME, &seen);
   if (m->pid == getpid() || fstat(m->fd, &st) != 0 || !S_ISREG(st.st_mode)) {
     pthread_mutex_lock(&fan_pending_lock);
     fan_respond(m->fd, true);
@@ -2753,6 +2781,7 @@ static void fan_handle_event(const struct fanotify_event_metadata *m) {
     p->fd = m->fd;
     p->pid = m->pid;
     p->st = st;
+    p->seen = seen;
     p->gen = fan_cache_current_gen();
     p->refs = 2;
     clock_gettime(CLOCK_MONOTONIC, &p->deadline);

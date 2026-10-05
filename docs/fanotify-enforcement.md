@@ -96,12 +96,13 @@ cause.
 
 ## Limitations
 
-- **Change detection before 6.13.** Kernels 6.13 and later have
-  multigrain timestamps (ext4, xfs, btrfs, tmpfs). There, the `fstat()`
-  done at event time guarantees that the next change gets a distinct
-  ctime. On older kernels, a same-size rewrite within one coarse timer
-  tick (~1–4 ms) of the cached scan can be served the stale cached
-  verdict.
+- **Freshly written files are not cached.** The cache key includes
+  ctime, but a same-size rewrite in the same timestamp tick keeps it
+  (before 6.13's multigrain timestamps, and on filesystems without
+  them). So a verdict is only cached for a file whose ctime was more
+  than 3 seconds old when the exec arrived. Any later change then gets
+  a new ctime on every kernel. Until a new file settles, each exec of
+  it is scanned in full.
 - **Interpreted content.** The scan covers the image being exec'd. For
   `#!` scripts that means the script file is scanned, and YARA rules
   match on it. A file read by an interpreter such as `python3 evil.py`
