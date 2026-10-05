@@ -13,7 +13,8 @@
 #   2. Neither does any shared library avd links, except the allowlist
 #      below - each entry says why the import is unreachable from avd.
 #   3. The avd sources contain no such call (catches a static helper
-#      before it is ever built).
+#      before it is ever built), and no exec/fork/clone syscall number
+#      (catches syscall(SYS_execveat, ...), which imports only syscall).
 #
 # No root, no module, no daemon:
 #   tests/test_avd_no_exec.sh
@@ -101,6 +102,21 @@ if [ -z "$hits" ]; then
     pass "no exec/fork/spawn-family call in userspace/avd sources"
 else
     fail "exec-family call(s) in avd sources:"
+    while IFS= read -r h; do echo "        $h"; done <<< "$hits"
+fi
+
+# Raw syscall(SYS_execveat, ...) bypasses both checks above: the import
+# is just "syscall", and the call site does not name an exec function.
+# Flag the syscall numbers themselves - any use, not only as a direct
+# syscall() argument, so a call split across lines or a number passed
+# through a variable is caught too.
+NRS='(SYS|__NR)_(execve|execveat|fork|vfork|clone|clone3)'
+hits="$(grep -nE "(^|[^[:alnum:]_])$NRS([^[:alnum:]_]|$)" "$AVD_DIR"/*.c "$AVD_DIR"/*.h |
+        grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+if [ -z "$hits" ]; then
+    pass "no exec/fork/clone syscall number in userspace/avd sources"
+else
+    fail "raw exec/fork/clone syscall(s) in avd sources:"
     while IFS= read -r h; do echo "        $h"; done <<< "$hits"
 fi
 
