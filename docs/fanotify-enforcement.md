@@ -15,7 +15,7 @@ userspace daemon is a different risk from scanning after the fact.
 | Variable | Default | Meaning |
 |---|---|---|
 | `AVD_FANOTIFY` | unset (off) | `1` enables pre-exec enforcement. |
-| `AVD_FANOTIFY_TIMEOUT_MS` | `11000` (the scan timeout + 1 s) | Watchdog deadline per held exec, clamped to 100–60000. |
+| `AVD_FANOTIFY_TIMEOUT_MS` | `11000` (the scan timeout + 1 s) | Watchdog deadline per held exec, 100–60000. A malformed or out-of-range value is ignored (logged) and the default is used. |
 
 Under systemd:
 

@@ -462,11 +462,21 @@ else
 fi
 
 stop_avd
-R="$(try_exec "$FIX/eicar.com")"
-if [ "$R" != EPERM ]; then
-    pass "marks go away with avd (EICAR no longer refused pre-exec)"
+# avd quarantined (removed) the earlier eicar.com; without a fresh copy
+# a missing file would pass this check without any exec happening.
+# Expect the kernel's post-exec bprm_check fallback (SIGKILL, rc=137)
+# rather than a pre-exec EPERM.
+printf '%s' "$EICAR" > "$FIX/eicar.com"
+chmod 755 "$FIX/eicar.com"
+if [ ! -e "$FIX/eicar.com" ]; then
+    fail "could not recreate the EICAR fixture"
 else
-    fail "exec still refused after avd exited"
+    R="$(try_exec "$FIX/eicar.com")"
+    if [ "$R" != EPERM ]; then
+        pass "marks go away with avd (EICAR no longer refused pre-exec, $R)"
+    else
+        fail "exec still refused after avd exited"
+    fi
 fi
 
 echo
