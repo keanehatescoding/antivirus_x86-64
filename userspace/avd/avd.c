@@ -1902,9 +1902,13 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
 
 /* Set once in main() before any thread starts, read-only after (same
  * reasoning as avd_scan_threads). fan_active is true only once
- * fanotify_init() and at least one filesystem mark succeeded. */
+ * fanotify_init() and at least one filesystem mark succeeded; it is
+ * atomic because the listener clears it again if it has to give the
+ * group up (fan_disable()) while workers are running. fan_fd is only
+ * ever closed under fan_pending_lock once threads exist, and is -1
+ * from then on. */
 static bool fan_enabled; /* AVD_FANOTIFY=1 */
-static bool fan_active;
+static atomic_bool fan_active;
 static int fan_fd = -1;
 static int avd_fan_timeout_ms;
 #define AVD_FAN_TIMEOUT_MS_DEFAULT ((SCAN_TIMEOUT_SECS + 1) * 1000)
@@ -2368,7 +2372,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
      * scanning the same image twice. A miss (cache disabled, the
      * fanotify verdict timed out, an unmarked filesystem) falls
      * through to a normal scan. */
-    if (fan_active) {
+    if (atomic_load(&fan_active)) {
       uint8_t cached;
       char cached_rule[AV_RULE_NAME_MAXLEN + 1];
 
@@ -2542,11 +2546,15 @@ static struct fan_pending *fan_pending_head;
 static bool fan_stop; /* under fan_pending_lock */
 
 /* Caller holds fan_pending_lock, so exactly one response is ever
- * written per event. */
+ * written per event. A no-op once fan_disable() has closed the group:
+ * the kernel has released every event of it, and fan_fd's old number
+ * may already belong to an unrelated file. */
 static void fan_respond(int event_fd, bool allow) {
   struct fanotify_response r = {.fd = event_fd,
                                 .response = allow ? FAN_ALLOW : FAN_DENY};
 
+  if (fan_fd < 0)
+    return;
   if (write(fan_fd, &r, sizeof(r)) != (ssize_t)sizeof(r))
     fprintf(stderr, "avd: fanotify response write failed: %s\n",
             strerror(errno));
@@ -2604,7 +2612,7 @@ static void fan_run_task(struct fan_pending *p) {
   struct scan_result res;
   struct stat after;
   char path[PATH_MAX];
-  bool late;
+  bool late, released;
 
   fan_fd_path(p->fd, path, sizeof(path));
   perform_scan(p->fd, path, NULL, (uint32_t)p->pid, false, &res);
@@ -2615,13 +2623,14 @@ static void fan_run_task(struct fan_pending *p) {
 
   pthread_mutex_lock(&fan_pending_lock);
   late = p->responded;
-  if (!late) {
+  released = fan_fd < 0;
+  if (!late && !released)
     fan_respond(p->fd, res.verdict != AV_VERDICT_MALICIOUS);
-    p->responded = true;
-  }
+  p->responded = true;
   pthread_mutex_unlock(&fan_pending_lock);
 
-  if (late)
+  /* Released: fan_disable() closed the group and already said so. */
+  if (late && !released)
     fprintf(stderr,
             "avd: %s verdict for exec of \"%s\" (pid %d) arrived after the "
             "watchdog had already answered by policy%s\n",
@@ -2630,7 +2639,7 @@ static void fan_run_task(struct fan_pending *p) {
             res.verdict == AV_VERDICT_MALICIOUS
                 ? " - left to the kernel's post-exec check"
                 : "");
-  else if (res.verdict == AV_VERDICT_MALICIOUS) {
+  else if (!late && !released && res.verdict == AV_VERDICT_MALICIOUS) {
     fan_count(&fan_denied);
     printf("avd: BLOCKED exec of \"%s\" (pid %d): %s\n", path, (int)p->pid,
            res.rule_name);
@@ -2657,7 +2666,11 @@ static long fan_expire(bool force_all) {
     long left = (long)(p->deadline.tv_sec - now.tv_sec) * 1000 +
                 (p->deadline.tv_nsec - now.tv_nsec) / 1000000L;
 
-    if (!p->responded && (force_all || left <= 0)) {
+    if (!p->responded && fan_fd < 0) {
+      /* Group closed by fan_disable(): the kernel already let it
+       * through, there is nothing left to answer or report. */
+      p->responded = true;
+    } else if (!p->responded && (force_all || left <= 0)) {
       char path[PATH_MAX];
 
       if (!policy_read) {
@@ -3001,6 +3014,33 @@ static void fan_sigs_refresh(void) {
 
 #define FAN_SIG_REFRESH_MS 2000
 
+/* Listener only. Gives up pre-exec enforcement for the rest of this
+ * run: closing the group makes the kernel allow every permission event
+ * of it still unanswered - read or not - and drops every mark, so no
+ * exec is left blocked on a listener that has stopped reading. Under
+ * fan_pending_lock so no worker's fan_respond() is mid-write on the fd
+ * (or writes to its reused number afterwards). The kernel module's
+ * post-exec check stays in place, as when fanotify was never enabled. */
+static void fan_disable(void) {
+  struct fan_sig *old;
+
+  pthread_mutex_lock(&fan_pending_lock);
+  close(fan_fd);
+  fan_fd = -1;
+  pthread_mutex_unlock(&fan_pending_lock);
+  atomic_store(&fan_active, false);
+
+  /* Nothing refreshes the snapshot from here on, and perform_scan()
+   * relies on it being empty without enforcement - a stale copy would
+   * keep matching signatures since removed from the kernel. */
+  pthread_rwlock_wrlock(&fan_sig_lock);
+  old = fan_sigs;
+  fan_sigs = NULL;
+  fan_sig_count = 0;
+  pthread_rwlock_unlock(&fan_sig_lock);
+  free(old);
+}
+
 static void *fan_listener_main(void *arg) {
   int mi_fd = (int)(intptr_t)arg;
   /* Aligned for the metadata struct the buffer is read as. */
@@ -3009,7 +3049,7 @@ static void *fan_listener_main(void *arg) {
   struct timespec last_refresh;
 
   clock_gettime(CLOCK_MONOTONIC, &last_refresh);
-  for (;;) {
+  while (fan_fd >= 0) {
     struct pollfd pfd[2] = {{.fd = fan_fd, .events = POLLIN},
                             {.fd = mi_fd, .events = POLLPRI}};
     struct timespec now;
@@ -3038,7 +3078,7 @@ static void *fan_listener_main(void *arg) {
       fan_mark_mounts(mi_fd);
 
     if (pr > 0 && (pfd[0].revents & POLLIN)) {
-      for (;;) {
+      while (fan_fd >= 0) {
         ssize_t n = read(fan_fd, buf, sizeof(buf));
         struct fanotify_event_metadata *m;
 
@@ -3051,12 +3091,17 @@ static void *fan_listener_main(void *arg) {
         for (m = (struct fanotify_event_metadata *)buf; FAN_EVENT_OK(m, n);
              m = FAN_EVENT_NEXT(m, n)) {
           if (m->vers != FANOTIFY_METADATA_VERSION) {
-            fprintf(stderr, "avd: fanotify metadata version %u, expected %u "
-                            "- ignoring event\n",
+            /* Nothing in this record - or past it - can be trusted, so
+             * neither its fd nor its event can be answered: the group
+             * has to go (fanotify(7)). Any event fds left in the buffer
+             * stay open; their execs are released with the group. */
+            fprintf(stderr,
+                    "avd: fanotify metadata version %u, expected %u - "
+                    "pre-exec enforcement disabled, the kernel module's "
+                    "post-exec check still applies\n",
                     m->vers, FANOTIFY_METADATA_VERSION);
-            if (m->fd >= 0)
-              close(m->fd);
-            continue;
+            fan_disable();
+            break;
           }
           fan_handle_event(m);
         }
@@ -3122,7 +3167,7 @@ static int fan_setup(void) {
     return -1;
   }
 
-  fan_active = true;
+  atomic_store(&fan_active, true);
   printf("avd: fanotify pre-exec enforcement active on %d filesystem(s), "
          "verdict deadline %d ms\n",
          marked, avd_fan_timeout_ms);
@@ -3487,7 +3532,7 @@ static void cmd_status(int fd) {
            fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads,
            (unsigned long long)total, (unsigned long long)malicious,
            (unsigned long long)avg_ms, (unsigned long long)time_max,
-           (unsigned long long)last_ms, fan_active ? 1 : 0,
+           (unsigned long long)last_ms, atomic_load(&fan_active) ? 1 : 0,
            (unsigned long long)f_events, (unsigned long long)f_hits,
            (unsigned long long)f_denied, (unsigned long long)f_fallbacks);
   write_all(fd, row, strlen(row));
@@ -4700,7 +4745,7 @@ int main(int argc, char **argv) {
      * watchdog if no worker takes them in time. */
     if (fan_enabled)
       fan_mi_fd = fan_setup();
-    if (fan_active) {
+    if (atomic_load(&fan_active)) {
       if (pthread_create(&fan_thread, NULL, fan_listener_main,
                          (void *)(intptr_t)fan_mi_fd) == 0) {
         fan_started = true;
@@ -4715,7 +4760,7 @@ int main(int argc, char **argv) {
                 strerror(errno));
         fan_teardown(fan_thread, false, fan_mi_fd);
         fan_mi_fd = -1;
-        fan_active = false;
+        atomic_store(&fan_active, false);
       }
     }
 
