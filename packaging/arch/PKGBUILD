@@ -37,7 +37,17 @@ license=('GPL3')
 # of gap debian/control's own comment already documents and accounts
 # for (python3-gi/gir1.2-gtk-4.0 there) and packaging/fedora/hyprav.spec
 # (python3-gobject/gtk4) - this file just hadn't caught up.
-makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4')
+#
+# No kernel headers package here on purpose: 'linux-headers' only
+# matches Arch's stock `linux` kernel, so listing it made `makepkg`
+# refuse to run on a machine that boots linux-zen, linux-hardened,
+# linux-lts or a CachyOS kernel (each has its own *-headers package),
+# and `makepkg -s` "fixed" that by installing headers the build never
+# used. Nothing in this build needs them - hyprav-dkms ships module
+# source, and build()'s compile check below skips itself when the
+# running kernel's headers are absent. They are a runtime need of
+# hyprav-dkms instead (see its optdepends).
+makedepends=('git' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4')
 source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus_x86-64.git}")
 sha256sums=('SKIP')
 
@@ -73,9 +83,27 @@ build() {
   # and builds actual matching kernel trees). Unset by default, so a
   # real Arch machine (where headers DO match uname -r) still gets this
   # check exactly as before.
-  if [ -z "$HYPRAV_SKIP_AV_KO_CHECK" ]; then
-    make -C av clean
-    make -C av
+  #
+  # The check follows whichever kernel is running, whatever its flavor:
+  # it is skipped (with a note) when that kernel's headers are not
+  # installed, and LLVM=1 is added when the kernel's own config says it
+  # was built with Clang (linux-cachyos and its -lto variants) - a
+  # GCC-built module does not link against those. An LLVM the caller
+  # set explicitly is left alone.
+  local _kdir="/usr/lib/modules/$(uname -r)/build"
+  if [ -n "$HYPRAV_SKIP_AV_KO_CHECK" ]; then
+    :
+  elif [ ! -e "$_kdir/Makefile" ]; then
+    echo "hyprav: no kernel headers at $_kdir - skipping the av.ko" \
+         "compile check (dkms still needs the headers package of every" \
+         "kernel the module should be built for)"
+  else
+    local _llvm=()
+    if [ -z "${LLVM:-}" ] && grep -qs '^CONFIG_CC_IS_CLANG=y' "$_kdir/.config"; then
+      _llvm=(LLVM=1)
+    fi
+    make -C av clean "${_llvm[@]}"
+    make -C av "${_llvm[@]}"
   fi
 
   # `make clean` first, unconditionally: makepkg reuses $srcdir across
@@ -104,6 +132,19 @@ build() {
 package_hyprav-dkms() {
   pkgdesc="HyprAV kprobe-based execve/file-event kernel module (DKMS source package)"
   depends=('dkms')
+  # dkms builds av.ko for every installed kernel whose headers are
+  # present, so one package covers all of these - there is no
+  # per-kernel variant of hyprav-dkms to pick. Install the headers
+  # package that matches each kernel you boot. clang/llvm/lld are only
+  # needed for a Clang-built kernel (dkms adds LLVM=1 by itself there).
+  optdepends=('linux-headers: build the module for the stock linux kernel'
+              'linux-lts-headers: build the module for linux-lts'
+              'linux-zen-headers: build the module for linux-zen'
+              'linux-hardened-headers: build the module for linux-hardened'
+              'linux-cachyos-headers: build the module for linux-cachyos (other CachyOS variants: their own -headers package)'
+              'clang: Clang-built kernels (e.g. linux-cachyos)'
+              'llvm: Clang-built kernels (e.g. linux-cachyos)'
+              'lld: Clang-built kernels (e.g. linux-cachyos)')
 
   # No install= script here on purpose: the `dkms` package itself ships
   # pacman hooks (/usr/share/libalpm/hooks/70-dkms-install.hook etc.)
