@@ -17,7 +17,7 @@
 <component type="desktop-application">
   <id>org.hyprav.avgui</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>GPL-3.0-only</project_license>
+  <project_license>GPL-2.0-only OR MIT</project_license>
   <name>HyprAV</name>
   <summary>Management console for the HyprAV kernel-level antivirus</summary>
   <description>

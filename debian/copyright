@@ -5,22 +5,19 @@ Source: https://github.com/keanehatescoding/antivirus_x86-64
 
 Files: *
 Copyright: 2025-2026 keanehatescoding
-License: GPL-3.0-only
+License: GPL-2.0-only or MIT
 
 Files: debian/*
 Copyright: 2026 keanehatescoding
-License: GPL-3.0-only
+License: GPL-2.0-only or MIT
 
-License: GPL-3.0-only
- This program is free software: you can redistribute it and/or modify
- it under the terms of the GNU General Public License version 3 as
- published by the Free Software Foundation.
- .
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- GNU General Public License for more details.
+License: GPL-2.0-only or MIT
+ This project is dual-licensed. You may use, copy, modify, and
+ redistribute this software under the terms of EITHER the GNU General
+ Public License version 2 only (GPL-2.0-only) OR the MIT License, at
+ your option. The full text of each license is reproduced in the
+ top-level LICENSE file in the upstream source tree.
  .
  On Debian systems, the complete text of the GNU General Public
- License version 3 can be found in
- "/usr/share/common-licenses/GPL-3".
+ License version 2 can be found in
+ "/usr/share/common-licenses/GPL-2".
