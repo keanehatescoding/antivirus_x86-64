@@ -2989,6 +2989,16 @@ static void fan_sigs_refresh(void) {
                       "keeping the previous signature snapshot\n");
       return;
     }
+  } else if (errno != ENOENT) {
+    /* Only a missing entry means an empty table. Any other failure
+     * (EMFILE, ENOMEM, ...) says nothing about the signatures, and
+     * swapping in an empty snapshot would drop pre-exec SHA-256
+     * enforcement until a later refresh got through. */
+    fprintf(stderr,
+            "avd: could not open /proc/kernel_av_signatures: %s - "
+            "keeping the previous signature snapshot\n",
+            strerror(errno));
+    return;
   }
 
   sha256_init(&ctx);
@@ -3057,6 +3067,13 @@ static void fan_sigs_refresh(void) {
 }
 
 #define FAN_SIG_REFRESH_MS 2000
+/* Reads per pass of the listener loop before it goes back to its
+ * deadline checks. Under a steady stream of execs the fd never reports
+ * EAGAIN, and draining it to empty would keep fan_expire() and the
+ * signature refresh from running - leaving a queued exec held past
+ * AVD_FANOTIFY_TIMEOUT_MS. poll() is level-triggered, so whatever is
+ * left is picked up on the next pass without waiting. */
+#define FAN_READ_BATCH 16
 
 /* Listener only. Gives up pre-exec enforcement for the rest of this
  * run: closing the group makes the kernel allow every permission event
@@ -3122,7 +3139,9 @@ static void *fan_listener_main(void *arg) {
       fan_mark_mounts(mi_fd);
 
     if (pr > 0 && (pfd[0].revents & POLLIN)) {
-      while (fan_fd >= 0) {
+      int reads;
+
+      for (reads = 0; fan_fd >= 0 && reads < FAN_READ_BATCH; reads++) {
         ssize_t n = read(fan_fd, buf, sizeof(buf));
         struct fanotify_event_metadata *m;
 
