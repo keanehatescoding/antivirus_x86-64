@@ -3074,6 +3074,21 @@ static void fan_sigs_refresh(void) {
  * AVD_FANOTIFY_TIMEOUT_MS. poll() is level-triggered, so whatever is
  * left is picked up on the next pass without waiting. */
 #define FAN_READ_BATCH 16
+/* One batch can still carry thousands of events (a read returns
+ * several hundred), and an event that finds the queue full costs a
+ * policy read and a log line. So the deadlines are also swept while a
+ * batch is being processed, whenever this much time has gone by since
+ * the last sweep - by the clock rather than per event, because
+ * fan_expire() walks the whole pending list. */
+#define FAN_EXPIRE_SLICE_MS 20
+
+static long fan_ms_since(const struct timespec *then) {
+  struct timespec now;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (long)(now.tv_sec - then->tv_sec) * 1000 +
+         (now.tv_nsec - then->tv_nsec) / 1000000L;
+}
 
 /* Listener only. Gives up pre-exec enforcement for the rest of this
  * run: closing the group makes the kernel allow every permission event
@@ -3107,7 +3122,7 @@ static void *fan_listener_main(void *arg) {
   /* Aligned for the metadata struct the buffer is read as. */
   char buf[8192] __attribute__((aligned(__alignof__(
       struct fanotify_event_metadata))));
-  struct timespec last_refresh;
+  struct timespec last_refresh, last_sweep;
 
   clock_gettime(CLOCK_MONOTONIC, &last_refresh);
   while (fan_fd >= 0) {
@@ -3125,6 +3140,7 @@ static void *fan_listener_main(void *arg) {
       break;
 
     next = fan_expire(false);
+    clock_gettime(CLOCK_MONOTONIC, &last_sweep);
     /* Capped at 200 ms so fan_stop and the signature refresh are
      * noticed promptly even with nothing pending. */
     timeout = (next >= 0 && next < 200) ? next : 200;
@@ -3167,6 +3183,10 @@ static void *fan_listener_main(void *arg) {
             break;
           }
           fan_handle_event(m);
+          if (fan_ms_since(&last_sweep) >= FAN_EXPIRE_SLICE_MS) {
+            fan_expire(false);
+            clock_gettime(CLOCK_MONOTONIC, &last_sweep);
+          }
         }
       }
     }
