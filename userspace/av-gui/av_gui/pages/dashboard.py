@@ -11,7 +11,7 @@ _ROWS = [
     "avd status", "uptime", "rules loaded", "fuzzy corpus entries",
     "TLSH corpus entries", "scan queue depth", "scan worker threads",
     "scans completed", "malicious scans", "avg scan latency",
-    "max scan latency", "last scan latency",
+    "max scan latency", "last scan latency", "pre-exec enforcement",
     "signatures", "trusted binaries", "protected paths",
     "daemon-unavailable policy",
 ]
@@ -70,9 +70,21 @@ class Page:
                 ("last scan latency", "last_scan_ms"),
             ):
                 self._set(key, f"{st[field]}ms" if field in st else "-")
+            if "fanotify_active" not in st:
+                self._set("pre-exec enforcement", "-")
+            elif st["fanotify_active"]:
+                self._set(
+                    "pre-exec enforcement",
+                    f"on - {st['fan_events']} execs, "
+                    f"{st['fan_cache_hits']} cached, "
+                    f"{st['fan_denied']} denied, "
+                    f"{st['fan_fallbacks']} fallbacks",
+                )
+            else:
+                self._set("pre-exec enforcement", "off")
         except avd_client.AvdError as exc:
             self._set("avd status", "unreachable")
-            for key in _ROWS[1:12]:
+            for key in _ROWS[1:13]:
                 self._set(key, "-")
             errors.append(path_validation.for_display(f"avd: {exc}"))
 
@@ -86,7 +98,7 @@ class Page:
                 path_validation.for_display(state["policy"] or "-"),
             )
         except procfs_client.ProcfsError as exc:
-            for key in _ROWS[12:]:
+            for key in _ROWS[13:]:
                 self._set(key, "-")
             errors.append(path_validation.for_display(f"avctl: {exc}"))
 
