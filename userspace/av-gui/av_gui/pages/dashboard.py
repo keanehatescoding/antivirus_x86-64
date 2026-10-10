@@ -78,7 +78,7 @@ class Page:
                     f"on - {st['fan_events']} execs, "
                     f"{st['fan_cache_hits']} cached, "
                     f"{st['fan_denied']} denied, "
-                    f"{st['fan_fallbacks']} timed out",
+                    f"{st['fan_fallbacks']} fallbacks",
                 )
             else:
                 self._set("pre-exec enforcement", "off")
