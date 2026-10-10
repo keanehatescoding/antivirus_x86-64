@@ -67,8 +67,10 @@ Summary:        Kernel-level Linux antivirus (kprobe execve/file monitor + YARA/
 # SPDX expression (current Fedora Licensing Guidelines). The project
 # is dual-licensed; downstream may elect either. Older Fedora releases
 # (pre F38-ish) used short names like "GPLv2"/"MIT" instead - adjust
-# if targeting one of those.
-License:        GPL-2.0-only OR MIT
+# if targeting one of those. The base package's avd binary also
+# contains the BSD-3-Clause TLSH port (userspace/avd/tlsh_core.c), hence
+# the AND; the subpackages below override this with the plain dual grant.
+License:        (GPL-2.0-only OR MIT) AND BSD-3-Clause
 URL:            https://github.com/keanehatescoding/antivirus_x86-64
 Source0:        %{url}/archive/%{gitcommit}/antivirus_x86-64-%{gitcommit}.tar.gz
 
@@ -107,6 +109,7 @@ kernel module and hyprav-gui for the GTK4 management console.
 
 %package -n hyprav-dkms
 Summary:        HyprAV kprobe-based execve/file-event kernel module (DKMS)
+License:        GPL-2.0-only OR MIT
 Requires:       dkms
 Requires(post): dkms
 Requires(preun): dkms
@@ -127,6 +130,7 @@ name; arm64 needs source changes to hook __arm64_sys_execve instead.
 
 %package -n hyprav-gui
 Summary:        GTK4 management console for HyprAV
+License:        GPL-2.0-only OR MIT
 BuildArch:      noarch
 Requires:       %{name} = %{version}-%{release}
 Requires:       python3
