@@ -35,6 +35,11 @@ User=root
 # to.
 ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib/av-quarantine @SYSCONFDIR@/tlsh_hashes.txt
 
+# Pre-exec enforcement (fanotify FAN_OPEN_EXEC_PERM, #176) is opt-in:
+# it holds every exec on the machine until avd answers. Enable with
+# `systemctl edit avd.service` adding Environment=AVD_FANOTIFY=1 - see
+# docs/fanotify-enforcement.md for the timeout and policy knobs.
+
 Restart=on-failure
 RestartSec=5
 

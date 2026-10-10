@@ -110,10 +110,11 @@ def status():
     """Returns a dict: uptime_secs, rules_loaded, fuzzy_corpus_count,
     tlsh_corpus_count, scan_queue_len, scan_threads (all int), plus -
     on daemons new enough to report them - scans_total,
-    scans_malicious, scan_avg_ms, scan_max_ms, last_scan_ms (all int).
-    Accepts both the 6-field row (older avd) and the 11-field row:
-    the metrics fields were appended, never inserted, so positional
-    parsing of the first six is stable either way."""
+    scans_malicious, scan_avg_ms, scan_max_ms, last_scan_ms, and then
+    fanotify_active, fan_events, fan_cache_hits, fan_denied,
+    fan_fallbacks (all int). Accepts the 6-field row (oldest avd), the
+    11-field row and the 16-field row: each group was appended, never
+    inserted, so positional parsing of the earlier fields is stable."""
     rows = _parse_rows(_request("STATUS"))
     if len(rows) != 1:
         raise AvdError(f"STATUS returned {len(rows)} row(s), expected 1")
@@ -125,15 +126,22 @@ def status():
         "scans_total", "scans_malicious", "scan_avg_ms",
         "scan_max_ms", "last_scan_ms",
     ]
+    fan_keys = [
+        "fanotify_active", "fan_events", "fan_cache_hits", "fan_denied",
+        "fan_fallbacks",
+    ]
+    shapes = [
+        base_keys,
+        base_keys + metric_keys,
+        base_keys + metric_keys + fan_keys,
+    ]
     fields = rows[0]
-    if len(fields) == len(base_keys):
-        keys = base_keys
-    elif len(fields) == len(base_keys) + len(metric_keys):
-        keys = base_keys + metric_keys
-    else:
+    keys = next((k for k in shapes if len(k) == len(fields)), None)
+    if keys is None:
+        expected = " or ".join(str(len(k)) for k in shapes)
         raise AvdError(
-            f"malformed STATUS row: expected {len(base_keys)} or "
-            f"{len(base_keys) + len(metric_keys)} fields, got {len(fields)}"
+            f"malformed STATUS row: expected {expected} fields, "
+            f"got {len(fields)}"
         )
     try:
         values = [int(v) for v in fields]
