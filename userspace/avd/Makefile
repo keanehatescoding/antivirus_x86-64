@@ -30,12 +30,26 @@ LIBNL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libnl-genl-3.0 2>/dev/null)
 LIBNL_LIBS   := $(shell $(PKG_CONFIG) --libs libnl-genl-3.0 2>/dev/null)
 YARA_CFLAGS  := $(shell $(PKG_CONFIG) --cflags yara 2>/dev/null)
 YARA_LIBS    := $(shell $(PKG_CONFIG) --libs yara 2>/dev/null)
+# ssdeep fuzzy hashing is opt-in (`make WITH_SSDEEP=1`), off by default:
+# libfuzzy is GPL-2.0-or-later, so an avd linked against it can only be
+# distributed under the GPL, while the default build links nothing but
+# MIT/BSD/LGPL code. TLSH (vendored, below) is always built and covers
+# near-identical-variant matching either way.
+WITH_SSDEEP ?= 0
+ifeq ($(WITH_SSDEEP),1)
+SSDEEP_CFLAGS := -DAVD_WITH_SSDEEP
 # libfuzzy (ssdeep) ships no pkg-config file upstream, so probe for a
 # downstream-provided one first and fall back to a plain -lfuzzy link.
 # `?=` (not `:=`) so packagers can override without editing this file
 # (e.g. `make FUZZY_LIBS="-l:libfuzzy.a"`). Recursive, so the probe
 # runs when FUZZY_LIBS is used, not at Makefile-parse time.
 FUZZY_LIBS   ?= $(shell $(PKG_CONFIG) --libs fuzzy 2>/dev/null || echo "-lfuzzy")
+else
+SSDEEP_CFLAGS :=
+# `override`: an inherited/command-line FUZZY_LIBS must not link
+# libfuzzy into a build that was asked not to use it.
+override FUZZY_LIBS :=
+endif
 # TLSH fuzzy hashing (tlsh_core.c/tlsh_shim.c) is vendored pure C -
 # no libtlsh/-ltlsh, no header search path, no C++ compiler. See
 # tlsh_core.h and the top-level README's "Testing TLSH fuzzy hashing"
@@ -70,6 +84,7 @@ checkdeps:
 		echo "  Debian/Ubuntu: sudo apt install libyara-dev"; \
 		exit 1; \
 	fi
+ifeq ($(WITH_SSDEEP),1)
 	@# mktemp + trap, not a fixed /tmp/.avd_fuzzy_check path: a
 	@# predictable world-writable-directory path is a classic
 	@# symlink-planting target - another local user (or a concurrent
@@ -86,14 +101,24 @@ checkdeps:
 		echo "ERROR: libfuzzy (ssdeep) not found."; \
 		echo "  Arch/CachyOS: sudo pacman -S ssdeep"; \
 		echo "  Debian/Ubuntu: sudo apt install libfuzzy-dev"; \
+		echo "  (or build without it: make WITH_SSDEEP=0, the default)"; \
 		exit 1; \
 	fi
+endif
+
+# Records which WITH_SSDEEP flavor the objects were built for and is a
+# prerequisite of avd.o/avd, so flipping the flag between runs rebuilds
+# instead of linking a stale avd.o from the other flavor. Only rewritten
+# when the value actually changes, so it doesn't force a rebuild itself.
+.ssdeep-flavor: FORCE
+	@echo '$(WITH_SSDEEP)' | cmp -s - $@ || echo '$(WITH_SSDEEP)' > $@
+FORCE:
 
 # Makefile is a normal prerequisite throughout: GNU Make won't rebuild
 # objects/binaries on a flags-only Makefile change otherwise, so an
 # incremental build could install stale artifacts missing the hardening
 # flags above. install depends on avd, so it inherits the rebuild.
-avd: avd.o sha256.o tlsh_core.o tlsh_shim.o Makefile
+avd: avd.o sha256.o tlsh_core.o tlsh_shim.o Makefile .ssdeep-flavor
 	$(CC) $(CFLAGS) $(LDFLAGS) -o avd avd.o sha256.o tlsh_core.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) -lpthread
 
 # Every translation unit here is plain C, built and linked with
@@ -103,8 +128,8 @@ avd: avd.o sha256.o tlsh_core.o tlsh_shim.o Makefile
 # checkdeps to run first without making a checkdeps timestamp change
 # trigger a needless rebuild of these objects (checkdeps has no file
 # output to have a timestamp in the first place).
-avd.o: avd.c ../../av/netlink_proto.h control_parse.h sha256.h tlsh_shim.h Makefile | checkdeps
-	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
+avd.o: avd.c ../../av/netlink_proto.h control_parse.h sha256.h tlsh_shim.h Makefile .ssdeep-flavor | checkdeps
+	$(CC) $(CFLAGS) $(SSDEEP_CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
 
 # sha256.o needs none of avd's third-party deps (libnl/yara/fuzzy)
 # - no "| checkdeps" prerequisite, so `make` in a tree missing those
@@ -123,7 +148,7 @@ tlsh_shim.o: tlsh_shim.c tlsh_shim.h tlsh_core.h Makefile
 	$(CC) $(CFLAGS) -c tlsh_shim.c -o tlsh_shim.o
 
 clean:
-	rm -f avd avd.o sha256.o tlsh_core.o tlsh_shim.o
+	rm -f avd avd.o sha256.o tlsh_core.o tlsh_shim.o .ssdeep-flavor
 
 # Installs the binary, the systemd unit, and a default rules/corpus
 # location under SYSCONFDIR - NOT enabled or started automatically
@@ -173,4 +198,4 @@ install: avd
 	@echo "  sudo systemctl daemon-reload"
 	@echo "  sudo systemctl enable --now avd.service"
 
-.PHONY: clean install checkdeps
+.PHONY: clean install checkdeps FORCE

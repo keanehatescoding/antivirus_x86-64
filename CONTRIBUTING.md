@@ -34,8 +34,9 @@ Dependencies, by component:
 sudo apt install build-essential linux-headers-$(uname -r) git
 
 # userspace/avd
-sudo apt install libnl-genl-3-dev libyara-dev libfuzzy-dev
+sudo apt install libnl-genl-3-dev libyara-dev
 # TLSH is vendored in userspace/avd/tlsh_core.c — no libtlsh needed
+# ssdeep is opt-in: `make WITH_SSDEEP=1` additionally needs libfuzzy-dev
 
 # userspace/av-gui
 sudo apt install python3 python3-gi gir1.2-gtk-4.0

@@ -11,6 +11,7 @@ Module.symvers
 modules.order
 userspace/avctl/avctl
 userspace/avd/avd
+userspace/avd/.ssdeep-flavor
 tests/netlink_test_helper
 av/compile_commands.json
 tests/qemu-boot/init

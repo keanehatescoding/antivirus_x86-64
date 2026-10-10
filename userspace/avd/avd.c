@@ -5,7 +5,8 @@
  * file at the given path.
  *
  * v0.3.0: netlink plumbing + YARA rule matching (rules directory)
- * v0.7.0: fuzzy hashing (ssdeep/libfuzzy) - runs when no YARA rule
+ * v0.7.0: fuzzy hashing (ssdeep/libfuzzy; opt-in at build time since
+ *         the MIT relicense, see AVD_WITH_SSDEEP) - runs when no YARA rule
  *         matched, comparing the file's fuzzy hash against a corpus
  *         of known-bad hashes (default: ./corpus/fuzzy_hashes.txt,
  *         override with argv[2] or AVD_CORPUS_FILE). Catches
@@ -56,9 +57,9 @@
  * docs/netlink-protocol.md and the top-level README's netlink testing
  * section.
  *
- * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara ssdeep
+ * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara
  * Dependencies (Debian/Ubuntu): sudo apt install libnl-genl-3-dev libyara-dev
- * libfuzzy-dev
+ * (plus ssdeep / libfuzzy-dev for a WITH_SSDEEP=1 build only)
  * (TLSH fuzzy hashing is vendored pure C - no libtlsh/libtlsh-dev
  * package needed.)
  *
@@ -104,7 +105,13 @@
 #include <netlink/genl/genl.h>
 #include <netlink/netlink.h>
 
+/* ssdeep/libfuzzy is GPL-2.0-or-later, so it is an opt-in build
+ * dependency (make WITH_SSDEEP=1 -> -DAVD_WITH_SSDEEP): without it avd
+ * links no GPL code and the ssdeep pass below compiles to a no-op.
+ * TLSH is vendored and always built. */
+#ifdef AVD_WITH_SSDEEP
 #include <fuzzy.h>
+#endif
 #include <yara.h>
 
 #include "../../av/netlink_proto.h"
@@ -259,10 +266,12 @@
  * the exact repro. */
 #define TLSH_MATCH_MAX_DIFF 30
 
+#ifdef AVD_WITH_SSDEEP
 struct fuzzy_corpus_entry {
   char hash[FUZZY_MAX_RESULT];
   char name[128];
 };
+#endif
 
 /* Name carried by the demo fixture entries in corpus/fuzzy_hashes.txt
  * and corpus/tlsh_hashes.txt (see their TEST FIXTURE ONLY headers).
@@ -288,7 +297,11 @@ struct tlsh_corpus_entry {
   char name[128];
 };
 
+#ifdef AVD_WITH_SSDEEP
 static struct fuzzy_corpus_entry *fuzzy_corpus;
+#endif
+/* Stays 0 in a build without ssdeep - STATUS still reports the field,
+ * so its row layout is the same either way. */
 static size_t fuzzy_corpus_count;
 static struct tlsh_corpus_entry *tlsh_corpus;
 static size_t tlsh_corpus_count;
@@ -677,6 +690,7 @@ static int parse_corpus_line(char *line, char **hash_part_out,
   return 1;
 }
 
+#ifdef AVD_WITH_SSDEEP
 static int load_fuzzy_corpus(const char *path) {
   FILE *fp;
   char line[512];
@@ -762,6 +776,16 @@ static int load_fuzzy_corpus(const char *path) {
 
   return 0;
 }
+#else
+/* Built without ssdeep: the corpus path is still accepted (avd.service
+ * and every caller pass it positionally) but never read. */
+static int load_fuzzy_corpus(const char *path) {
+  printf("avd: built without ssdeep (WITH_SSDEEP=1 to enable) - "
+         "fuzzy corpus \"%s\" ignored, TLSH matching unaffected\n",
+         path);
+  return 0;
+}
+#endif
 
 /*
  * Compares the already-open file `fd` against every entry in the
@@ -829,6 +853,7 @@ static bool fuzzy_tlsh_size_ok(int fd, const char *label) {
   return true;
 }
 
+#ifdef AVD_WITH_SSDEEP
 static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
                               int *score_out) {
   char file_hash[FUZZY_MAX_RESULT];
@@ -925,6 +950,16 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
 
   return 0;
 }
+#else
+static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
+                              int *score_out) {
+  (void)fd;
+  (void)name_out;
+  (void)name_out_len;
+  (void)score_out;
+  return 0;
+}
+#endif
 
 /*
  * Startup regression guard for the hand-ported TLSH implementation
@@ -3952,7 +3987,9 @@ int main(int argc, char **argv) {
   if (compiled_rules)
     yr_rules_destroy(compiled_rules);
   yr_finalize();
+#ifdef AVD_WITH_SSDEEP
   free(fuzzy_corpus);
+#endif
   free(tlsh_corpus);
   return 0;
 }

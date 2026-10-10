@@ -37,7 +37,7 @@ license=('GPL3')
 # of gap debian/control's own comment already documents and accounts
 # for (python3-gi/gir1.2-gtk-4.0 there) and packaging/fedora/hyprav.spec
 # (python3-gobject/gtk4) - this file just hadn't caught up.
-makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'pkgconf' 'python-gobject' 'gtk4')
+makedepends=('git' 'linux-headers' 'libnl' 'yara' 'pkgconf' 'python-gobject' 'gtk4')
 source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus_x86-64.git}")
 sha256sums=('SKIP')
 
@@ -147,7 +147,7 @@ EOF
 
 package_hyprav() {
   pkgdesc="HyprAV userspace scanning daemon (avd) and control CLI (avctl) - YARA/entropy/fuzzy-hash detection, quarantine"
-  depends=('libnl' 'yara' 'ssdeep' 'polkit' 'systemd')
+  depends=('libnl' 'yara' 'polkit' 'systemd')
   optdepends=('hyprav-dkms: kernel-level execve/file interception; avd refuses to start without av.ko loaded')
   backup=('etc/hyprav/rules/heuristics.yar'
           'etc/hyprav/rules/elf_analysis.yar'

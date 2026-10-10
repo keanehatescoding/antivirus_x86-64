@@ -3,6 +3,10 @@
 # Format: <ssdeep_hash>,<name>
 # Lines starting with # are comments. Blank lines are ignored.
 #
+# Only read by an avd built with WITH_SSDEEP=1 (off by default - see
+# userspace/avd/Makefile); the default build ignores this file and
+# relies on tlsh_hashes.txt for near-identical-variant matching.
+#
 # TEST FIXTURE ONLY: the entry below is the fuzzy hash of a small,
 # harmless test binary built during development (a program that calls
 # ptrace() - see rules/heuristics.yar), NOT a real malware sample. It

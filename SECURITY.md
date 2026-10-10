@@ -37,7 +37,7 @@ When you report something, include the commit SHA you tested against
 
 **Out of scope:**
 
-- Bugs in YARA, libfuzzy (ssdeep), or the vendored TLSH code itself —
+- Bugs in YARA, libfuzzy (ssdeep, opt-in builds only), or the vendored TLSH code itself —
   report those upstream, unless the issue is specifically in how this
   project calls them
 - "You didn't catch my sample" — detection/evasion gaps in the rules

@@ -24,7 +24,7 @@
     <p>
       HyprAV is a kprobe-based kernel antivirus (av.ko) paired with a
       privileged userspace daemon (avd) that does YARA matching, ELF
-      structural analysis, entropy scoring, and ssdeep/TLSH fuzzy
+      structural analysis, entropy scoring, and TLSH fuzzy
       hashing, plus a CLI (avctl) for managing it.
     </p>
     <p>

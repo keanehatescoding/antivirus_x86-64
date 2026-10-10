@@ -76,7 +76,6 @@ BuildRequires:  make
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(libnl-genl-3.0)
 BuildRequires:  yara-devel
-BuildRequires:  ssdeep-devel
 BuildRequires:  systemd-rpm-macros
 # userspace/av-gui/Makefile's `install` target (invoked in %install
 # below) depends on `checkdeps`, which imports gi and loads GTK4
@@ -96,7 +95,7 @@ Requires:       /usr/bin/pkexec
 HyprAV is a kprobe-based kernel module (av.ko) that hooks execve and
 file events, does fast hash/counter checks in-kernel, and defers
 anything heavier - YARA matching, ELF structural analysis, entropy
-scoring, ssdeep/TLSH fuzzy hashing - to avd, a privileged userspace
+scoring, TLSH fuzzy hashing - to avd, a privileged userspace
 daemon it talks to over netlink. avctl is the CLI (and polkit-gated
 privileged entry point) for managing avd's signatures, trust list,
 protected paths, policy, on-demand scans, and quarantine.

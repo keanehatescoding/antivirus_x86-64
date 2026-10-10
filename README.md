@@ -31,7 +31,7 @@ rmmod av
 ```
 av/                  the kernel module — see wiki: Kernel Module
 rules/               YARA rule tiers — see wiki: Detection Rules
-corpus/               fuzzy-hash corpora (ssdeep + TLSH) — see wiki: Detection Rules
+corpus/               fuzzy-hash corpora (TLSH; ssdeep if built with WITH_SSDEEP=1) — see wiki: Detection Rules
 userspace/avctl/     CLI — see wiki: avctl CLI
 userspace/avd/       scanning/quarantine daemon — see wiki: avd Daemon
 userspace/av-gui/    GTK4 management console — see wiki: av gui

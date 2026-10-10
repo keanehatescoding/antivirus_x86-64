@@ -246,6 +246,23 @@ jobs:
         # Same CI-only -Werror rationale as build-avctl above.
         run: make -C userspace/avd CFLAGS="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security"
 
+      - name: Corpus loader checks (default build, no ssdeep)
+        run: tests/test_corpus_format.sh
+
+      - name: Build avd with the opt-in ssdeep pass
+        # WITH_SSDEEP=1 is not what the packages ship (libfuzzy is
+        # GPL-2.0-or-later, see userspace/avd/Makefile) but it is still
+        # supported, so it must keep compiling warning-free and its
+        # corpus loader must keep validating. Rebuilt back to the
+        # default flavor afterwards so the smoke tests below run against
+        # what actually ships.
+        run: |
+          set -euxo pipefail
+          W="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security"
+          make -C userspace/avd WITH_SSDEEP=1 CFLAGS="$W"
+          WITH_SSDEEP=1 tests/test_corpus_format.sh
+          make -C userspace/avd CFLAGS="$W"
+
       - name: Smoke-test YARA rules against EICAR
         run: |
           set -euxo pipefail

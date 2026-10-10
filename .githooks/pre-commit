@@ -58,7 +58,7 @@ for f in "${STAGED[@]}"; do
             YARA_LIBS="$(pkg-config --libs yara 2>/dev/null)"
             if [ -z "$NL_LIBS" ] || [ -z "$YARA_LIBS" ]; then
                 echo "  ! libnl-genl-3.0 and/or yara not found via pkg-config - skipping syntax check for $f"
-                echo "    (sudo pacman -S libnl yara ssdeep  /  apt install libnl-genl-3-dev libyara-dev libfuzzy-dev)"
+                echo "    (sudo pacman -S libnl yara  /  apt install libnl-genl-3-dev libyara-dev)"
             else
                 echo "  - gcc -fsyntax-only: $f"
                 # Arrays, not a plain word-split string - avoids any risk

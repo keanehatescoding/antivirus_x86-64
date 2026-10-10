@@ -1,10 +1,10 @@
-# Verified on a real Debian 13 (trixie) box via `dpkg-buildpackage -us
-# -uc -b`: dh_shlibdeps resolves ${shlibs:Depends} for libfuzzy-dev
-# (ssdeep) fine despite it not shipping a pkg-config file (it still
-# carries proper shlibs metadata) - computed deps came out as
-# libfuzzy2, libyara10, libnl-genl-3-200, no manual Depends: needed.
-# TLSH fuzzy hashing needs no such entry at all: it's vendored, pure C
-# (userspace/avd/tlsh_core.c/.h), not linked against a system libtlsh.
+# dh_shlibdeps computes the runtime deps (libyara, libnl-genl-3-200) -
+# no manual Depends: needed. ssdeep/libfuzzy is deliberately NOT a
+# build dependency: it is GPL-2.0-or-later, and avd is built without it
+# (userspace/avd/Makefile's WITH_SSDEEP=0 default) so the packaged
+# binary stays MIT. TLSH fuzzy hashing needs no entry at all: it's
+# vendored, pure C (userspace/avd/tlsh_core.c/.h), not linked against a
+# system libtlsh.
 Source: hyprav
 Section: admin
 Priority: optional
@@ -19,7 +19,6 @@ Build-Depends: debhelper-compat (= 13),
                pkg-config,
                libnl-genl-3-dev,
                libyara-dev,
-               libfuzzy-dev,
                python3,
                python3-gi,
                gir1.2-gtk-4.0
@@ -54,7 +53,7 @@ Recommends: hyprav-dkms
 Description: HyprAV userspace scanning daemon and control CLI
  avd is the privileged userspace daemon that the av.ko kernel module
  defers heavyweight checks to: YARA matching, ELF structural analysis,
- entropy scoring, ssdeep/TLSH fuzzy hashing, and quarantine
+ entropy scoring, TLSH fuzzy hashing, and quarantine
  (move + chmod 0000) of anything avd itself flags. avctl is the CLI
  (and polkit-gated privileged entry point) for managing avd's
  signatures, trust list, protected paths, policy, on-demand scans, and
