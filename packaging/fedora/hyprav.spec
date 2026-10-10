@@ -64,10 +64,11 @@ Version:        %{pkgversion}
 Release:        1%{?dist}
 Summary:        Kernel-level Linux antivirus (kprobe execve/file monitor + YARA/entropy/fuzzy-hash daemon)
 
-# SPDX identifier (current Fedora Licensing Guidelines). Older Fedora
-# releases (pre F38-ish) used the short name "GPLv3" instead - adjust
+# SPDX expression (current Fedora Licensing Guidelines). The project
+# is dual-licensed; downstream may elect either. Older Fedora releases
+# (pre F38-ish) used short names like "GPLv2"/"MIT" instead - adjust
 # if targeting one of those.
-License:        GPL-3.0-only
+License:        GPL-2.0-only OR MIT
 URL:            https://github.com/keanehatescoding/antivirus_x86-64
 Source0:        %{url}/archive/%{gitcommit}/antivirus_x86-64-%{gitcommit}.tar.gz
 

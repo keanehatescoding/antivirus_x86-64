@@ -27,7 +27,10 @@ pkgver=0.9.0.r134.g849b462
 pkgrel=1
 arch=('x86_64')
 url="https://github.com/keanehatescoding/antivirus_x86-64"
-license=('GPL3')
+# Dual-licensed per LICENSE (GPL-2.0-only OR MIT). Listed here as a
+# multi-license array so pacman's -Qi/-Si show the choice. Uses the
+# modern SPDX short names (namcap E-errors on legacy 'GPL3'-style ids).
+license=('GPL-2.0-only' 'MIT')
 # python-gobject/gtk4 are needed at BUILD time, not just runtime:
 # package_hyprav-gui()'s `make install` (userspace/av-gui/Makefile)
 # depends on `checkdeps`, which imports gi and loads GTK4 before

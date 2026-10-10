@@ -141,5 +141,6 @@ in a PR or issue comment for on-demand help — see
 
 ## License
 
-GPL-3.0, same as the rest of the repo (`LICENSE`). Opening a PR here
-means you're contributing under that same license — no separate CLA.
+Dual-licensed `GPL-2.0-only OR MIT`, same as the rest of the repo
+(`LICENSE`). Opening a PR here means you're contributing under that
+same dual-license — no separate CLA.
