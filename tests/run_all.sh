@@ -50,6 +50,16 @@ echo "### test_parser_robustness.sh (adversarial parser coverage for #105) ###"
 "$REPO_ROOT/tests/test_parser_robustness.sh" || FAIL=1
 
 echo
+echo "### test_fan_parse.sh (fanotify mountinfo/signature parsers, #176) ###"
+# Same no-root-needed reasoning as test_parser_robustness.sh above.
+"$REPO_ROOT/tests/test_fan_parse.sh" || FAIL=1
+
+echo
+echo "### test_avd_no_exec.sh (avd never execs - fanotify re-entrancy guard) ###"
+# No root needed: inspects the built binary's dynamic imports.
+"$REPO_ROOT/tests/test_avd_no_exec.sh" || FAIL=1
+
+echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 
