@@ -344,7 +344,8 @@ struct scan_result {
              * a clean result; supplementary info, not authoritative */
   char sha256_hex[65];
   /* True when the verdict is CLEAN only because the pipeline failed
-   * open (no rules loaded, rewind or YARA error/timeout) rather than
+   * open (no rules loaded, rewind or YARA error/timeout, or a SHA-256/
+   * fuzzy/TLSH hashing failure that skipped a check) rather than
    * because every check ran and came back clean. The fanotify verdict
    * cache refuses to remember such a result - see fan_cache_store(). */
   bool inconclusive;
@@ -2139,10 +2140,15 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
     hash = sha256_hex;
   else if (sha256_fd(fd, sha256_buf) == 0)
     hash = sha256_buf;
-  else
+  else {
     hash = ""; /* on-demand scan of a file sha256_fd() couldn't hash -
                * proceed without one rather than failing the scan
                * over it */
+    /* The signature lookup below is skipped without a hash, and the
+     * failure can be transient (dup() hitting EMFILE, a read error) -
+     * a CLEAN from this run must not be cached. */
+    out->inconclusive = true;
+  }
 
   /* Exact-hash signatures first (#176): the kernel's sigtable is
    * normally matched post-exec by the bprm_check kprobe, which can only
@@ -2267,8 +2273,13 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       quarantine_file(fd, path, out->rule_name, hash);
       goto record;
     }
-    if (fret < 0)
+    if (fret < 0) {
       fprintf(stderr, "avd: fuzzy hash of \"%s\" failed\n", path);
+      /* -1 is a real hashing failure (dup/alloc/read), possibly
+       * transient, so the check did not run - unlike an over-cap file,
+       * which returns 0 and is the same answer every time. */
+      out->inconclusive = true;
+    }
   }
 
   /* ssdeep didn't match either - try TLSH before declaring clean.
@@ -2294,8 +2305,12 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       quarantine_file(fd, path, out->rule_name, hash);
       goto record;
     }
-    if (tret < 0)
+    if (tret < 0) {
       fprintf(stderr, "avd: TLSH hash of \"%s\" failed\n", path);
+      /* Same as the fuzzy pass above. Over-cap and too-short inputs
+       * return 0 from check_tlsh_corpus() and stay conclusive. */
+      out->inconclusive = true;
+    }
   }
 
 record:
