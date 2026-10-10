@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Reads signatures/trust/protected-paths/policy via `avctl save -`
 (stdout mode - see do_save() in userspace/avctl/avctl.c) rather than
 reading /proc/kernel_av_* directly: this reuses avctl's existing,

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_corpus_format.sh - load-time validation of the fuzzy/TLSH
 # corpus files by userspace/avd/avd.c (load_fuzzy_corpus() /

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
 obj-m += av.o
 av-y := main.o sigtable.o netlink_chan.o behavior.o logfmt.o
 

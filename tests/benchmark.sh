@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # benchmark.sh - v1.0.0: measures the actual overhead the kernel hooks
 # add to execve and openat, by timing many iterations with the module

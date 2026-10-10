@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Signatures page - list/add/remove exact-hash signatures
 (/proc/kernel_av_signatures via avctl add/del)."""
 import gi

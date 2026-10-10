@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # Real launcher for the AppImage build, installed by build-appimage.sh
 # to AppDir/usr/bin/av-gui (matching Exec=av-gui in
 # packaging/org.hyprav.avgui.desktop, shared with the Flatpak build).

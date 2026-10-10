@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 CC ?= gcc
 # Same hardening rationale as userspace/avd/Makefile: avctl's
 # add/del/scan/quarantine commands run privileged (pkexec), so the

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # No compiled build step - av-gui is a pure-Python GTK4 application.
 # checkdeps verifies PyGObject + GTK4 bindings are importable (same
 # friendly-failure style as userspace/avd/Makefile's checkdeps for its

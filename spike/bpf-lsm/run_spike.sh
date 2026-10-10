@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # LOADS ONLY - never attaches. A loaded-but-unattached BPF LSM program
 # gates nothing; no exec on this machine is affected. Both programs are
 # freed the moment this script exits (nothing is pinned).

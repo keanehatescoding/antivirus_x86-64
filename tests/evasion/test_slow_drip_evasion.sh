@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # test_slow_drip_evasion.sh - evasion test 4 (see docs/evasion-findings.md #4).
 #

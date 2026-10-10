@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # test_entropy_dilution_evasion.sh - v0.9.0 evasion test 3.
 #

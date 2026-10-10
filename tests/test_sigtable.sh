@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_sigtable.sh - exercises the avctl <-> /proc/kernel_av_signatures
 # protocol: add/list/del, plus malformed-input rejection.

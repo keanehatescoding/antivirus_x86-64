@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Resolve the avctl binary path for av-gui's two call sites.
 
 procfs_client.py calls avctl directly, unprivileged (`avctl save -`);

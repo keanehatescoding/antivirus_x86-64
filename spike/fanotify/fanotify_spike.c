@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT */
 /* Spike: is FAN_OPEN_EXEC_PERM the blocking verdict primitive #102 needs?
  *
  * The BPF LSM spike (spike/bpf-lsm/) settled that an LSM hook can deny an

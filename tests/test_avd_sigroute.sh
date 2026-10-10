@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_avd_sigroute.sh - regression test for avd's SIGINT/SIGTERM
 # routing (see the pthread_sigmask block/unblock in main() in

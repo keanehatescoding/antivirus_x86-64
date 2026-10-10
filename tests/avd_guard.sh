@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# SPDX-License-Identifier: MIT
 # tests/avd_guard.sh - sourced, not run. Defines avd_guard(), which
 # refuses to continue while some other avd could talk to the module a
 # test is about to load.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * sha256.c - minimal self-contained SHA-256 (FIPS 180-4). See sha256.h
  * for why this exists instead of linking libcrypto. Implemented

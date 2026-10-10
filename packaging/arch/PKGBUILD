@@ -27,7 +27,10 @@ pkgver=0.9.0.r134.g849b462
 pkgrel=1
 arch=('x86_64')
 url="https://github.com/keanehatescoding/antivirus_x86-64"
-license=('GPL3')
+# Per-package overrides below: the kernel module is dual-licensed (it
+# has to stay GPL-compatible to load), and avd carries the BSD-licensed
+# TLSH port. See LICENSES/ for the texts.
+license=('MIT')
 # python-gobject/gtk4 are needed at BUILD time, not just runtime:
 # package_hyprav-gui()'s `make install` (userspace/av-gui/Makefile)
 # depends on `checkdeps`, which imports gi and loads GTK4 before
@@ -142,7 +145,10 @@ MAKE[0]="make KDIR=\${kernel_source_dir}"
 CLEAN="make KDIR=\${kernel_source_dir} clean"
 EOF
 
+  license=('GPL-2.0-only OR MIT')
   install -Dm644 hyprav/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 hyprav/LICENSES/GPL-2.0-only.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/GPL-2.0-only.txt"
 }
 
 package_hyprav() {
@@ -181,7 +187,12 @@ package_hyprav() {
   install -Dm644 packaging/hyprav-modprobe.conf "$pkgdir/usr/lib/modprobe.d/hyprav.conf"
   install -Dm755 packaging/apply-ioc-group.sh "$pkgdir/usr/lib/hyprav/apply-ioc-group"
 
+  license=('MIT AND BSD-3-Clause')
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # BSD-3-Clause requires binary redistributions to reproduce the
+  # notice: avd contains the TLSH port (userspace/avd/tlsh_core.c).
+  install -Dm644 LICENSES/BSD-3-Clause.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/BSD-3-Clause.txt"
 }
 
 package_hyprav-gui() {

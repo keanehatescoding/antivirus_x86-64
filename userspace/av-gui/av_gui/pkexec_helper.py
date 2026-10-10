@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Runs privileged avctl commands via pkexec, asynchronously (so the
 GTK main loop never blocks on the polkit authentication prompt). See
 docs/avd-socket-protocol.md's Authorization section and

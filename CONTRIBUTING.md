@@ -142,5 +142,15 @@ in a PR or issue comment for on-demand help — see
 
 ## License
 
-GPL-3.0, same as the rest of the repo (`LICENSE`). Opening a PR here
-means you're contributing under that same license — no separate CLA.
+MIT, except where a file's `SPDX-License-Identifier` header says
+otherwise (`av/` is `GPL-2.0-only OR MIT`, the TLSH port is
+`BSD-3-Clause` — see the README's License section). Opening a PR here
+means you're contributing under the license of each file you touch — no
+separate CLA. New files need an SPDX header: `MIT`, or
+`GPL-2.0-only OR MIT` under `av/`.
+
+Sign off your commits (`git commit -s`) to certify the
+[Developer Certificate of Origin](https://developercertificate.org/):
+that you wrote the change or otherwise have the right to submit it under
+that license. Don't paste in code from GPL-only projects (the Linux
+kernel included, outside of `av/`'s normal use of its headers).

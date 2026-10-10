@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * main.c - av module entry point: kprobe on security_bprm_check (exec),
  * workqueue-deferred multi-algorithm hashing (MD5/SHA-1/SHA-256),
@@ -1853,7 +1854,7 @@ static void __exit av_exit(void) {
 module_init(av_init);
 module_exit(av_exit);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Keane");
 MODULE_DESCRIPTION("Signature-based execve detection with runtime-managed "
                    "signature DB and behavioral heuristics");

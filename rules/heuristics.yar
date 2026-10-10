@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * heuristics.yar - v0.4.0: string & API heuristics.
  * v0.9.1: added numeric `weight` meta (see below).

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # AppImage entry point. Kept as a thin wrapper around usr/bin/av-gui
 # (the real launcher logic) rather than duplicating it here, so
 # there's exactly one place that resolves LIBDIR/checks deps - see

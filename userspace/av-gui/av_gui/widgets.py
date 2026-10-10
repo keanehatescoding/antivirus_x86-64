@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Small reusable GTK4 widgets shared across pages."""
 import gi
 

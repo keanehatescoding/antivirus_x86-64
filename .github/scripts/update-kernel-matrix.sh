@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # update-kernel-matrix.sh - fetches kernel.org's release list and rewrites
 # .github/kernel-versions.json's "versions" array with:
 #   - the 2 most recently released non-EOL "longterm" (LTS) branches

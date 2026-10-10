@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_detection.sh - end-to-end integration test: builds the module,
 # loads it, runs a known-clean command and the EICAR test file, checks

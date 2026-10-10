@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Regression tests for the #97 av-gui hardening (issue #97).
 
 Runs without root, GTK, or avd: pure unit tests over path_validation and

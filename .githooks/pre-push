@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # .githooks/pre-push - runs the full build+load+detect+unload test suite
 # before anything leaves your machine, but ONLY when the push actually

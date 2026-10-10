@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/run_all.sh - builds everything and runs both test scripts.
 # Used by .githooks/pre-push, and safe to run manually any time:

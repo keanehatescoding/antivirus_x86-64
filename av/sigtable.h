@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /*
  * sigtable.h - kernel-side signature store: a mutex-protected hashtable
  * of known-bad hashes, plus a /proc interface to manage it from

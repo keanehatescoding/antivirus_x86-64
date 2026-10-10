@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* Dedicated regression case for #87: av.ko's old exec hook was a
  * kprobe on __x64_sys_execve/execveat that copied the pathname with
  * strncpy_from_user() in atomic/kprobe context. That can't sleep to

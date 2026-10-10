@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * control_parse.h - shared control-socket parsing helpers for avd and its
  * adversarial test (tests/test_parser_robustness.sh, issue #105).

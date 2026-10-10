@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_tlsh_core.sh - known-answer tests for the hand-ported TLSH
 # implementation in userspace/avd/tlsh_core.c/tlsh_shim.c. Unlike

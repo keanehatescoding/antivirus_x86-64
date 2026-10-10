@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 #
 # av-gui launcher - sets PYTHONPATH to wherever the av_gui package
 # actually lives and execs the module.

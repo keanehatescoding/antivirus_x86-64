@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 CC ?= gcc
 # _FORTIFY_SOURCE needs -O1+ to have any effect (already satisfied by
 # -O2 above); avd runs privileged (root, via systemd) so the extra

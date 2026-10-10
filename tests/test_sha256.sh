@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_sha256.sh - known-answer tests (FIPS 180-4 test vectors)
 # for the self-contained SHA-256 implementation in

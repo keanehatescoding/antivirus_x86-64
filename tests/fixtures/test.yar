@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * test.yar - TEST FIXTURE ONLY, never installed to production (see
  * userspace/avd/Makefile's explicit production rule list and

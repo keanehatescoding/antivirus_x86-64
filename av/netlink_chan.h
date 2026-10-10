@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /*
  * netlink_chan.h - kernel-side Generic Netlink channel to the userspace
  * avd daemon. See docs/netlink-protocol.md for the protocol design.

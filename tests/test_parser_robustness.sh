@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_parser_robustness.sh - adversarial input coverage for the two
 # externally-reachable parsers tracked in issue #105 (observability +

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_trust_protect.sh - exercises the avctl <-> /proc/kernel_av_trusted
 # and /proc/kernel_av_protected protocols: add/list/del, plus

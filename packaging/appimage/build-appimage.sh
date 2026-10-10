@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 set -eu
 # Builds an AppImage of the GTK4 management console (userspace/av-gui)
 # ONLY - not the kernel module or avd system daemon, see

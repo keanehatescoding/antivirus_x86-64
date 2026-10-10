@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * sha256.h - minimal self-contained SHA-256 (FIPS 180-4). Used only to
  * fill in a hash for on-demand scans (avctl scan / GUI-triggered),

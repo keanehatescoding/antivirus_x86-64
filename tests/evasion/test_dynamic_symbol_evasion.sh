@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # test_dynamic_symbol_evasion.sh - v0.9.0 evasion test 1.
 #

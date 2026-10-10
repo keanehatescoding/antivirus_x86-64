@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT */
 /* Exec target for fanotify_spike.c.
  *
  * Built three times from this one file with different MARKER_CHAR, so

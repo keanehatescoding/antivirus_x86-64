@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT */
 /* PID 1 for the QEMU enforcement test: proves the spike's BPF LSM
  * program actually DENIES an exec, which the load-only run_spike.sh
  * deliberately cannot show (it runs the verifier and attaches nothing).

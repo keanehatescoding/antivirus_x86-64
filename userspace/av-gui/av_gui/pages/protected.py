@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Protected paths page - paths exempted from certain behavioral
 heuristics (/proc/kernel_av_protected via avctl protect add/del)."""
 import gi

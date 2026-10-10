@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Detections page - recent scan verdicts (avd's VERDICTS RECENT).
 Read-only, no privileged actions here."""
 import time

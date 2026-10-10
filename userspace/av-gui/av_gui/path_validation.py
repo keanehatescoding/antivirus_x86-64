@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Validate absolute filesystem paths entered in av-gui.
 
 scan.py and protected.py previously accepted anything starting with "/"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * netlink_chan.c - kernel-side Generic Netlink channel to avd.
  * See docs/netlink-protocol.md for the full protocol design/rationale.

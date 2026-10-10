@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # scripts/setup-hooks.sh - one-time setup: points git at the tracked
 # hooks in .githooks/ instead of the untracked (and gitignored-by-default)

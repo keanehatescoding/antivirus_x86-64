@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /*
  * logfmt.h - escaping for untrusted strings (paths) embedded in the
  * module's quoted key=value log records.

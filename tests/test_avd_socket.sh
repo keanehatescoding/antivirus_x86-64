@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_avd_socket.sh - exercises avd's control socket protocol
 # (see docs/avd-socket-protocol.md): STATUS, VERDICTS RECENT, SCAN,

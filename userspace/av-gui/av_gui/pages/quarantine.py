@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Quarantine page - list quarantined files, restore/delete via
 pkexec avctl quarantine restore|delete."""
 import gi

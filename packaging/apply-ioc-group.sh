@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # packaging/apply-ioc-group.sh - chgrp the three IOC /proc entries
 # (/proc/kernel_av_signatures, _trusted, _protected) to the hyprav

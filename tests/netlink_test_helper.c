@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * netlink_test_helper.c - throwaway client for tests/test_netlink.sh.
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * elf_analysis.yar - v0.5.0: ELF header & section analysis.
  * v0.9.1: added numeric `weight` meta - see heuristics.yar for the

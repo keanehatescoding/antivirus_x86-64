@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # test_execveat_bypass.sh - execveat() coverage test (post-fix
 # regression, not really an "evasion" in the adversarial sense the

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * avctl - userspace CLI for /proc/kernel_av_signatures,
  * /proc/kernel_av_trusted, /proc/kernel_av_protected, and

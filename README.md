@@ -135,6 +135,27 @@ a QEMU boot test with real runtime detection, and a packaging build
 - [Testing](../../wiki/Testing) — automated tests and manual walkthroughs
 - [CI and Packaging](../../wiki/CI-and-Packaging)
 
+## License
+
+MIT — see [`LICENSE`](LICENSE). Two parts of the tree carry a different
+tag in their `SPDX-License-Identifier` header (full texts in
+[`LICENSES/`](LICENSES)):
+
+- `av/` (the kernel module) and the BPF programs under `spike/` are
+  `GPL-2.0-only OR MIT`. A module has to be GPL-compatible to use the
+  kernel's GPL-only exports, so the built `av.ko` is used under GPL-2.0;
+  the source can be reused under either.
+- `userspace/avd/tlsh_core.{c,h}` and `tlsh_diff_table.h` are a C port of
+  [TLSH](https://github.com/trendmicro/tlsh), © Trend Micro Incorporated,
+  under `BSD-3-Clause`.
+
+`avd` built with `WITH_SSDEEP=1` links libfuzzy (GPL-2.0-or-later), so a
+binary built that way can only be distributed under the GPL. The default
+build and the packages do not link it.
+
+Releases up to and including the `last-gpl-3.0` tag were published under
+GPL-3.0-only and remain available under it.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for scope, already-accepted tradeoffs

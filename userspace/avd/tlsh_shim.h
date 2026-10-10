@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * tlsh_shim.h - plain-C interface to this project's own TLSH fuzzy-
  * hashing implementation (tlsh_shim.c + tlsh_core.c/tlsh_core.h). This

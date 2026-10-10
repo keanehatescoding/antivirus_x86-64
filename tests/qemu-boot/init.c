@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* Minimal PID 1 for the QEMU-boot runtime CI job (see
  * .github/workflows/qemu-boot-test.yml) - actually boots a kernel,
  * insmod's av.ko, and confirms EICAR detection fires for real, unlike

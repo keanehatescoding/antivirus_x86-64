@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # Spike build - NOT part of the main build. Nothing in the repo's normal
 # `make` path reaches here; this is built by hand when investigating the
 # exec-interception redesign (#102).

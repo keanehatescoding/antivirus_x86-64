@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * entropy.yar - v0.6.0: entropy analysis (packed/encrypted file detection).
  * v0.9.1: added numeric `weight` meta - see heuristics.yar for the

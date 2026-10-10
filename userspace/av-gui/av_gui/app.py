@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """av-gui - GTK4 management console for HyprAV.
 
 Unprivileged reads via avd_client.py (avd's control socket) and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * logfmt.c - escaping for untrusted strings in quoted log fields.
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /*
  * netlink_proto.h - shared Generic Netlink protocol definitions between
  * the av kernel module and the userspace avd daemon. Deliberately kept

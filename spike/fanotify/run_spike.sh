@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # Drives fanotify_spike, which answers whether FAN_OPEN_EXEC_PERM is the
 # blocking-verdict primitive #102 assumes it is.
 #

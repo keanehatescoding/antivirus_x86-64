@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # tests/test_netlink.sh - exercises the kernel<->avd Generic Netlink
 # channel (see docs/netlink-protocol.md), which SECURITY.md calls out

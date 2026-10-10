@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Trust list page - runtime-vouched-for binary hashes
 (/proc/kernel_av_trusted via avctl trust add/del)."""
 import gi

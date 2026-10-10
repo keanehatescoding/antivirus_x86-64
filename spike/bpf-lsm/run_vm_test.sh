@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # run_vm_test.sh - prove the spike's BPF LSM program actually DENIES an
 # exec, by attaching it inside a throwaway QEMU VM.

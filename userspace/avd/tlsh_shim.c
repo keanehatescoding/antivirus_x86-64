@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * tlsh_shim.c - the plain-C, in-tree implementation of TLSH fuzzy
  * hashing. This used to be tlsh_shim.cpp, a thin C++ bridge to the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * behavior.c - v0.8.0: behavioral heuristics implementation.
  * See behavior.h for the design summary.

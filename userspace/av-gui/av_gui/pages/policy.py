@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Policy page - fail-open/fail-closed toggle for what happens to an
 exec when avd can't produce a verdict in time
 (/proc/kernel_av_daemon_policy via avctl policy set)."""

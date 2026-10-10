@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Wraps a host command so it still works from inside a Flatpak sandbox.
 
 av-gui's privileged/unprivileged calls (pkexec_helper.py,

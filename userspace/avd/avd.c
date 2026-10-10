@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * avd.c - userspace daemon: registers with the av kernel module over
  * Generic Netlink, receives scan requests, and replies with a verdict

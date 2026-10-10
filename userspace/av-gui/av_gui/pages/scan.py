@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """On-demand scan page - pick a file, scan it via pkexec avctl scan."""
 import gi
 

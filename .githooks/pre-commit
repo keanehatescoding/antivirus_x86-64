@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # .githooks/pre-commit - fast lint checks on staged files.
 # Kept deliberately quick (no build, no insmod) so it doesn't discourage

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Raw client for avd's control socket (unprivileged verbs only).
 
 See docs/avd-socket-protocol.md for the full wire protocol. This

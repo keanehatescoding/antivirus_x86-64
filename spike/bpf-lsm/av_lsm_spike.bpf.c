@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Spike, NOT production: does an eBPF LSM program on bprm_check_security
  * actually give us what #87 and #88 need? Proves three things by loading:
  *   1. "lsm.s/" verifies      -> hook is sleepable (closes #87)
@@ -13,7 +13,7 @@
 /* vmlinux.h carries no errno definitions. */
 #define EPERM 1
 
-char LICENSE[] SEC("license") = "GPL";
+char LICENSE[] SEC("license") = "Dual MIT/GPL";
 
 struct exec_event {
 	__u64 ino;

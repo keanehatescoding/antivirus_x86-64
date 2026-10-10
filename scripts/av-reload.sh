@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # scripts/av-reload.sh - reload the av kernel module without losing its
 # runtime state: the signature DB, trust list, protected-path list, and

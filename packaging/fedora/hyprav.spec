@@ -64,10 +64,11 @@ Version:        %{pkgversion}
 Release:        1%{?dist}
 Summary:        Kernel-level Linux antivirus (kprobe execve/file monitor + YARA/entropy/fuzzy-hash daemon)
 
-# SPDX identifier (current Fedora Licensing Guidelines). Older Fedora
-# releases (pre F38-ish) used the short name "GPLv3" instead - adjust
-# if targeting one of those.
-License:        GPL-3.0-only
+# SPDX identifiers (current Fedora Licensing Guidelines). The base
+# package is MIT plus the BSD-3-Clause TLSH port compiled into avd
+# (userspace/avd/tlsh_core.c); hyprav-dkms and hyprav-gui override this
+# below.
+License:        MIT AND BSD-3-Clause
 URL:            https://github.com/keanehatescoding/antivirus_x86-64
 Source0:        %{url}/archive/%{gitcommit}/antivirus_x86-64-%{gitcommit}.tar.gz
 
@@ -105,6 +106,9 @@ kernel module and hyprav-gui for the GTK4 management console.
 
 %package -n hyprav-dkms
 Summary:        HyprAV kprobe-based execve/file-event kernel module (DKMS)
+# Dual-licensed: a module has to be GPL-compatible to use the kernel's
+# GPL-only exports (register_kprobe).
+License:        GPL-2.0-only OR MIT
 Requires:       dkms
 Requires(post): dkms
 Requires(preun): dkms
@@ -125,6 +129,7 @@ name; arm64 needs source changes to hook __arm64_sys_execve instead.
 
 %package -n hyprav-gui
 Summary:        GTK4 management console for HyprAV
+License:        MIT
 BuildArch:      noarch
 Requires:       %{name} = %{version}-%{release}
 Requires:       python3
@@ -212,7 +217,7 @@ dkms autoinstall -m hyprav-av -v %{version} || :
 dkms remove -m hyprav-av -v %{version} --all || :
 
 %files
-%license LICENSE
+%license LICENSE LICENSES/BSD-3-Clause.txt
 %doc README.md
 %{_bindir}/avd
 %{_bindir}/avctl
@@ -229,7 +234,7 @@ dkms remove -m hyprav-av -v %{version} --all || :
 %attr(0700,root,root) %dir %{_localstatedir}/lib/av-quarantine
 
 %files -n hyprav-dkms
-%license LICENSE
+%license LICENSE LICENSES/GPL-2.0-only.txt
 %{_usrsrc}/hyprav-av-%{version}/
 
 %files -n hyprav-gui

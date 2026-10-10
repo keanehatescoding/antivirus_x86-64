@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Dashboard page - avd's STATUS plus a summary of state read via
 `avctl save -` (signature/trust/protected counts, current policy)."""
 import gi
