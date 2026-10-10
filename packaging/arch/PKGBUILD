@@ -184,6 +184,9 @@ package_hyprav() {
   install -Dm644 packaging/hyprav-modprobe.conf "$pkgdir/usr/lib/modprobe.d/hyprav.conf"
   install -Dm755 packaging/apply-ioc-group.sh "$pkgdir/usr/lib/hyprav/apply-ioc-group"
 
+  # avd contains the BSD-3-Clause TLSH port (userspace/avd/tlsh_core.c);
+  # LICENSE carries that notice alongside the dual-license texts.
+  license=('GPL-2.0-only' 'MIT' 'BSD-3-Clause')
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
 
