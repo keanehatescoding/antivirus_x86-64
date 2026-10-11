@@ -250,3 +250,24 @@ jobs:
           name: qemu-serial-log-${{ matrix.kernel_version }}
           path: tests/qemu-boot/serial.log
           if-no-files-found: warn
+
+  # Single stable check name for the branch ruleset to require - see
+  # build-all in build-matrix.yml for why the per-version
+  # "qemu-boot (7.2.9)" legs can't be required by name. `if: always()`
+  # so a failed or cancelled leg reports a real failure here rather
+  # than skipping this job (a skipped required check counts as
+  # passing).
+  qemu-boot-all:
+    if: always()
+    needs: qemu-boot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every boot leg succeeded
+        env:
+          RESULT: ${{ needs.qemu-boot.result }}
+        run: |
+          echo "qemu-boot: $RESULT"
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::qemu-boot finished as '$RESULT'"
+            exit 1
+          fi

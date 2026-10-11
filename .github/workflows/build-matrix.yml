@@ -435,3 +435,29 @@ jobs:
           name: avd
           path: userspace/avd/avd
           if-no-files-found: error
+
+  # Single stable check name for the branch ruleset to require. The
+  # matrix legs above are named after their kernel version
+  # ("build (7.2.9, gcc)"), and update-kernel-matrix.yml bumps those
+  # versions weekly - a ruleset that required the legs by name went
+  # stale on every bump and left PRs waiting on checks that no longer
+  # exist. Require "build-all" instead; it fails unless every leg and
+  # both userspace builds succeeded. `if: always()` so a failed or
+  # cancelled dependency reports a real failure here rather than
+  # skipping this job (a skipped required check counts as passing).
+  build-all:
+    if: always()
+    needs: [build, build-avctl, build-avd]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every build job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a build job finished as '$r'"
+              exit 1
+            fi
+          done
