@@ -1110,10 +1110,11 @@ static u32 pid_key(pid_t pid) { return (u32)pid; }
  * the table can never stay permanently full of untouchable entries,
  * because SOME entry is always the least-recently-touched one and
  * becomes evictable. A process actively triggering the checks that
- * matter (openat/unlink/rename/exec) keeps refreshing its own
- * last_touched and is never the eviction target; only idle entries -
- * the ones least likely to be mid-attack right now - get reclaimed
- * under pressure. */
+ * record activity for it (openat/rename/exec - unlink is a read-only
+ * find_entry() lookup and deliberately does not touch LRU order)
+ * keeps refreshing its own last_touched and is never the eviction
+ * target; only idle entries - the ones least likely to be mid-attack
+ * right now - get reclaimed under pressure. */
 static bool evict_lru_entry(void) {
   /* e deliberately left uninitialized (unlike get_or_create_entry()'s
    * NULL-initialized e above) - hash_for_each() always assigns it via
@@ -1151,9 +1152,11 @@ static bool evict_lru_entry(void) {
 }
 
 /* Read-only lookup for `pid`: returns the existing entry or NULL,
- * never allocating or evicting. The create half lives in
- * get_or_create_entry() below, which reuses this for its hit path.
- * Always called under behavior_lock. */
+ * never allocating, evicting, or writing to the entry it finds - not
+ * even last_touched, so a caller that only consults the table (see
+ * av_behavior_check_unlink()) leaves LRU order exactly as it was.
+ * Refreshing last_touched is get_or_create_entry()'s job, on its hit
+ * path. Always called under behavior_lock. */
 static struct av_behavior_entry *find_entry(pid_t pid) {
   /* Initialized to NULL only to satisfy static analyzers that can't
    * expand hash_for_each_possible() (a nested kernel macro requiring
@@ -1164,10 +1167,8 @@ static struct av_behavior_entry *find_entry(pid_t pid) {
   struct av_behavior_entry *e = NULL;
 
   hash_for_each_possible(behavior_table, e, node, pid_key(pid)) {
-    if (e->pid == pid) {
-      e->last_touched = jiffies;
+    if (e->pid == pid)
       return e;
-    }
   }
   return NULL;
 }
@@ -1179,8 +1180,14 @@ static struct av_behavior_entry *find_entry(pid_t pid) {
 static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
   struct av_behavior_entry *e = find_entry(pid);
 
-  if (e)
+  if (e) {
+    /* Hit: refresh LRU position here rather than inside find_entry(),
+     * which stays free of writes - only the hooks that actually
+     * register activity for a pid (openat/rename/exec) should keep it
+     * off the eviction block. */
+    e->last_touched = jiffies;
     return e;
+  }
 
   if (behavior_table_count >= MAX_BEHAVIOR_ENTRIES) {
     /* At capacity - kick GC to run as soon as possible (instead of
