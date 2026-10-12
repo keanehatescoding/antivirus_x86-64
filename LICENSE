@@ -25,17 +25,51 @@ code; downstream recipients may elect the MIT grant for reuse outside
 a kernel-linked context.
 
 ================================================================================
-Third-party notice (userspace/avd/tlsh_core.*, tlsh_shim.*,
-tlsh_diff_table.h)
+Third-party code: TLSH port (BSD-3-Clause)
 ================================================================================
 
-The TLSH fuzzy-hash implementation under `userspace/avd/tlsh_core.*`,
-`userspace/avd/tlsh_shim.*`, and `userspace/avd/tlsh_diff_table.h` is a
-from-scratch C port of TrendMicro TLSH
-(https://github.com/trendmicro/tlsh), which is distributed by its
-authors under a 3-clause BSD-like license. The port preserves the
-upstream algorithm, constants, and lookup tables. Keep upstream
-attribution intact if you redistribute these files.
+`userspace/avd/tlsh_core.c`, `userspace/avd/tlsh_core.h`, and
+`userspace/avd/tlsh_diff_table.h` are a C port of Trend Micro TLSH
+(https://github.com/trendmicro/tlsh), which upstream offers under
+Apache-2.0 OR BSD-3-Clause. They are used here under BSD-3-Clause and
+are NOT covered by the dual-license grant above: each file carries an
+`SPDX-License-Identifier: BSD-3-Clause` header, and the notice below
+must be kept with source and binary redistributions of them (the `avd`
+binary contains this code). BSD-3-Clause is compatible with both
+GPL-2.0-only and MIT, so either choice above still applies to the rest
+of the project.
+
+Copyright (c) 2013, Trend Micro Incorporated
+All rights reserved.
+
+Copyright (c) 2026 keanehatescoding (C port)
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 MIT License
