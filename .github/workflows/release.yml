@@ -96,7 +96,7 @@ jobs:
             "hyprav-gui-${VERSION}-x86_64.flatpak" org.hyprav.avgui
 
       - name: Upload .flatpak bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: flatpak-package
           path: hyprav-gui-*-x86_64.flatpak
@@ -170,7 +170,7 @@ jobs:
           packaging/appimage/build-appimage.sh "$VERSION"
 
       - name: Upload AppImage
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: appimage-package
           path: packaging/appimage/*.AppImage
