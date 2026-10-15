@@ -211,7 +211,7 @@ jobs:
 
       - name: Upload build artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: modules-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
           path: |
@@ -228,7 +228,7 @@ jobs:
         # from a compiler/libc version CI doesn't use, but CI itself
         # should never let one merge silently.
         run: make -C userspace/avctl CFLAGS="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: avctl
           path: userspace/avctl/avctl
@@ -430,7 +430,7 @@ jobs:
               userspace/avd/tlsh_core.o userspace/avd/tlsh_shim.o
           /tmp/tlsh_shim_smoke
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: avd
           path: userspace/avd/avd
