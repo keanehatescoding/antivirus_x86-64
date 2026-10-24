@@ -60,6 +60,12 @@ echo "### test_avd_no_exec.sh (avd never execs - fanotify re-entrancy guard) ###
 "$REPO_ROOT/tests/test_avd_no_exec.sh" || FAIL=1
 
 echo
+echo "### test_fuzz_replay.sh (libFuzzer corpus replay for the avd parsers, #105) ###"
+# No root needed. Skips (exit 0) when clang's libFuzzer runtime is not
+# installed; CI sets AV_FUZZ_REQUIRED=1 so it cannot skip there.
+"$REPO_ROOT/tests/test_fuzz_replay.sh" || FAIL=1
+
+echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 

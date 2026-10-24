@@ -1,0 +1,61 @@
+name: Fuzz
+
+# libFuzzer targets for avd's externally reachable parsers (#105), see
+# tests/fuzz/. Two jobs:
+#
+#   replay  - every push and PR: runs the checked-in seed corpora (and any
+#             minimized crasher committed there) through each target under
+#             ASan+UBSan. Takes seconds; this is the regression check.
+#   fuzz    - weekly (and on demand): fuzzes each target for a few minutes
+#             from those seeds. A crash fails the job and libFuzzer prints
+#             the offending input (hex and base64) in the log - commit it
+#             under tests/fuzz/corpus/<target>/ with the fix so the replay
+#             job guards it from then on.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+# Nothing here pushes, comments, or writes back - read-only is enough.
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Install clang with the libFuzzer runtime and avd's dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            clang libclang-rt-dev pkg-config libnl-genl-3-dev libyara-dev libfuzzy-dev
+
+      - name: Replay the fuzz corpora
+        # AV_FUZZ_REQUIRED turns a missing toolchain into a failure here,
+        # so this job can never go green by skipping.
+        run: AV_FUZZ_REQUIRED=1 tests/test_fuzz_replay.sh
+
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Install clang with the libFuzzer runtime and avd's dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            clang libclang-rt-dev pkg-config libnl-genl-3-dev libyara-dev libfuzzy-dev
+
+      - name: Fuzz each target
+        run: make -C tests/fuzz run SECS=300
