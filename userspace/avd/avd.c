@@ -2093,26 +2093,23 @@ static void fan_cache_store(const struct stat *before, const struct stat *after,
 }
 
 /*
- * Shared core of file analysis - YARA, then fuzzy/TLSH fallback,
- * quarantine on MALICIOUS, and a verdict_history record either way.
- * Used by both handle_scan_request() (kernel-triggered, netlink) and
- * cmd_scan() (on-demand, control socket) - see each caller for how
- * they report `out` over their own transport; this function touches
- * neither.
+ * Analysis half of a scan: SHA-256, exact-signature lookup, YARA, then the
+ * fuzzy/TLSH fallbacks. Everything in here consumes the bytes of the file
+ * behind `fd` and produces only a verdict in `out` - it never quarantines,
+ * touches verdict history or metrics, or otherwise acts on the machine.
+ * That is deliberate (#103): this is the code that parses attacker-
+ * influenced content, and keeping it free of privileged actions is what
+ * lets it later run in an unprivileged worker process. perform_scan()
+ * below acts on the result.
  *
- * `fd` must already be open for reading - opening is the caller's
- * responsibility, deliberately kept out of this shared core since a
- * failed open means something different to each caller (fail-open and
- * tell the kernel CLEAN for the netlink path, vs. an ERR reply for the
- * interactive on-demand path). `sha256_hex` may be NULL/empty - kernel
- * scans always have one (precomputed via av/sigtable.c), on-demand
- * scans never do, and this fills one in via sha256_fd() either way.
- * `pid` is 0 for on-demand scans (no owning process - see struct
- * verdict_record's own comment).
+ * `fd` must already be open for reading (and, for a kernel-triggered scan,
+ * `sha256_hex` is the kernel's precomputed digest). On return `fd`'s
+ * offset is wherever the last analysis step left it; a MALICIOUS verdict
+ * returns immediately after the step that convicted, which is the state
+ * quarantine_file() has always seen.
  */
-static void perform_scan(int fd, const char *path, const char *sha256_hex,
-                         uint32_t pid, bool on_demand,
-                         struct scan_result *out) {
+static void analyze_fd(int fd, const char *path, const char *sha256_hex,
+                       uint32_t pid, bool on_demand, struct scan_result *out) {
   struct yara_match_ctx ctx = {.matched = 0,
                                .match_count = 0,
                                .score = 0,
@@ -2121,17 +2118,6 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   char sha256_buf[65] = "";
   const char *hash;
   int ret;
-  struct stat owner_st;
-  /* (uid_t)-1 (never a real uid) if the fstat() fails - callers treat
-   * that as "owner unknown", visible to root only. See struct
-   * verdict_record's uid field comment. */
-  uid_t owner_uid = fstat(fd, &owner_st) == 0 ? owner_st.st_uid : (uid_t)-1;
-  /* Wall-clock for STATUS latency metrics. Monotonic, so NTP steps and
-   * the time-of-day clock can't skew it - same clock the recv-deadline
-   * code below already uses. Started before anything scan-shaped so the
-   * early fail-open path (!compiled_rules) still records a sample. */
-  struct timespec scan_t0;
-  clock_gettime(CLOCK_MONOTONIC, &scan_t0);
 
   memset(out, 0, sizeof(*out));
   out->verdict = AV_VERDICT_CLEAN;
@@ -2149,6 +2135,9 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
      * a CLEAN from this run must not be cached. */
     out->inconclusive = true;
   }
+  /* Recorded here rather than after the scan so the acting half
+   * (perform_scan) sees the digest the analysis actually used. */
+  snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
 
   /* Exact-hash signatures first (#176): the kernel's sigtable is
    * normally matched post-exec by the bprm_check kprobe, which can only
@@ -2163,14 +2152,13 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       out->verdict = AV_VERDICT_MALICIOUS;
       snprintf(out->rule_name, sizeof(out->rule_name), "Sig:%.58s", sig_name);
       printf("avd: SIGNATURE MATCH \"%s\" -> \"%s\"\n", path, sig_name);
-      quarantine_file(fd, path, out->rule_name, hash);
-      goto record;
+      return;
     }
   }
 
   if (!compiled_rules) {
     out->inconclusive = true;
-    goto record;
+    return;
   }
 
   printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
@@ -2189,7 +2177,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                     "%s - failing open\n",
             path, strerror(errno));
     out->inconclusive = true;
-    goto record;
+    return;
   }
 
   ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
@@ -2201,7 +2189,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
     fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
             ret);
     out->inconclusive = true;
-    goto record;
+    return;
   }
 
   if (ctx.matched) {
@@ -2228,8 +2216,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       out->verdict = AV_VERDICT_MALICIOUS;
       snprintf(out->rule_name, sizeof(out->rule_name), "%s", ctx.rule_name);
       out->score = ctx.score;
-      quarantine_file(fd, path, out->rule_name, hash);
-      goto record;
+      return;
     }
 
     printf("avd: %d rule(s) matched \"%s\" but score=%d is below "
@@ -2270,8 +2257,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                fuzzy_name, fuzzy_score);
       printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n", path, fuzzy_name,
              fuzzy_score);
-      quarantine_file(fd, path, out->rule_name, hash);
-      goto record;
+      return;
     }
     if (fret < 0) {
       fprintf(stderr, "avd: fuzzy hash of \"%s\" failed\n", path);
@@ -2302,8 +2288,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                tlsh_name, tlsh_diff);
       printf("avd: TLSH MATCH \"%s\" -> \"%s\" diff=%d\n", path, tlsh_name,
              tlsh_diff);
-      quarantine_file(fd, path, out->rule_name, hash);
-      goto record;
+      return;
     }
     if (tret < 0) {
       fprintf(stderr, "avd: TLSH hash of \"%s\" failed\n", path);
@@ -2312,8 +2297,49 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
       out->inconclusive = true;
     }
   }
+}
 
-record:
+/*
+ * Shared core of file analysis: run analyze_fd(), quarantine on MALICIOUS,
+ * and record the verdict history and metrics either way. Used by both
+ * handle_scan_request() (kernel-triggered, netlink) and cmd_scan()
+ * (on-demand, control socket) - see each caller for how they report `out`
+ * over their own transport; this function touches neither.
+ *
+ * `fd` must already be open for reading - opening is the caller's
+ * responsibility, deliberately kept out of this shared core since a
+ * failed open means something different to each caller (fail-open and
+ * tell the kernel CLEAN for the netlink path, vs. an ERR reply for the
+ * interactive on-demand path). `sha256_hex` may be NULL/empty - kernel
+ * scans always have one (precomputed via av/sigtable.c), on-demand
+ * scans never do, and analyze_fd() fills one in via sha256_fd() either
+ * way. `pid` is 0 for on-demand scans (no owning process - see struct
+ * verdict_record's own comment).
+ */
+static void perform_scan(int fd, const char *path, const char *sha256_hex,
+                         uint32_t pid, bool on_demand,
+                         struct scan_result *out) {
+  struct stat owner_st;
+  /* (uid_t)-1 (never a real uid) if the fstat() fails - callers treat
+   * that as "owner unknown", visible to root only. See struct
+   * verdict_record's uid field comment. Taken before the analysis reads
+   * the file, as it always was. */
+  uid_t owner_uid = fstat(fd, &owner_st) == 0 ? owner_st.st_uid : (uid_t)-1;
+  /* Wall-clock for STATUS latency metrics. Monotonic, so NTP steps and
+   * the time-of-day clock can't skew it - same clock the recv-deadline
+   * code below already uses. Started before anything scan-shaped so the
+   * early fail-open path (!compiled_rules) still records a sample. */
+  struct timespec scan_t0;
+  clock_gettime(CLOCK_MONOTONIC, &scan_t0);
+
+  analyze_fd(fd, path, sha256_hex, pid, on_demand, out);
+
+  /* The one place a scan acts on its verdict. Every MALICIOUS result
+   * (signature, YARA, fuzzy, TLSH) used to quarantine inline at the point
+   * it was decided; they all converge here now. */
+  if (out->verdict == AV_VERDICT_MALICIOUS)
+    quarantine_file(fd, path, out->rule_name, out->sha256_hex);
+
   /* Single exit path: counters updated here see every completed scan
    * exactly once. Elapsed in whole ms (truncated, not rounded - a
    * sub-ms scan reports 0, honestly). */
@@ -2344,7 +2370,6 @@ record:
     last_scan_ms = (uint64_t)elapsed_ms;
     pthread_mutex_unlock(&metrics_lock);
   }
-  snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
   record_verdict_history(pid, owner_uid, path, out->sha256_hex, out->verdict,
                          out->rule_name, out->score, on_demand);
 }
