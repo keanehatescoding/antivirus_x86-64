@@ -33,8 +33,10 @@ MAKE_ARGS := -C $(KDIR) M=$(PWD)
 # emptiness is always true - that used to pass CC="cc" down on every
 # build, which overrode the clang that LLVM=1 selects (a bare
 # `make LLVM=1` then ran cc with Clang-only flags) and tripped kbuild's
-# "compiler differs" warning on GCC kernels (gcc vs. cc).
-ifneq ($(origin CC),default)
+# "compiler differs" warning on GCC kernels (gcc vs. cc). `make -R`
+# (no built-in variables) makes the origin "undefined" instead of
+# "default"; that must not forward an empty CC="" either.
+ifeq ($(filter default undefined,$(origin CC)),)
   # Quoted: a multi-word CC (e.g. CC="ccache clang") would otherwise
   # word-split into CC=ccache plus a stray `clang` goal that the
   # recursive make treats as a build target instead of part of CC.
