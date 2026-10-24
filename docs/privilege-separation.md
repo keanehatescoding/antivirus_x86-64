@@ -1,7 +1,7 @@
 # avd privilege separation (design sketch for #103)
 
-Status: proposal. Stage 0 is implemented in #200; stages 1 and 2 are
-design only. Written against master at `08ff847` and revised after review
+Status: proposal. Stage 0 is proposed in #200 (open, not merged); stages 1
+and 2 are design only. Written against master at `08ff847` and revised after review
 of #199.
 
 ## Problem
@@ -96,7 +96,9 @@ tests below check them.
 
 ### Stage 0: split analysis from action (no behaviour change)
 
-Implemented in #200. `perform_scan()` becomes `analyze_fd()` (SHA-256,
+Proposed in #200, which is open and not merged: on master today there is no
+`analyze_fd()` and `perform_scan()` calls `quarantine_file()` from four
+places. With #200, `perform_scan()` becomes `analyze_fd()` (SHA-256,
 signature lookup, YARA, ssdeep, TLSH; fills a `struct scan_result`) plus an
 acting half that quarantines once, then records metrics and history. The four
 inline `quarantine_file()` calls become one, after the analysis, and contract
@@ -139,23 +141,64 @@ and that rules out the obvious options:
   worker to recompile them.
 
 Instead, avd forks one **spawner** process, once, in the window that exists
-today after `load_tlsh_corpus()` and before the first `pthread_create()` and
-before any socket is opened (so the spawner inherits none of them). That
-window has exactly one thread. The spawner:
+today after `load_tlsh_corpus()` and before `nl_socket_alloc()`, which is also
+before the first `pthread_create()`. That window has exactly one thread and
+no sockets, so the spawner inherits none of avd's netlink, control or
+fanotify descriptors.
+
+**Bootstrap channel.** Just before that fork the main process creates one
+`socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC)`. The spawner inherits one
+end and the main process keeps the other. Right after the fork the main
+process closes the spawner's end, and the spawner closes every descriptor it
+inherited except its end and stderr. There is no named rendezvous point, so
+nothing to race or spoof, and the spawner needs neither filesystem access nor
+`bind()`. EOF on this channel is how each side learns the other has died.
+
+Messages are fixed-size and treated as untrusted input in both directions.
+Workers are named by a `worker_id` the spawner assigns, never by pid:
+
+- `SPAWN`: the spawner makes a `socketpair`, forks a worker, and replies
+  `READY(worker_id, pid)` with the main process's end of the worker socket
+  attached via `SCM_RIGHTS`, or `FAILED(errno)`
+- `KILL(worker_id)`: the spawner sends `SIGKILL` to that worker
+- `EXITED(worker_id, wait status)`: sent unprompted whenever the spawner reaps
+  a worker, so the cause (exit code or signal) can be logged
+
+The spawner:
 
 - stays single-threaded for its whole life, so it can always `fork()` safely
 - holds the compiled rules and corpora, which every worker it forks inherits
 - is the only process that holds `CAP_SETUID`, `CAP_SETGID` and `CAP_SETPCAP`
-  (the last to empty a worker's bounding set); everything else is dropped,
-  with `NO_NEW_PRIVS` and its own small seccomp filter (fork, the credential
-  calls, socket I/O)
+  (the last to empty a worker's bounding set), plus `CAP_KILL`, which it needs
+  to signal a worker running as a different uid; everything else is dropped,
+  with `NO_NEW_PRIVS` and a seccomp filter that is a **superset** of the
+  worker allowlist (see "Seccomp filters stack" below)
 - never reads a scanned file or handles file content, so it is not part of
   the attack surface
-- on a request over its control socket, forks a worker, hardens it, and
-  returns the worker's socket and pid to the parent
 
 This also answers "who keeps the bootstrap capabilities for respawns": the
 spawner does, and the main process does not need them (Stage 2).
+
+**Reaping and lifecycle.** The spawner is the parent of every worker, so it is
+the only process that can reap them, and it must. It blocks `SIGCHLD` and
+watches a `signalfd` (or a self-pipe written by a handler) in the same
+`poll()` as the control channel. On each wakeup it calls
+`waitpid(-1, &status, WNOHANG)` in a loop until that returns 0, and sends an
+`EXITED` message per worker. `KILL` only sends the signal and leaves the
+reaping to that loop: a blocking `waitpid()` could hang the spawner on a
+process stuck in uninterruptible sleep. Without this loop every failed
+worker would stay a zombie and repeated failures would exhaust the process
+table.
+
+The main process never signals a worker pid itself. Because only the spawner
+reaps, a pid cannot be reused between the spawner deciding to signal it and
+the signal being sent, which a signal from the main process could not
+guarantee. The main process also needs no `CAP_KILL` for this.
+
+Orphans. Each worker sets `PR_SET_PDEATHSIG` to `SIGKILL`, and so does the
+spawner with respect to the main process, so killing avd leaves nothing
+running. The signal follows the thread that forked; the spawner is forked by
+the main thread, which lives as long as the process.
 
 Pool shape: each existing scan thread owns one worker process. The queue, the
 pool size, `queue_push(task, false)` for the listener and the deadline
@@ -164,10 +207,11 @@ scan thread where the in-process scan happens today (contracts 3 and 4). The
 control-socket `SCAN` path already enqueues to the same pool, so it uses
 workers with no extra work.
 
-If the spawner dies, no worker can be replaced. Proposal: avd exits non-zero
-so systemd restarts it, which the kernel already treats like any avd crash
-(its own fail-open/fail-closed policy applies in the meantime). Silently
-falling back to scanning in the root process would defeat the point.
+If the spawner dies, no worker can be replaced (the main process sees EOF on
+the channel). Proposal: avd exits non-zero so systemd restarts it, which the
+kernel already treats like any avd crash (its own fail-open/fail-closed
+policy applies in the meantime). Silently falling back to scanning in the
+root process would defeat the point.
 
 #### Worker hardening fails closed
 
@@ -185,13 +229,18 @@ no request is ever sent to a worker that has not reported ready.
    `setuid(0)` now fails
 4. empty the bounding set, then clear the permitted, effective and
    inheritable sets
-5. `prctl(PR_SET_NO_NEW_PRIVS, 1)`
+5. `prctl(PR_SET_NO_NEW_PRIVS, 1)` and `prctl(PR_SET_PDEATHSIG, SIGKILL)`
 6. install the seccomp allowlist last
 
 Only then does the worker report ready. The parent does not take that on
-trust: before dispatching, it reads `/proc/<pid>/status` and requires the
-worker's uids and gids to be the dedicated ones, `CapEff`, `CapPrm` and
-`CapBnd` to be zero, `NoNewPrivs: 1` and `Seccomp: 2`.
+trust: before dispatching, it reads `/proc/<pid>/status` (the pid from
+`READY`; the spawner has no filesystem access, so the main process does
+this) and requires the worker's uids and gids to be the dedicated ones,
+`CapEff`, `CapPrm` and `CapBnd` to be zero, `NoNewPrivs: 1` and
+`Seccomp: 2`. The pid is used for this read-only check and never to signal
+or address the worker: dispatch goes through the socket, and signals go
+through the spawner. A stale pid can therefore only make the check fail,
+which gets the worker replaced.
 
 #### IPC
 
@@ -225,8 +274,8 @@ finished, then closes it.
 Request association. Because there is one request in flight, the next reply
 on a worker's socket can only belong to it, and the parent still requires the
 echoed request id to match. After a timeout, a mismatch or any other anomaly
-the parent kills the worker (`SIGKILL`) and closes its socket. A socket is
-never reused after an anomaly, so a late reply can never be matched to a
+the parent has the spawner `KILL` the worker and closes its own end of the
+socket. A socket is never reused after an anomaly, so a late reply can never be matched to a
 later scan. The replacement gets a fresh socketpair from the spawner.
 
 #### The parent treats every reply as untrusted
@@ -269,7 +318,7 @@ the new rules, or every reply carries a rules generation that the parent
 validates before applying or caching it. Reload also cannot create a new
 spawner from the multithreaded main process, so it needs its own design.
 
-#### Seccomp allowlist
+#### Seccomp allowlist (worker)
 
 Default action kill. Expected contents: `read`, `pread64`, `lseek`,
 `fstat`/`newfstatat` with `AT_EMPTY_PATH`, `mmap`, `munmap`, `mprotect`,
@@ -281,6 +330,24 @@ real list must come from tracing the test suite and a YARA scan with the
 shipped rules, not from this guess. libseccomp is not currently a dependency;
 either add it or emit the BPF program by hand (a short, auditable filter for
 this list).
+
+#### Seccomp filters stack
+
+A seccomp filter is inherited across `fork()`. A child may add filters but can
+never loosen one it inherited; every attached filter is evaluated and the
+strictest result wins. Three consequences:
+
+1. The spawner's own filter must allow everything a worker needs, so it is a
+   superset of the worker allowlist plus what only the spawner needs
+   (`clone`/`fork`, `wait4`, `kill`, `socketpair`, `sendmsg`/`recvmsg`,
+   `poll`, `signalfd`, the credential, capability and rlimit calls,
+   `prctl`, `seccomp`). A narrow spawner filter would kill the workers it
+   creates. The tight worker-only filter above is installed last, inside the
+   worker, after hardening.
+2. A `SystemCallFilter=` in `packaging/avd.service` applies to the whole unit,
+   spawner and workers included, so it must be a superset of both as well.
+3. The main process installs its own Stage 2 filter only after it has forked
+   the spawner. Installed earlier, the spawner would inherit it.
 
 Optional extra layers once the above works: `chroot` to an empty directory
 and `unshare(CLONE_NEWNET)` before dropping privileges. Seccomp already
@@ -309,7 +376,8 @@ the issue suggests. Candidates to confirm empirically, not assume:
   `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_CHOWN` the open/quarantine paths
   actually hit
 - drops, once the spawner exists: `CAP_SETUID`, `CAP_SETGID` and
-  `CAP_SETPCAP`. They live only in the spawner
+  `CAP_SETPCAP`. They live only in the spawner (which also holds its own
+  `CAP_KILL` for signalling workers)
 - gains: `NO_NEW_PRIVS`, a bounding set limited to the list above, and a
   seccomp filter that excludes `execve`, `ptrace`, module loading and so on
 
@@ -317,8 +385,9 @@ This can also be done in `packaging/avd.service` with
 `CapabilityBoundingSet=`, `NoNewPrivileges=yes` and `SystemCallFilter=`
 without adding filesystem sandboxing, which the unit comment rightly avoids.
 One catch: those settings apply to the whole unit including the spawner, so
-the unit's bounding set has to include `CAP_SETUID`, `CAP_SETGID` and
-`CAP_SETPCAP`, and its syscall filter has to allow the credential calls. The
+the unit's bounding set has to include `CAP_SETUID`, `CAP_SETGID`,
+`CAP_SETPCAP` and `CAP_KILL`, and its syscall filter has to be a superset of
+the spawner's and the worker's (see "Seccomp filters stack"). The
 main process then drops those capabilities itself after it has forked the
 spawner. The unit comment is also worth rewording: avd cannot be confined to
 a restricted filesystem view, but it can still be confined in capabilities
@@ -347,6 +416,17 @@ and syscalls.
 - worker sends truncated, oversized, non-NUL-terminated or wrong-request-id
   replies; the parent stays correct and does not reuse that socket
 - a late reply after a timeout is never matched to a later scan
+- the spawner inherits no descriptor other than its channel end and stderr
+  (check `/proc/<spawner>/fd`)
+- kill workers repeatedly (a thousand times, under concurrent scans): no
+  zombie children remain under the spawner and the process count is stable
+- each `EXITED` message carries the real wait status, and the exit code or
+  killing signal is logged
+- killing the spawner takes its workers down, and killing avd takes the
+  spawner down (`PR_SET_PDEATHSIG`)
+- the main process never calls `kill()` on a worker pid
+- a real scan succeeds in a worker under the spawner's filter and the unit's
+  `SystemCallFilter=`, not only under the worker filter on its own
 - an unexpected extra or missing `SCM_RIGHTS` descriptor is rejected and
   closed
 - many scans in a row (more than the worker's `RLIMIT_NOFILE`) never
