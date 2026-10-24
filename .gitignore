@@ -38,3 +38,12 @@ packaging/appimage/*.AppImage
 # Python bytecode from running the GTK GUI / tooling from source.
 __pycache__/
 *.pyc
+# libFuzzer build output and working corpus (tests/fuzz/)
+tests/fuzz/fuzz_fan_parse
+tests/fuzz/fuzz_control_parse
+tests/fuzz/fuzz_control_line
+tests/fuzz/work/
+tests/fuzz/crash-*
+tests/fuzz/leak-*
+tests/fuzz/timeout-*
+tests/fuzz/oom-*
