@@ -39,6 +39,12 @@ echo "### test_corpus_format.sh (load-time corpus validation in userspace/avd/av
 "$REPO_ROOT/tests/test_corpus_format.sh" || FAIL=1
 
 echo
+echo "### test_perform_scan.sh (scan pipeline outcomes in userspace/avd/avd.c) ###"
+# Same no-root-needed reasoning as test_sha256.sh above - drives
+# perform_scan() directly against generated fixtures, no netlink involved.
+"$REPO_ROOT/tests/test_perform_scan.sh" || FAIL=1
+
+echo
 echo "### test_avd_sigroute.sh (SIGINT/SIGTERM routing to avd main thread) ###"
 # Same no-root-needed reasoning as test_sha256.sh above.
 "$REPO_ROOT/tests/test_avd_sigroute.sh" || FAIL=1
