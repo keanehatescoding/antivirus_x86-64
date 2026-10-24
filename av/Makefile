@@ -23,12 +23,20 @@ PWD  := $(CURDIR)
 # compiler family the target kernel itself was built with, especially
 # under LTO/CFI configs. Usage:
 #   make                       # default: GCC
-#   make CC=clang LLVM=1       # build against a Clang-built kernel
-CC   ?=
+#   make LLVM=1                # build against a Clang-built kernel
+#   make CC=clang LLVM=1       # same, compiler named explicitly
 LLVM ?=
 
 MAKE_ARGS := -C $(KDIR) M=$(PWD)
-ifneq ($(CC),)
+# Forward CC only when someone actually set it (command line or
+# environment). GNU make predefines CC as "cc", so testing it for
+# emptiness is always true - that used to pass CC="cc" down on every
+# build, which overrode the clang that LLVM=1 selects (a bare
+# `make LLVM=1` then ran cc with Clang-only flags) and tripped kbuild's
+# "compiler differs" warning on GCC kernels (gcc vs. cc). `make -R`
+# (no built-in variables) makes the origin "undefined" instead of
+# "default"; that must not forward an empty CC="" either.
+ifeq ($(filter default undefined,$(origin CC)),)
   # Quoted: a multi-word CC (e.g. CC="ccache clang") would otherwise
   # word-split into CC=ccache plus a stray `clang` goal that the
   # recursive make treats as a build target instead of part of CC.

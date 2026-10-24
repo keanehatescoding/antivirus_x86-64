@@ -223,6 +223,68 @@ jobs:
           path: packaging/arch/*.pkg.tar.zst
           if-no-files-found: error
 
+  # Compiles av/ against the real header packages of the Arch kernel
+  # flavors hyprav-dkms claims to support (its optdepends). build-arch
+  # above cannot cover this: it skips the av.ko check entirely
+  # (HYPRAV_SKIP_AV_KO_CHECK), and build-matrix.yml builds vanilla
+  # kernel.org trees with its own config, not a distro's patched,
+  # differently-configured kernel (linux-hardened's gcc plugins,
+  # linux-zen's patch set). Compile-only, like dkms itself at install
+  # time - nothing is loaded. CachyOS kernels are not in this matrix
+  # (they need CachyOS's own repo and Clang toolchain); build-matrix.yml
+  # covers the Clang build path.
+  arch-kernel-flavors:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel@sha256:61f7de2dd88cc4ba1fe36c24cfe1a503c3936984492d6405eeab013ce6ac68c5
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [linux, linux-lts, linux-zen, linux-hardened]
+    steps:
+      - name: Install git (before checkout needs it)
+        run: pacman -Syu --noconfirm --quiet && pacman -S --noconfirm --needed --quiet git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+
+      - name: Install ${{ matrix.flavor }}-headers
+        run: pacman -S --noconfirm --needed --quiet "${{ matrix.flavor }}-headers"
+
+      - name: Build av.ko against ${{ matrix.flavor }}
+        run: |
+          set -euo pipefail
+          # Exactly one headers package is installed in this container,
+          # so exactly one build dir exists - fail loudly otherwise
+          # rather than silently building against the wrong one.
+          set -- /usr/lib/modules/*/build
+          if [ "$#" -ne 1 ] || [ ! -e "$1/Makefile" ]; then
+            echo "::error::expected exactly one kernel build dir, got: $*"
+            exit 1
+          fi
+          echo "building against $1"
+          # Same invocation packaging/arch/PKGBUILD writes into dkms.conf.
+          make -C av KDIR="$1"
+          test -f av/av.ko
+
+  # Fixed check name for the branch ruleset: the legs above are named
+  # after their flavor, and requiring each by name would go stale
+  # whenever the list changes. Fails unless every leg succeeded.
+  arch-kernel-flavors-all:
+    if: always()
+    needs: arch-kernel-flavors
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every flavor built
+        env:
+          RESULT: ${{ needs.arch-kernel-flavors.result }}
+        run: |
+          echo "arch-kernel-flavors: $RESULT"
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::arch-kernel-flavors finished as '$RESULT'"
+            exit 1
+          fi
+
   build-rpm:
     runs-on: ubuntu-latest
     # Pinned digest, same rolling-tag reasoning as build-deb above.
