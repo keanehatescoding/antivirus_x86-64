@@ -9,8 +9,8 @@ of #199.
 avd runs as root for its whole lifetime, and everything runs in one
 process. The code that parses attacker-influenced bytes (the file being
 scanned) sits in the same address space as the code that can quarantine
-files, kill processes, answer fanotify permission events and send
-netlink verdicts. A memory-safety bug in any of these is root:
+files, answer fanotify permission events and send the netlink verdicts the
+kernel module acts on. A memory-safety bug in any of these is root:
 
 - libyara scanning the file, including its `elf` module, which parses the
   scanned ELF in-process (the shipped rules import `elf` and `math`)
@@ -164,6 +164,12 @@ Workers are named by a `worker_id` the spawner assigns, never by pid:
 - `EXITED(worker_id, wait status)`: sent unprompted whenever the spawner reaps
   a worker, so the cause (exit code or signal) can be logged
 
+`worker_id` is a 64-bit counter that only increases for the spawner's
+lifetime and is never reused, so a delayed `EXITED` for a worker that has
+already been replaced can only name the old one. The main process ignores
+(and logs) any message naming an id it is not tracking, and a `KILL` for an
+id that has already exited is a no-op.
+
 The spawner:
 
 - stays single-threaded for its whole life, so it can always `fork()` safely
@@ -229,8 +235,28 @@ no request is ever sent to a worker that has not reported ready.
    `setuid(0)` now fails
 4. empty the bounding set, then clear the permitted, effective and
    inheritable sets
-5. `prctl(PR_SET_NO_NEW_PRIVS, 1)` and `prctl(PR_SET_PDEATHSIG, SIGKILL)`
+5. `prctl(PR_SET_NO_NEW_PRIVS, 1)`, then `prctl(PR_SET_PDEATHSIG, SIGKILL)`,
+   then read it back with `PR_GET_PDEATHSIG` and require `SIGKILL`, then
+   require `getppid()` to equal the pid the spawner recorded before the
+   `fork()`
 6. install the seccomp allowlist last
+
+The parent-death signal needs both the order and the handshake above:
+
+- The kernel clears it whenever a process changes its effective or
+  filesystem uid or gid (tried here: set, then `setresuid()`, and
+  `PR_GET_PDEATHSIG` reads back 0). So it is set *after* step 3, never
+  before, and read back so that a later reordering fails closed instead of
+  silently leaving orphans.
+- Setting it is not enough by itself. If the spawner died before the child
+  called `prctl()`, no signal will ever arrive. So the spawner records its own
+  pid before the `fork()` and the child, after the `prctl()`, exits unless
+  `getppid()` still equals it.
+- The spawner does the same against the main process, right after it is
+  forked and again after its own capability drop.
+- The packaged unit's default `KillMode=control-group` also cleans up
+  descendants on a service stop or restart, but not a manual launch, so it
+  complements this and does not replace it.
 
 Only then does the worker report ready. The parent does not take that on
 trust: before dispatching, it reads `/proc/<pid>/status` (the pid from
@@ -372,12 +398,13 @@ After init the parent still needs real power, so this stage is smaller than
 the issue suggests. Candidates to confirm empirically, not assume:
 
 - keeps: `CAP_NET_ADMIN` (verdicts), `CAP_SYS_ADMIN` (fanotify permission
-  events), `CAP_KILL`, and whichever of `CAP_DAC_READ_SEARCH`,
-  `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_CHOWN` the open/quarantine paths
-  actually hit
+  events), and whichever of `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`,
+  `CAP_FOWNER`, `CAP_CHOWN` the open/quarantine paths actually hit. Not
+  `CAP_KILL`: avd calls `kill()` nowhere (the kernel module does the
+  killing when a verdict arrives), and it never signals workers itself
 - drops, once the spawner exists: `CAP_SETUID`, `CAP_SETGID` and
-  `CAP_SETPCAP`. They live only in the spawner (which also holds its own
-  `CAP_KILL` for signalling workers)
+  `CAP_SETPCAP`. They live only in the spawner, which also holds `CAP_KILL`
+  for signalling workers
 - gains: `NO_NEW_PRIVS`, a bounding set limited to the list above, and a
   seccomp filter that excludes `execve`, `ptrace`, module loading and so on
 
@@ -424,6 +451,13 @@ and syscalls.
   killing signal is logged
 - killing the spawner takes its workers down, and killing avd takes the
   spawner down (`PR_SET_PDEATHSIG`)
+- parent death before and during the startup window of both the worker and
+  the spawner: a test hook pauses the child between hardening steps, the
+  parent is killed at each point, and the child must exit (the `getppid()`
+  handshake, and `PR_GET_PDEATHSIG` failing closed if the call is moved
+  before the credential change)
+- a delayed `EXITED` for a replaced worker is ignored: it must not be
+  applied to the replacement
 - the main process never calls `kill()` on a worker pid
 - a real scan succeeds in a worker under the spawner's filter and the unit's
   `SystemCallFilter=`, not only under the worker filter on its own
