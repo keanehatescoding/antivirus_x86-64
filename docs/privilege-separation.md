@@ -157,9 +157,15 @@ nothing to race or spoof, and the spawner needs neither filesystem access nor
 Messages are fixed-size and treated as untrusted input in both directions.
 Workers are named by a `worker_id` the spawner assigns, never by pid:
 
-- `SPAWN`: the spawner makes a `socketpair`, forks a worker, and replies
-  `READY(worker_id, pid)` with the main process's end of the worker socket
-  attached via `SCM_RIGHTS`, or `FAILED(errno)`
+- `SPAWN(request_id)`: the spawner makes a `socketpair`, forks a worker, and
+  waits (bounded by a short startup timeout) for the worker's own readiness
+  report, which the worker sends on its socket only after every hardening
+  step has succeeded. Only then does it reply
+  `READY(request_id, worker_id, pid)` with the main process's end of the
+  worker socket attached via `SCM_RIGHTS`. If the worker exits or closes its
+  socket first, sends anything else, or the timeout expires, the spawner kills
+  and reaps it and replies `FAILED(request_id, reason)`, where `reason`
+  distinguishes fork, hardening and timeout failures
 - `KILL(worker_id)`: the spawner sends `SIGKILL` to that worker
 - `EXITED(worker_id, wait status)`: sent unprompted whenever the spawner reaps
   a worker, so the cause (exit code or signal) can be logged
@@ -169,6 +175,21 @@ lifetime and is never reused, so a delayed `EXITED` for a worker that has
 already been replaced can only name the old one. The main process ignores
 (and logs) any message naming an id it is not tracking, and a `KILL` for an
 id that has already exited is a no-op.
+
+**Correlating replies.** Scan threads replace their workers independently, so
+several `SPAWN`s can be outstanding at once, and `EXITED` events arrive
+unprompted on the same channel. The `request_id` is a 64-bit counter chosen by
+the main process, echoed in `READY` and `FAILED`. One small reader thread in
+the main process (created after the spawner is forked) owns reads from the
+channel: it hands each `READY`/`FAILED` to the scan thread waiting on that
+`request_id`, applies each `EXITED` to the worker table, and drops anything
+naming a request or worker it does not know. Writers (`SPAWN`, `KILL`) share
+the channel under a lock. A scan thread waits for its reply with a bound a
+little above the spawner's startup timeout; a reply that never comes counts
+as the spawner being unresponsive (see below). The spawner itself handles
+concurrent spawns as a small state machine in its single `poll()` loop, one
+entry per pending `request_id`, so a slow-starting worker never blocks the
+loop.
 
 The spawner:
 
@@ -187,8 +208,11 @@ spawner does, and the main process does not need them (Stage 2).
 
 **Reaping and lifecycle.** The spawner is the parent of every worker, so it is
 the only process that can reap them, and it must. It blocks `SIGCHLD` and
-watches a `signalfd` (or a self-pipe written by a handler) in the same
-`poll()` as the control channel. On each wakeup it calls
+reads it from a `signalfd` in the same `poll()` as the control channel and
+the sockets of pending spawns. (A self-pipe is the alternative only if
+`SIGCHLD` is *not* blocked and a handler writes to the pipe: a blocked
+signal never runs its handler, so the two must not be combined.) `SIGCHLD`s
+coalesce, which is why the reap below loops. On each wakeup it calls
 `waitpid(-1, &status, WNOHANG)` in a loop until that returns 0, and sends an
 `EXITED` message per worker. `KILL` only sends the signal and leaves the
 reaping to that loop: a blocking `waitpid()` could hang the spawner on a
@@ -214,7 +238,10 @@ control-socket `SCAN` path already enqueues to the same pool, so it uses
 workers with no extra work.
 
 If the spawner dies, no worker can be replaced (the main process sees EOF on
-the channel). Proposal: avd exits non-zero so systemd restarts it, which the
+the channel). It can also hang rather than die: a `SPAWN` that gets no reply
+within its bound fails that one scan with the canonical failure result, and a
+run of consecutive missed replies is treated like death, since a hung spawner
+cannot recover on its own. Proposal: avd exits non-zero so systemd restarts it, which the
 kernel already treats like any avd crash (its own fail-open/fail-closed
 policy applies in the meantime). Silently falling back to scanning in the
 root process would defeat the point.
@@ -222,8 +249,9 @@ root process would defeat the point.
 #### Worker hardening fails closed
 
 The spawner applies these in order inside the child and checks every return
-value. Any failure ends the child with `_exit(1)` before it reports ready;
-no request is ever sent to a worker that has not reported ready.
+value. Any failure ends the child with `_exit(1)` before it reports ready on
+its socket; the spawner then replies `FAILED`, so no request is ever sent to
+a worker that has not reported ready.
 
 1. rlimits: `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE=0` and a small
    `RLIMIT_NOFILE` (not `RLIMIT_NPROC`: seccomp already forbids `fork`, and a
@@ -258,7 +286,8 @@ The parent-death signal needs both the order and the handshake above:
   descendants on a service stop or restart, but not a manual launch, so it
   complements this and does not replace it.
 
-Only then does the worker report ready. The parent does not take that on
+Only then does the worker report ready, and only on that report does the
+spawner send `READY`. The main process does not take that on
 trust: before dispatching, it reads `/proc/<pid>/status` (the pid from
 `READY`; the spawner has no filesystem access, so the main process does
 this) and requires the worker's uids and gids to be the dedicated ones,
@@ -436,7 +465,13 @@ and syscalls.
   fail in a test build; the worker must exit without reporting ready and the
   parent must never send it a request
 - the parent's `/proc/<pid>/status` check rejects a worker that skipped a
-  step
+  step, and never sees a worker that is still mid-hardening (`READY` is only
+  sent after the worker's report)
+- concurrent `SPAWN`s from several scan threads, with slow and failing
+  workers mixed in, each get exactly their own `READY` or `FAILED`; a worker
+  that never reports is killed and reaped at the startup timeout
+- a burst of simultaneous worker exits (coalesced `SIGCHLD`) leaves no
+  zombie and produces one `EXITED` per worker
 - worker killed mid-scan: the scan is the canonical failure result and a new
   worker appears; repeat under concurrent scans with workers being killed, to
   exercise respawn from the multithreaded parent
@@ -485,8 +520,9 @@ and syscalls.
    some; measure.
 3. Worker lifetime: long-lived, recycled after K scans, or one per scan (see
    the residual-risk section). Needs the latency measurement.
-4. Spawner death: exit and let systemd restart avd (proposed), or degrade to
-   all-inconclusive and keep running.
+4. Spawner death or hang: exit and let systemd restart avd (proposed), or
+   degrade to all-inconclusive and keep running; and how many consecutive
+   missed replies count as a hang.
 5. Whether to kill a worker whose scan has already missed the fanotify
    deadline, instead of letting it finish and only logging the late result as
    today.
