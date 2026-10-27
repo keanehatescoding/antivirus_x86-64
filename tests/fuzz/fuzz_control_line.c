@@ -328,10 +328,25 @@ static void check_root_reply(const char *arg, const char *id, bool seeded,
   check_framing();
   if (!quarantine_id_valid(arg))
     REQUIRE(!strcmp(reply, "ERR invalid id\n"));
-  else if (geteuid() != 0)
-    return; /* quarantined files are mode 000, which only root can reopen */
-  else if (strlen(arg) + sizeof(".quarantined.meta") > NAME_MAX)
-    return; /* too long for one path component: any clean ERR is fine */
+  else if (strlen(arg) + sizeof(".quarantined.meta") > NAME_MAX) {
+    /* The metadata name no longer fits one path component, so RESTORE
+     * cannot read it. DELETE only needs "<id>.quarantined": if that fits
+     * and is absent, ENOENT is success; if not, unlink fails. Checked
+     * rootless too: neither path needs to reopen a mode-000 file. */
+    if (is_restore || strlen(arg) + sizeof(".quarantined") - 1 > NAME_MAX)
+      REQUIRE(starts(reply, "ERR "));
+    else
+      REQUIRE(!strcmp(reply, "OK\n"));
+  } else if (geteuid() != 0) {
+    /* Rootless: RESTORE cannot reopen mode-000 files, so only its seeded
+     * success check is skipped. DELETE just unlinks inside the private
+     * quarantine directory, and a missing id has no metadata either way. */
+    if (!is_restore)
+      REQUIRE(!strcmp(reply, "OK\n"));
+    else if (!(seeded && !strcmp(arg, id)))
+      REQUIRE(starts(reply, "ERR no metadata for this id"));
+    return;
+  }
   else if (seeded && !strcmp(arg, id))
     REQUIRE(!strcmp(reply, "OK\n")); /* the real entry restores/deletes */
   else if (is_restore)
