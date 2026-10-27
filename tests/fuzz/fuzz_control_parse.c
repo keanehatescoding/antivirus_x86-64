@@ -144,20 +144,32 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     {
       const char *p = str;
       size_t digits = 0;
-      unsigned long long v = 0;
-      int plain;
+      unsigned long v = 0;
+      int negative = 0, overflow = 0;
 
       while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
         p++;
-      plain = (*p != '+' && *p != '-');
-      if (!plain)
-        p++;
-      for (; *p >= '0' && *p <= '9'; p++, digits++)
-        v = digits < 18 ? v * 10 + (unsigned)(*p - '0') : v;
+      if (*p == '+' || *p == '-')
+        negative = *p++ == '-';
+      for (; *p >= '0' && *p <= '9'; p++, digits++) {
+        unsigned digit = (unsigned)(*p - '0');
+
+        if (!overflow) {
+          if (v > ((unsigned long)-1 - digit) / 10)
+            overflow = 1;
+          else
+            v = v * 10 + digit;
+        }
+      }
       REQUIRE(ok == (digits > 0 && *p == '\0'));
-      /* A plain run of up to 18 digits has an exact, overflow-free value. */
-      if (ok && plain && digits <= 18)
-        REQUIRE(n == (unsigned long)v);
+      if (ok) {
+        /* Out of range saturates to the maximum (the sign is not applied
+         * then); a minus sign otherwise negates modulo 2^N. */
+        unsigned long expected = overflow ? (unsigned long)-1
+                                          : (negative ? 0UL - v : v);
+
+        REQUIRE(n == expected);
+      }
     }
     break;
   }

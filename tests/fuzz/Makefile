@@ -27,6 +27,10 @@ PC_CFLAGS := $(shell $(PKG_CONFIG) --cflags libnl-genl-3.0 yara 2>/dev/null)
 PC_LIBS   := $(shell $(PKG_CONFIG) --libs libnl-genl-3.0 yara 2>/dev/null) \
              $(shell $(PKG_CONFIG) --libs fuzzy 2>/dev/null || echo -lfuzzy) -lpthread
 
+# Every header avd.c and the linked sources include (control_parse.h,
+# fan_parse.h, sha256.h, tlsh_*.h, ...), so a header edit rebuilds.
+AVD_HEADERS    := $(wildcard $(AVD_DIR)/*.h)
+
 HEADER_TARGETS := fuzz_fan_parse fuzz_control_parse
 AVD_TARGETS    := fuzz_control_line
 TARGETS        := $(HEADER_TARGETS) $(AVD_TARGETS)
@@ -38,7 +42,7 @@ $(HEADER_TARGETS): %: %.c $(AVD_DIR)/control_parse.h $(AVD_DIR)/fan_parse.h
 
 $(AVD_TARGETS): %: %.c $(AVD_DIR)/avd.c $(AVD_DIR)/sha256.c \
                 $(AVD_DIR)/tlsh_core.c $(AVD_DIR)/tlsh_shim.c \
-                $(AVD_DIR)/control_parse.h $(AVD_DIR)/fan_parse.h
+                $(AVD_HEADERS) ../../av/netlink_proto.h
 	$(CLANG) $(CFLAGS) $(SAN) -w -I$(AVD_DIR) $(PC_CFLAGS) -o $@ $< \
 	    $(AVD_DIR)/sha256.c $(AVD_DIR)/tlsh_core.c $(AVD_DIR)/tlsh_shim.c \
 	    $(PC_LIBS)

@@ -30,6 +30,47 @@
     }                                                                          \
   } while (0)
 
+/* Independent model of fan_sig_parse_line(): what it must return for `s`,
+ * worked out from the documented "<algo> <hex> <name>" format and the
+ * kernel's three algorithms, not by calling the parser. Tokens: algo and
+ * hex end at the first space, tab or newline; the name is the rest up to a
+ * newline, minus leading blanks, and must be non-empty. */
+static int expect_sig_rc(const char *s) {
+  static const char dl[] = " \t\n";
+  const char *algo, *hex, *name;
+  size_t alen, hlen, want, i;
+
+  algo = s + strspn(s, dl);
+  alen = strcspn(algo, dl);
+  if (!algo[alen])
+    return -1;
+  hex = algo + alen + strspn(algo + alen, dl);
+  hlen = strcspn(hex, dl);
+  if (!hex[hlen])
+    return -1;
+  /* One delimiter ends the hex token. The parser then cuts the name at the
+   * next newline (skipping leading newlines) and only afterwards trims
+   * leading blanks, so a blank-only name is empty. */
+  name = hex + hlen + 1;
+  name += strspn(name, "\n");
+  if (strspn(name, " \t") >= strcspn(name, "\n"))
+    return -1;
+  if (alen == 6 && !strncmp(algo, "sha256", 6))
+    want = 64;
+  else if (alen == 4 && !strncmp(algo, "sha1", 4))
+    want = 40;
+  else if (alen == 3 && !strncmp(algo, "md5", 3))
+    want = 32;
+  else
+    return -1;
+  if (hlen != want)
+    return -1;
+  for (i = 0; i < hlen; i++)
+    if (!isxdigit((unsigned char)hex[i]))
+      return -1;
+  return want == 64 ? 1 : 0;
+}
+
 static int in_buf(const char *p, const char *buf, size_t len) {
   return p >= buf && p < buf + len + 1;
 }
@@ -72,10 +113,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   }
   case 1: {
     char *algo = NULL, *hex = NULL, *name = NULL;
-    int rc = fan_sig_parse_line(line, &algo, &hex, &name);
+    char orig[MAX_LINE + 1];
+    int rc, want_rc;
     size_t i;
 
-    REQUIRE(rc == -1 || rc == 0 || rc == 1);
+    /* The model runs on a copy: the parser tokenizes `line` in place. */
+    memcpy(orig, line, len + 1);
+    want_rc = expect_sig_rc(orig);
+    rc = fan_sig_parse_line(line, &algo, &hex, &name);
+
+    REQUIRE(rc == want_rc);
     if (rc == 1) {
       REQUIRE(hex && name && algo);
       REQUIRE(in_buf(hex, line, len) && in_buf(name, line, len));
@@ -86,17 +133,31 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       REQUIRE(name[0] != '\0' && name[0] != ' ' && name[0] != '\t');
     } else if (rc == 0) {
       REQUIRE(algo && in_buf(algo, line, len));
-      REQUIRE(strcmp(algo, "sha256") != 0);
+      REQUIRE(!strcmp(algo, "md5") || !strcmp(algo, "sha1"));
     }
     break;
   }
   case 2: {
-    size_t before = len, after;
+    /* Expected output built first, from the documented rule: a backslash
+     * plus exactly three octal digits (first 0-3) is one byte; anything
+     * else, including a malformed escape, stays literal. */
+    char expected[MAX_LINE + 1];
+    size_t i = 0, e = 0;
 
+    while (i < len) {
+      if (i + 3 < len && line[i] == '\\' && line[i + 1] >= '0' &&
+          line[i + 1] <= '3' && line[i + 2] >= '0' && line[i + 2] <= '7' &&
+          line[i + 3] >= '0' && line[i + 3] <= '7') {
+        expected[e++] = (char)(((line[i + 1] - '0') << 6) |
+                               ((line[i + 2] - '0') << 3) | (line[i + 3] - '0'));
+        i += 4;
+      } else {
+        expected[e++] = line[i++];
+      }
+    }
+    expected[e] = '\0';
     fan_unescape_octal(line);
-    after = strlen(line);
-    /* In-place unescape can only shrink. */
-    REQUIRE(after <= before);
+    REQUIRE(!strcmp(line, expected));
     break;
   }
   case 3: {

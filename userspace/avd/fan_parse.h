@@ -158,16 +158,18 @@ static inline bool fan_fstype_markable(const char *fstype) {
  * only, so MD5/SHA-1 entries are reported back via *algo_out (return
  * 0) for the caller to count, and stay enforced by the kernel's
  * post-exec bprm_check path. The hex is lowercased and validated as
- * exactly 64 hex digits. `name` is the rest of the line (sigtable
- * names never contain whitespace, but taking the remainder is the
- * conservative read). Returns -1 on a malformed line. */
+ * exactly 64 (sha256), 40 (sha1) or 32 (md5) hex digits. `name` is
+ * the rest of the line (sigtable names never contain whitespace, but
+ * taking the remainder is the conservative read). Returns -1 on a
+ * malformed line, including any algorithm other than md5, sha1 or
+ * sha256. */
 static inline int fan_sig_parse_line(char *line, char **algo_out,
                                      char **hex_out, char **name_out) {
   char *save = NULL;
   char *algo = strtok_r(line, " \t\n", &save);
   char *hex = strtok_r(NULL, " \t\n", &save);
   char *name = strtok_r(NULL, "\n", &save);
-  size_t i;
+  size_t i, want;
 
   if (!algo || !hex || !name)
     return -1;
@@ -175,16 +177,24 @@ static inline int fan_sig_parse_line(char *line, char **algo_out,
     name++;
   if (!name[0])
     return -1;
-  *algo_out = algo;
-  if (strcmp(algo, "sha256") != 0)
-    return 0;
-  if (strlen(hex) != 64)
+  if (strcmp(algo, "sha256") == 0)
+    want = 64;
+  else if (strcmp(algo, "sha1") == 0)
+    want = 40;
+  else if (strcmp(algo, "md5") == 0)
+    want = 32;
+  else
+    return -1; /* the kernel only ever emits md5, sha1 and sha256 */
+  if (strlen(hex) != want)
     return -1;
-  for (i = 0; i < 64; i++) {
+  for (i = 0; i < want; i++) {
     if (!isxdigit((unsigned char)hex[i]))
       return -1;
     hex[i] = (char)tolower((unsigned char)hex[i]);
   }
+  *algo_out = algo;
+  if (want != 64)
+    return 0;
   *hex_out = hex;
   *name_out = name;
   return 1;

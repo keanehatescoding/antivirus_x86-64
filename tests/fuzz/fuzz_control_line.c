@@ -323,13 +323,24 @@ static void check_peer_reply(const char *line, bool seeded) {
 }
 
 /* What the root peer must get back for a RESTORE/DELETE of `arg`. */
-static void check_root_reply(const char *arg, const char *id, bool seeded) {
+static void check_root_reply(const char *arg, const char *id, bool seeded,
+                             bool is_restore) {
   check_framing();
   if (!quarantine_id_valid(arg))
     REQUIRE(!strcmp(reply, "ERR invalid id\n"));
-  else if (seeded && !strcmp(arg, id) && geteuid() == 0)
-    /* The real entry restores/deletes cleanly. Not asserted rootless:
-     * quarantined files are mode 000, which only root can reopen. */
+  else if (geteuid() != 0)
+    return; /* quarantined files are mode 000, which only root can reopen */
+  else if (strlen(arg) + sizeof(".quarantined.meta") > NAME_MAX)
+    return; /* too long for one path component: any clean ERR is fine */
+  else if (seeded && !strcmp(arg, id))
+    REQUIRE(!strcmp(reply, "OK\n")); /* the real entry restores/deletes */
+  else if (is_restore)
+    /* The private quarantine directory holds only the seeded entry (and a
+     * root-owned one with an unguessable id), so any other valid id has no
+     * metadata. */
+    REQUIRE(starts(reply, "ERR no metadata for this id"));
+  else
+    /* DELETE is idempotent: a missing entry (ENOENT) is not an error. */
     REQUIRE(!strcmp(reply, "OK\n"));
 }
 
@@ -382,7 +393,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     /* Refused, so nothing may have been touched yet. */
     REQUIRE(access(sentinel_path, F_OK) == 0);
     dispatch(line, 0, true);
-    check_root_reply(arg, id, seeded);
+    check_root_reply(arg, id, seeded, PREFIX_MATCH(line, "QUARANTINE RESTORE "));
     /* Whatever id the fuzzer sent, nothing outside the quarantine
      * directory may have been moved or removed. */
     REQUIRE(access(sentinel_path, F_OK) == 0);
