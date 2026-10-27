@@ -74,25 +74,39 @@ static int seed_entry(char *id_out, size_t id_len) {
   char orig[PATH_MAX];
   DIR *d;
   struct dirent *e;
+  struct stat created, reopened;
   int fd, found = 0;
 
   wipe_quarantine();
   snprintf(orig, sizeof(orig), "%s/orig_%u.bin", work_dir, entry_counter++);
-  fd = open(orig, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  /* O_EXCL | O_NOFOLLOW: always a brand-new regular file, never one that
+   * already existed or a symlink planted at the name. The directory is a
+   * private mkdtemp tree, so this is belt and braces, but every later step
+   * works on this descriptor rather than re-resolving the name. */
+  fd = open(orig, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0644);
   if (fd < 0)
     return -1;
-  if (write(fd, "payload", 7) != 7) {
+  if (write(fd, "payload", 7) != 7 || fstat(fd, &created) != 0) {
     close(fd);
     return -1;
   }
-  close(fd);
-  /* Owned by the unprivileged peer so QUARANTINE LIST shows it to them. */
-  if (chown(orig, FUZZ_UNPRIV_UID, FUZZ_UNPRIV_UID) != 0) {
+  /* Owned by the unprivileged peer so QUARANTINE LIST shows it to them.
+   * fchown() on the open descriptor, not chown() on the name, so it cannot
+   * land on whatever the name resolves to by then. */
+  if (fchown(fd, FUZZ_UNPRIV_UID, FUZZ_UNPRIV_UID) != 0) {
     /* not root: the entry is simply invisible to the unprivileged peer */
   }
-  fd = open(orig, O_RDONLY);
+  close(fd);
+  /* The scan path hands quarantine_file() a read-only descriptor, so reopen
+   * read-only, and confirm it is the very file created above. */
+  fd = open(orig, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0)
     return -1;
+  if (fstat(fd, &reopened) != 0 || reopened.st_dev != created.st_dev ||
+      reopened.st_ino != created.st_ino) {
+    close(fd);
+    return -1;
+  }
   quarantine_file(fd, orig, "Fuzz_Rule",
                   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                   "abcdef");
