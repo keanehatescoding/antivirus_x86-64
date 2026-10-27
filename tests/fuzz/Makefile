@@ -37,7 +37,8 @@ $(HEADER_TARGETS): %: %.c $(AVD_DIR)/control_parse.h $(AVD_DIR)/fan_parse.h
 	$(CLANG) $(CFLAGS) $(SAN) -I$(AVD_DIR) -o $@ $<
 
 $(AVD_TARGETS): %: %.c $(AVD_DIR)/avd.c $(AVD_DIR)/sha256.c \
-                $(AVD_DIR)/tlsh_core.c $(AVD_DIR)/tlsh_shim.c
+                $(AVD_DIR)/tlsh_core.c $(AVD_DIR)/tlsh_shim.c \
+                $(AVD_DIR)/control_parse.h $(AVD_DIR)/fan_parse.h
 	$(CLANG) $(CFLAGS) $(SAN) -w -I$(AVD_DIR) $(PC_CFLAGS) -o $@ $< \
 	    $(AVD_DIR)/sha256.c $(AVD_DIR)/tlsh_core.c $(AVD_DIR)/tlsh_shim.c \
 	    $(PC_LIBS)
@@ -56,8 +57,13 @@ run: all
 	        work/$$t corpus/$$t; \
 	done
 
-clean:
+# Binaries only: work/ (new coverage) and crash-* reproducers from an
+# earlier `make run` are results, not build products. test_fuzz_replay.sh
+# uses this target so a replay never deletes them.
+clean-bin:
 	rm -f $(TARGETS)
+
+clean: clean-bin
 	rm -rf work crash-* leak-* timeout-* oom-*
 
-.PHONY: all replay run clean
+.PHONY: all replay run clean clean-bin

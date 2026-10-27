@@ -99,9 +99,25 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     REQUIRE(after <= before);
     break;
   }
-  case 3:
-    (void)fan_fstype_markable(line);
+  case 3: {
+    /* Independent oracle: the pseudo/network filesystems that must not be
+     * marked, spelled out here rather than read from the implementation. */
+    static const char *const never[] = {
+        "proc",    "sysfs",    "cgroup",  "cgroup2", "devpts",      "mqueue",
+        "debugfs", "tracefs",  "securityfs", "pstore", "bpf",       "configfs",
+        "fusectl", "hugetlbfs", "autofs", "binfmt_misc", "efivarfs", "nsfs",
+        "selinuxfs", "rpc_pipefs", "nfsd", "nfs",     "nfs4",    "cifs",
+        "smb3",    "smbfs",    "9p",      "ceph",    "glusterfs",   "afs",
+        "sshfs",   "fuse",     "fuseblk"};
+    bool want = line[0] != '\0' && strncmp(line, "fuse.", 5) != 0;
+    size_t k;
+
+    for (k = 0; k < sizeof(never) / sizeof(never[0]); k++)
+      if (!strcmp(line, never[k]))
+        want = false;
+    REQUIRE(fan_fstype_markable(line) == want);
     break;
+  }
   default: {
     /* Positive path: a line built to be valid must be ACCEPTED, with the
      * hex lowercased. The other cases only check what an accepted parse

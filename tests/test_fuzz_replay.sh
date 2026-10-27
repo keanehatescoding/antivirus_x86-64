@@ -83,7 +83,9 @@ for target in fuzz_fan_parse fuzz_control_parse fuzz_control_line; do
     fi
 done
 
-make -C "$FUZZ_DIR" clean >/dev/null 2>&1
+# Remove only the binaries built above; work/ and crash-* from an earlier
+# `make run` are fuzzing results and must survive a replay.
+make -C "$FUZZ_DIR" clean-bin >/dev/null 2>&1
 
 echo
 echo "fuzz replay: $PASS passed, $FAIL failed"

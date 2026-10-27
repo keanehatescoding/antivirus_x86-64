@@ -137,12 +137,27 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     memcpy(str, data, size);
     str[size] = '\0';
     ok = parse_verdicts_count(str, &n);
-    if (ok) {
-      char *end;
-      /* Accepted means the whole string was one strtoul() number. */
-      REQUIRE(str[0] != '\0');
-      REQUIRE(n == strtoul(str, &end, 10));
-      REQUIRE(*end == '\0');
+    /* Independent grammar, written without strtoul(): optional leading
+     * whitespace, optional sign, one or more digits, nothing after. Both
+     * directions are checked, so a parser that rejects every argument
+     * (or accepts garbage) fails on the plain-number seeds too. */
+    {
+      const char *p = str;
+      size_t digits = 0;
+      unsigned long long v = 0;
+      int plain;
+
+      while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
+        p++;
+      plain = (*p != '+' && *p != '-');
+      if (!plain)
+        p++;
+      for (; *p >= '0' && *p <= '9'; p++, digits++)
+        v = digits < 18 ? v * 10 + (unsigned)(*p - '0') : v;
+      REQUIRE(ok == (digits > 0 && *p == '\0'));
+      /* A plain run of up to 18 digits has an exact, overflow-free value. */
+      if (ok && plain && digits <= 18)
+        REQUIRE(n == (unsigned long)v);
     }
     break;
   }
