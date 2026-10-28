@@ -112,6 +112,7 @@
 #include "../../av/netlink_proto.h"
 #include "control_parse.h"
 #include "fan_parse.h"
+#include "privsep_proto.h"
 #include "sha256.h"
 #include "tlsh_shim.h"
 
@@ -304,6 +305,14 @@ static int family_id;
  * for both the handler (only lock-free atomics are async-signal-safe)
  * and the cross-thread accesses. */
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "running must be lock-free");
+
+/* privsep_proto.h is standalone, so it restates two constants from
+ * av/netlink_proto.h; keep them from drifting apart (#103). */
+_Static_assert(PS_VERDICT_CLEAN == AV_VERDICT_CLEAN &&
+                   PS_VERDICT_MALICIOUS == AV_VERDICT_MALICIOUS,
+               "privsep verdict values must match the netlink protocol");
+_Static_assert(PS_RULE_NAME_SIZE == AV_RULE_NAME_MAXLEN + 1,
+               "privsep rule name size must match struct scan_result");
 static atomic_int running = 1;
 static YR_RULES *compiled_rules;
 
@@ -2093,68 +2102,27 @@ static void fan_cache_store(const struct stat *before, const struct stat *after,
 }
 
 /*
- * Analysis half of a scan: SHA-256, exact-signature lookup, YARA, then the
- * fuzzy/TLSH fallbacks. Everything in here consumes the bytes of the file
- * behind `fd` and produces only a verdict in `out` - it never quarantines,
- * touches verdict history or metrics, or otherwise acts on the machine.
- * That is deliberate (#103): this is the code that parses attacker-
- * influenced content, and keeping it free of privileged actions is what
- * lets it later run in an unprivileged worker process. perform_scan()
- * below acts on the result.
+ * Content half of the analysis: YARA, then the ssdeep and TLSH fallbacks.
+ * This is the code that parses attacker-influenced file bytes, and the part
+ * #103 Stage 1 moves into an unprivileged worker process. It needs only an
+ * open `fd`, and the digest and path for log lines; it never quarantines and
+ * never reads the signature snapshot, which can change at runtime and so
+ * stays with the parent (docs/privilege-separation.md, "Stage 1").
  *
- * `fd` must already be open for reading (and, for a kernel-triggered scan,
- * `sha256_hex` is the kernel's precomputed digest). On return `fd`'s
- * offset is wherever the last analysis step left it; a MALICIOUS verdict
- * returns immediately after the step that convicted, which is the state
- * quarantine_file() has always seen.
+ * `out` arrives already initialised by analyze_fd() (verdict CLEAN, digest
+ * filled in, `inconclusive` possibly set by a hashing failure) and is only
+ * ever updated here: a conviction sets verdict/rule_name, a below-threshold
+ * YARA match records its score, a skipped check sets `inconclusive`.
  */
-static void analyze_fd(int fd, const char *path, const char *sha256_hex,
-                       uint32_t pid, bool on_demand, struct scan_result *out) {
+static void analyze_content(int fd, const char *path, const char *hash,
+                            uint32_t pid, bool on_demand,
+                            struct scan_result *out) {
   struct yara_match_ctx ctx = {.matched = 0,
                                .match_count = 0,
                                .score = 0,
                                .override_matched = 0,
                                .rule_name = ""};
-  char sha256_buf[65] = "";
-  const char *hash;
   int ret;
-
-  memset(out, 0, sizeof(*out));
-  out->verdict = AV_VERDICT_CLEAN;
-
-  if (sha256_hex && sha256_hex[0])
-    hash = sha256_hex;
-  else if (sha256_fd(fd, sha256_buf) == 0)
-    hash = sha256_buf;
-  else {
-    hash = ""; /* on-demand scan of a file sha256_fd() couldn't hash -
-               * proceed without one rather than failing the scan
-               * over it */
-    /* The signature lookup below is skipped without a hash, and the
-     * failure can be transient (dup() hitting EMFILE, a read error) -
-     * a CLEAN from this run must not be cached. */
-    out->inconclusive = true;
-  }
-  /* Recorded here rather than after the scan so the acting half
-   * (perform_scan) sees the digest the analysis actually used. */
-  snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
-
-  /* Exact-hash signatures first (#176): the kernel's sigtable is
-   * normally matched post-exec by the bprm_check kprobe, which can only
-   * kill. With the fanotify listener holding the exec, avd matches the
-   * same SHA-256 entries here so a known-bad image is refused before it
-   * runs. The snapshot is empty unless fanotify enforcement is active
-   * (see fan_sigs_refresh()), so this is a no-op otherwise. */
-  if (hash[0]) {
-    char sig_name[AV_RULE_NAME_MAXLEN + 1];
-
-    if (fan_sig_lookup(hash, sig_name, sizeof(sig_name))) {
-      out->verdict = AV_VERDICT_MALICIOUS;
-      snprintf(out->rule_name, sizeof(out->rule_name), "Sig:%.58s", sig_name);
-      printf("avd: SIGNATURE MATCH \"%s\" -> \"%s\"\n", path, sig_name);
-      return;
-    }
-  }
 
   if (!compiled_rules) {
     out->inconclusive = true;
@@ -2297,6 +2265,70 @@ static void analyze_fd(int fd, const char *path, const char *sha256_hex,
       out->inconclusive = true;
     }
   }
+}
+
+/*
+ * Analysis half of a scan: SHA-256, exact-signature lookup, then the content
+ * detectors (analyze_content(): YARA, ssdeep, TLSH). Everything in here
+ * consumes the bytes of the file behind `fd` and produces only a verdict in
+ * `out` - it never quarantines, touches verdict history or metrics, or
+ * otherwise acts on the machine. That is deliberate (#103): perform_scan()
+ * below acts on the result.
+ *
+ * The split inside is the Stage 1 seam. SHA-256 and the signature lookup stay
+ * in the calling (privileged) process: the digest ends up in quarantine
+ * metadata so a worker must not supply it, and the signature snapshot is
+ * live. analyze_content() is what a worker runs.
+ *
+ * `fd` must already be open for reading (and, for a kernel-triggered scan,
+ * `sha256_hex` is the kernel's precomputed digest). On return `fd`'s
+ * offset is wherever the last analysis step left it; a MALICIOUS verdict
+ * returns immediately after the step that convicted, which is the state
+ * quarantine_file() has always seen.
+ */
+static void analyze_fd(int fd, const char *path, const char *sha256_hex,
+                       uint32_t pid, bool on_demand, struct scan_result *out) {
+  char sha256_buf[65] = "";
+  const char *hash;
+
+  memset(out, 0, sizeof(*out));
+  out->verdict = AV_VERDICT_CLEAN;
+
+  if (sha256_hex && sha256_hex[0])
+    hash = sha256_hex;
+  else if (sha256_fd(fd, sha256_buf) == 0)
+    hash = sha256_buf;
+  else {
+    hash = ""; /* on-demand scan of a file sha256_fd() couldn't hash -
+               * proceed without one rather than failing the scan
+               * over it */
+    /* The signature lookup below is skipped without a hash, and the
+     * failure can be transient (dup() hitting EMFILE, a read error) -
+     * a CLEAN from this run must not be cached. */
+    out->inconclusive = true;
+  }
+  /* Recorded here rather than after the scan so the acting half
+   * (perform_scan) sees the digest the analysis actually used. */
+  snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
+
+  /* Exact-hash signatures first (#176): the kernel's sigtable is
+   * normally matched post-exec by the bprm_check kprobe, which can only
+   * kill. With the fanotify listener holding the exec, avd matches the
+   * same SHA-256 entries here so a known-bad image is refused before it
+   * runs. The snapshot is empty unless fanotify enforcement is active
+   * (see fan_sigs_refresh()), so this is a no-op otherwise. */
+  if (hash[0]) {
+    char sig_name[AV_RULE_NAME_MAXLEN + 1];
+
+    if (fan_sig_lookup(hash, sig_name, sizeof(sig_name))) {
+      out->verdict = AV_VERDICT_MALICIOUS;
+      snprintf(out->rule_name, sizeof(out->rule_name), "Sig:%.58s", sig_name);
+      printf("avd: SIGNATURE MATCH \"%s\" -> \"%s\"\n", path, sig_name);
+      return;
+    }
+  }
+
+  analyze_content(fd, path, hash, pid, on_demand, out);
 }
 
 /*

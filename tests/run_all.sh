@@ -61,6 +61,11 @@ echo "### test_fan_parse.sh (fanotify mountinfo/signature parsers, #176) ###"
 "$REPO_ROOT/tests/test_fan_parse.sh" || FAIL=1
 
 echo
+echo "### test_privsep_proto.sh (worker IPC reply validation, #103) ###"
+# Same no-root-needed reasoning as test_fan_parse.sh above.
+"$REPO_ROOT/tests/test_privsep_proto.sh" || FAIL=1
+
+echo
 echo "### test_avd_no_exec.sh (avd never execs - fanotify re-entrancy guard) ###"
 # No root needed: inspects the built binary's dynamic imports.
 "$REPO_ROOT/tests/test_avd_no_exec.sh" || FAIL=1

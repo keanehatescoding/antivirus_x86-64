@@ -31,13 +31,14 @@ PC_LIBS   := $(shell $(PKG_CONFIG) --libs libnl-genl-3.0 yara 2>/dev/null) \
 # fan_parse.h, sha256.h, tlsh_*.h, ...), so a header edit rebuilds.
 AVD_HEADERS    := $(wildcard $(AVD_DIR)/*.h)
 
-HEADER_TARGETS := fuzz_fan_parse fuzz_control_parse
+HEADER_TARGETS := fuzz_fan_parse fuzz_control_parse fuzz_privsep_reply
 AVD_TARGETS    := fuzz_control_line
 TARGETS        := $(HEADER_TARGETS) $(AVD_TARGETS)
 
 all: $(TARGETS)
 
-$(HEADER_TARGETS): %: %.c $(AVD_DIR)/control_parse.h $(AVD_DIR)/fan_parse.h
+$(HEADER_TARGETS): %: %.c $(AVD_DIR)/control_parse.h $(AVD_DIR)/fan_parse.h \
+                   $(AVD_DIR)/privsep_proto.h
 	$(CLANG) $(CFLAGS) $(SAN) -I$(AVD_DIR) -o $@ $<
 
 $(AVD_TARGETS): %: %.c $(AVD_DIR)/avd.c $(AVD_DIR)/sha256.c \
