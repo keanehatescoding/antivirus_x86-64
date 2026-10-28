@@ -1,9 +1,12 @@
 # avd privilege separation (design sketch for #103)
 
 Status: Stage 0 is merged (#200). Stage 1 is being built in slices: the
-wire format and reply validation (`userspace/avd/privsep_proto.h`) and the
-parent/content split inside `analyze_fd()` are in; the spawner, the hardened
-worker and `AVD_PRIVSEP` are not yet. Stage 2 is design only. Written against
+wire format and reply validation (`userspace/avd/privsep_proto.h`), the
+parent/content split inside `analyze_fd()`, and the worker side
+(`userspace/avd/privsep_worker.h`: the hardening sequence, the seccomp
+filter and the request/reply loop, tested standalone) are in; the spawner, the
+parent-side dispatch and `AVD_PRIVSEP` are not yet. Stage 2 is design only.
+Written against
 master at `08ff847` and revised after review of #199.
 
 ## Problem
@@ -254,27 +257,43 @@ value. Any failure ends the child with `_exit(1)` before it reports ready on
 its socket; the spawner then replies `FAILED`, so no request is ever sent to
 a worker that has not reported ready.
 
-1. rlimits: `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE=0` and a small
+1. close every inherited fd except the IPC socket (and one log fd if used)
+2. rlimits: `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE=0` and a small
    `RLIMIT_NOFILE` (not `RLIMIT_NPROC`: seccomp already forbids `fork`, and a
    low NPROC set before `setuid` is a known way to make `setuid` misbehave)
-2. close every inherited fd except the IPC socket (and one log fd if used)
-3. `setgroups(0)`, then `setresgid` and `setresuid` to the dedicated user
+3. empty the bounding set
+4. `setgroups(0)`, then `setresgid` and `setresuid` to the dedicated user
    (for example `hyprav-scan`, declared next to the existing group in
    `packaging/hyprav.sysusers` and its Debian twin), then confirm that
    `setuid(0)` now fails
-4. empty the bounding set, then clear the permitted, effective and
-   inheritable sets
-5. `prctl(PR_SET_NO_NEW_PRIVS, 1)`, then `prctl(PR_SET_PDEATHSIG, SIGKILL)`,
-   then read it back with `PR_GET_PDEATHSIG` and require `SIGKILL`, then
-   require `getppid()` to equal the pid the spawner recorded before the
-   `fork()`
-6. install the seccomp allowlist last
+5. clear the permitted, effective and inheritable sets, and read them back
+6. `prctl(PR_SET_NO_NEW_PRIVS, 1)`
+7. `prctl(PR_SET_PDEATHSIG, SIGKILL)`, then read it back with
+   `PR_GET_PDEATHSIG` and require `SIGKILL`, then require `getppid()` to equal
+   the pid the spawner recorded before the `fork()`
+8. install the seccomp allowlist last
+
+Two of these differ from the first draft of this document, both found while
+implementing `privsep_worker.h`:
+
+- The bounding set (3) is emptied *before* the credential change (4), not
+  after. `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective set, and
+  changing the real, effective and saved uid away from 0 clears it, so the
+  drop fails with `EPERM` if it comes second. The tests check this: swapping
+  the two makes hardening fail at the bounding-set step.
+- Descriptors are closed (1) *before* the rlimits (2). On a kernel without
+  `close_range()` the fallback walks descriptor numbers up to the current
+  `RLIMIT_NOFILE`, which would miss open descriptors above a limit that had
+  already been lowered.
+
+`ps_worker_harden()` returns the number of the step that failed (and leaves
+`errno`), so the spawner can say which one in `FAILED`.
 
 The parent-death signal needs both the order and the handshake above:
 
 - The kernel clears it whenever a process changes its effective or
   filesystem uid or gid (tried here: set, then `setresuid()`, and
-  `PR_GET_PDEATHSIG` reads back 0). So it is set *after* step 3, never
+  `PR_GET_PDEATHSIG` reads back 0). So it is set *after* step 4, never
   before, and read back so that a later reordering fails closed instead of
   silently leaving orphans.
 - Setting it is not enough by itself. If the spawner died before the child
@@ -382,10 +401,28 @@ Default action kill. Expected contents: `read`, `pread64`, `lseek`,
 the IPC socket, `clock_gettime`, `clock_nanosleep`, `rt_sig*`, `getrandom`,
 `exit_group`. Explicitly absent: `open*`, `socket`, `connect`, `execve*`,
 `clone`/`fork`, `ptrace`, `kill`, anything that writes the filesystem. The
-real list must come from tracing the test suite and a YARA scan with the
-shipped rules, not from this guess. libseccomp is not currently a dependency;
-either add it or emit the BPF program by hand (a short, auditable filter for
-this list).
+real list must come from tracing a YARA scan with the shipped rules, and
+that has not been done: `privsep_worker.h` implements the list above, tested
+against a scan callback that uses only `pread` and large `malloc`/`free`, not
+against libyara itself. Expect to add to it when the scan is wired in.
+
+The filter is emitted by hand rather than through libseccomp, which keeps it
+a dependency-free, auditable program of about 40 instructions
+(`ps_seccomp_build()`), and which is what lets it be tested exhaustively in
+userspace: the tests run it through a small classic-BPF interpreter for every
+syscall number on several architecture values. It is tighter than a plain
+name list in three ways:
+
+- the architecture must be x86-64 and the x32 bit clear; anything else is
+  killed (x86-64 only for now, see #105)
+- `sendmsg` and `recvmsg` are allowed only on exactly the IPC descriptor,
+  comparing all 64 bits of the argument, so a compromised worker cannot use
+  them on any other descriptor
+- `newfstatat` is allowed only with `AT_EMPTY_PATH`, so it can describe an
+  open descriptor but not probe paths (a seccomp filter cannot inspect the
+  path argument itself, so this restricts the flag, not the path)
+
+The default action is `SECCOMP_RET_KILL_PROCESS`.
 
 #### Seccomp filters stack
 
