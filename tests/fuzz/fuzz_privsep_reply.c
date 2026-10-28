@@ -56,6 +56,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   memset(&v, 0xA5, sizeof(v));
   ok = ps_reply_validate(data, size, expect, &v);
 
+  /* The request side shares the header checks. This runs before the reply
+   * path returns: a request is 16 bytes and an accepted reply is 112, so
+   * after that return a request could never be seen here. */
+  {
+    uint64_t id = 0;
+    struct ps_request rq;
+
+    if (ps_request_parse(data, size, &id)) {
+      REQUIRE(size == sizeof(struct ps_request));
+      memcpy(&rq, data, sizeof(rq));
+      REQUIRE(rq.magic == PS_MAGIC && rq.version == PS_VERSION);
+      REQUIRE(id == rq.request_id);
+    } else {
+      REQUIRE(id == 0); /* nothing written on rejection */
+    }
+  }
+
   if (!ok) {
     REQUIRE(is_failure(&v));
     return 0;
@@ -73,13 +90,5 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   REQUIRE(i < PS_RULE_NAME_SIZE);
   for (; i < PS_RULE_NAME_SIZE; i++)
     REQUIRE(v.rule_name[i] == '\0'); /* nothing after the NUL survives */
-
-  /* The request side shares the header checks. */
-  {
-    uint64_t id;
-
-    if (ps_request_parse(data, size, &id))
-      REQUIRE(size == sizeof(struct ps_request));
-  }
   return 0;
 }
