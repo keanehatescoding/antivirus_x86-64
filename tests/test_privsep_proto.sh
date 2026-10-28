@@ -142,6 +142,25 @@ int main(void) {
           "oversized reply");
     CHECK(!ps_reply_validate(&r, sizeof(r), ID + 1, &v) && is_failure(&v),
           "wrong request id (a late reply for an earlier scan)");
+    {
+        int bit, all = 1;
+        /* One flipped bit in each byte of the id, in both directions: a
+         * comparison of only part of the 64-bit id would pass the ID + 1
+         * check above and still fail one of these. */
+        for (bit = 0; bit < 64; bit += 8) {
+            good_reply(&r);
+            if (ps_reply_validate(&r, sizeof(r), ID ^ (1ull << bit), &v) ||
+                !is_failure(&v))
+                all = 0;
+            good_reply(&r); r.request_id = ID ^ (1ull << (bit + 7));
+            if (ps_reply_validate(&r, sizeof(r), ID, &v) || !is_failure(&v))
+                all = 0;
+        }
+        CHECK(all, "id differing only in any single byte, high bytes included");
+        good_reply(&r); r.request_id = ID ^ (1ull << 40);
+        CHECK(!ps_reply_validate(&r, sizeof(r), ID, &v) && is_failure(&v),
+              "id differing only at bit 40");
+    }
     good_reply(&r); r.magic = 0;
     CHECK(!ps_reply_validate(&r, sizeof(r), ID, &v) && is_failure(&v), "bad magic");
     good_reply(&r); r.version = PS_VERSION + 1;

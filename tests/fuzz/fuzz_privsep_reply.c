@@ -73,6 +73,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
   }
 
+  /* An id that differs anywhere in its 64 bits must be rejected, whatever
+   * else the reply holds: a comparison of only part of the id would let a
+   * late reply for another scan through. */
+  if (size == sizeof(struct ps_reply)) {
+    struct ps_verdict w;
+    int b;
+
+    for (b = 0; b < 64; b += 13) {
+      memset(&w, 0xA5, sizeof(w));
+      REQUIRE(!ps_reply_validate(data, size, expect ^ (1ull << b), &w));
+      REQUIRE(is_failure(&w));
+    }
+  }
+
   if (!ok) {
     REQUIRE(is_failure(&v));
     return 0;
