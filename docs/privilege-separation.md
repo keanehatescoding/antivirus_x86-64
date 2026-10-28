@@ -1,8 +1,10 @@
 # avd privilege separation (design sketch for #103)
 
-Status: proposal. Stage 0 is proposed in #200 (open, not merged); stages 1
-and 2 are design only. Written against master at `08ff847` and revised after review
-of #199.
+Status: Stage 0 is merged (#200). Stage 1 is being built in slices: the
+wire format and reply validation (`userspace/avd/privsep_proto.h`) and the
+parent/content split inside `analyze_fd()` are in; the spawner, the hardened
+worker and `AVD_PRIVSEP` are not yet. Stage 2 is design only. Written against
+master at `08ff847` and revised after review of #199.
 
 ## Problem
 
@@ -96,18 +98,17 @@ tests below check them.
 
 ### Stage 0: split analysis from action (no behaviour change)
 
-Proposed in #200, which is open and not merged: on master today there is no
-`analyze_fd()` and `perform_scan()` calls `quarantine_file()` from four
-places. With #200, `perform_scan()` becomes `analyze_fd()` (SHA-256,
+Merged in #200: `perform_scan()` is `analyze_fd()` (SHA-256,
 signature lookup, YARA, ssdeep, TLSH; fills a `struct scan_result`) plus an
 acting half that quarantines once, then records metrics and history. The four
-inline `quarantine_file()` calls become one, after the analysis, and contract
+inline `quarantine_file()` calls became one, after the analysis, and contract
 1 is untouched because `perform_scan()` still returns only after the
 quarantine.
 
-Stage 0 deliberately leaves the SHA-256 and signature lookup inside
-`analyze_fd()`. Stage 1 moves them out (see below); doing that later keeps
-#200 a pure refactor.
+Stage 0 deliberately left the SHA-256 and signature lookup inside
+`analyze_fd()` so #200 stayed a pure refactor. Stage 1 separates them (see
+below): `analyze_fd()` now does the hash and signature lookup itself and hands
+the rest to `analyze_content()`, which is the part a worker will run.
 
 ### Stage 1: unprivileged scan worker processes
 
