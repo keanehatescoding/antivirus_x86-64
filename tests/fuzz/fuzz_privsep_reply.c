@@ -60,7 +60,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
    * path returns: a request is 16 bytes and an accepted reply is 112, so
    * after that return a request could never be seen here. */
   {
-    uint64_t id = 0;
+    const uint64_t sentinel = UINT64_C(0xA5A5A5A5A5A5A5A5);
+    uint64_t id = sentinel;
     struct ps_request rq;
 
     if (ps_request_parse(data, size, &id)) {
@@ -69,7 +70,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       REQUIRE(rq.magic == PS_MAGIC && rq.version == PS_VERSION);
       REQUIRE(id == rq.request_id);
     } else {
-      REQUIRE(id == 0); /* nothing written on rejection */
+      REQUIRE(id == sentinel); /* nothing written on rejection */
     }
   }
 
