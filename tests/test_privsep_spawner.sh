@@ -102,7 +102,22 @@ static void dump_fds(pid_t pid) {
     }
     closedir(d);
 }
+static int fds_of_raw(pid_t pid);
+/* The spawner sends READY and only then closes its own copy of the worker
+ * socket, so a count taken the instant READY arrives can include that
+ * descriptor for a moment. Wait until two reads agree. */
 static int fds_of(pid_t pid) {
+    int prev = fds_of_raw(pid);
+    for (int i = 0; i < 50; i++) {
+        int cur;
+        usleep(20 * 1000);
+        cur = fds_of_raw(pid);
+        if (cur == prev) return cur;
+        prev = cur;
+    }
+    return prev;
+}
+static int fds_of_raw(pid_t pid) {
     char p[64];
     snprintf(p, sizeof(p), "/proc/%d/fd", (int)pid);
     return count_fds_dir(p, false);
@@ -615,6 +630,14 @@ static void test_wire_recv(void) {
               errno == EAGAIN,
           "MSG_DONTWAIT on an empty channel reports EAGAIN");
 
+    /* A write-half-closed peer will never send again, so it is EOF. Reporting
+     * it as malformed would leave the socket readable forever and spin any
+     * loop that drops malformed messages. (Run after the EAGAIN check above:
+     * once the peer half-closes, recvmsg() returns 0 instead of EAGAIN.) */
+    CHECK(shutdown(sv[0], SHUT_WR) == 0, "the peer can half-close its write side");
+    CHECK(ps_ctl_recv(sv[1], PS_FROM_SPAWNER, 0, &m, &got) == PS_CTL_EOF,
+          "a write-half-closed peer is EOF, not malformed");
+
     CHECK(count_fds() == before, "no descriptor leaked across all of the above");
 
     close(sv[0]);
@@ -1009,6 +1032,7 @@ static void test_hostile_main(void) {
           "a good SPAWN after a run of bad messages is still served");
     /* (801's socket stays open in the queue, so that worker stays alive) */
     after = fds_of(sp);
+    if (after != before) { printf("    spawner fds: before %d, after %d\n", before, after); dump_fds(sp); }
     CHECK(after == before, "no descriptor attached to a rejected message is kept");
     {
         int n = child_stats(sp, &z);
@@ -1048,6 +1072,42 @@ static void test_shutdown(void) {
     CHECK(all, "and every worker was killed with SIGKILL first");
     reset_queues();
     while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+
+    /* Main half-closes its end (write side only): no more commands can ever
+     * arrive, so this is a shutdown too, and must not leave the spawner
+     * spinning on a socket that is readable forever. */
+    {
+        int c2, st2 = 0;
+        pid_t s2, w2;
+        unsigned long t0, t1;
+
+        NSCRIPT = 0;
+        start_stubbed(&cfg, &c2, &s2);
+        send_spawn(c2, 950);
+        if (wait_reply(c2, 950, 5000) >= 0) {
+            w2 = REPLY[find_reply(950)].pid;
+            shutdown(c2, SHUT_WR);
+            t0 = cpu_ticks(s2);
+            usleep(500 * 1000);
+            t1 = cpu_ticks(s2);
+            CHECK(waitpid(s2, &st2, WNOHANG) == s2 || t1 - t0 < 10,
+                  "a half-closed channel does not spin the spawner");
+            if (waitpid(s2, &st2, WNOHANG) != s2) waitpid(s2, &st2, 0);
+            CHECK(WIFEXITED(st2) && WEXITSTATUS(st2) == 0,
+                  "and shuts it down in order (exit 0)");
+            {
+                int ws = 0;
+                CHECK(waitpid(w2, &ws, 0) == w2 && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL,
+                      "killing its worker first");
+            }
+        } else {
+            CHECK(false, "a worker for the half-close test");
+        }
+        close(c2);
+        reset_queues();
+        while (waitpid(-1, NULL, WNOHANG) > 0) {
+        }
     }
 
     /* Main dies: a grandchild "main" starts the spawner and exits at once. */
@@ -1129,9 +1189,17 @@ static void test_limits(void) {
     /* A: the worker table fills, then frees up. */
     NSCRIPT = 0;
     start_stubbed(&cfg, &ctl, &sp);
-    for (uint64_t r = 1; r <= 4; r++) send_spawn(ctl, r);
-    for (uint64_t r = 1; r <= 4; r++) (void)wait_reply(ctl, r, 5000);
-    CHECK(find_reply(4) >= 0 && REPLY[find_reply(4)].type == PS_MSG_READY,
+    /* One at a time: this binary also limits simultaneous spawns to 3, so
+     * four back-to-back SPAWNs could be refused for that reason, depending on
+     * how quickly the first ones become ready. */
+    for (uint64_t r = 1; r <= 4; r++) {
+        send_spawn(ctl, r);
+        (void)wait_reply(ctl, r, 5000);
+    }
+    CHECK(find_reply(4) >= 0 && REPLY[find_reply(4)].type == PS_MSG_READY &&
+              find_reply(1) >= 0 && REPLY[find_reply(1)].type == PS_MSG_READY &&
+              find_reply(2) >= 0 && REPLY[find_reply(2)].type == PS_MSG_READY &&
+              find_reply(3) >= 0 && REPLY[find_reply(3)].type == PS_MSG_READY,
           "four workers fit");
     t0 = ps_now_ms();
     send_spawn(ctl, 5);

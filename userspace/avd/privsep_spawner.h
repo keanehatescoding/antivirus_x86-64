@@ -47,6 +47,10 @@
 
 #include "privsep_worker.h"
 
+#ifndef POLLRDHUP /* only visible with _GNU_SOURCE, which a header cannot set */
+#define POLLRDHUP 0x2000
+#endif
+
 /* ------------------------------------------------------------------------
  * Control channel wire format
  * ------------------------------------------------------------------------ */
@@ -254,13 +258,16 @@ ps_ctl_recv(int sock, enum ps_ctl_from from, int flags, struct ps_ctl_msg *m,
   }
 
   if (len == 0 && nfds == 0 && !(msg.msg_flags & MSG_CTRUNC)) {
-    /* recvmsg() returns 0 both when the peer has closed and for a zero-length
-     * SEQPACKET record, which a peer can send while keeping its end open.
-     * Only a hangup is EOF; an empty record is a malformed message and must
-     * not be taken as an instruction to shut down. */
-    struct pollfd hup = {.fd = sock, .events = 0};
+    /* recvmsg() returns 0 both when the peer has gone away and for a
+     * zero-length SEQPACKET record, which a peer can send while keeping its
+     * end open. EOF means the peer will send nothing more: a full close
+     * (POLLHUP) or a write-side shutdown (POLLRDHUP). An empty record is a
+     * malformed message and must not be taken as an instruction to shut
+     * down. A half-closed peer must be EOF, not malformed: its socket stays
+     * readable forever, so dropping it as malformed would spin the loop. */
+    struct pollfd hup = {.fd = sock, .events = POLLRDHUP};
 
-    if (poll(&hup, 1, 0) > 0 && (hup.revents & POLLHUP))
+    if (poll(&hup, 1, 0) > 0 && (hup.revents & (POLLHUP | POLLRDHUP)))
       return PS_CTL_EOF;
   }
 
