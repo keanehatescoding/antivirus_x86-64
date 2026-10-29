@@ -2,10 +2,15 @@
 
 Status: Stage 0 is merged (#200). Stage 1 is being built in slices: the
 wire format and reply validation (`userspace/avd/privsep_proto.h`), the
-parent/content split inside `analyze_fd()`, and the worker side
+parent/content split inside `analyze_fd()`, the worker side
 (`userspace/avd/privsep_worker.h`: the hardening sequence, the seccomp
-filter and the request/reply loop, tested standalone) are in; the spawner, the
-parent-side dispatch and `AVD_PRIVSEP` are not yet. Stage 2 is design only.
+filter and the request/reply loop) and the spawner with its control channel
+(`userspace/avd/privsep_spawner.h`: `SPAWN`/`KILL`/`READY`/`FAILED`/`EXITED`,
+the `poll()` + `signalfd` loop, reaping, the worker readiness report), all
+tested standalone, are in. Still to come: the spawner's own capability drop
+and seccomp superset filter, the parent-side dispatch (reader thread, request
+table, the `/proc/<pid>/status` check, canonical failure on any anomaly) and
+`AVD_PRIVSEP`. Stage 2 is design only.
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -209,6 +214,43 @@ The spawner:
 
 This also answers "who keeps the bootstrap capabilities for respawns": the
 spawner does, and the main process does not need them (Stage 2).
+
+**As implemented (`privsep_spawner.h`).** The behaviour above is in, with
+these details worth knowing that the sketch did not say:
+
+- One fixed 40-byte struct carries every message in both directions, and each
+  receiver validates it per sender class: a type that sender may not send,
+  a field that type does not use being non-zero, a `READY` without exactly one
+  descriptor, or a descriptor on anything else is malformed, and every
+  descriptor that arrived is closed. Malformed input from main is dropped (the
+  channel is `SEQPACKET`, so there is no stream to resynchronise, and nobody
+  to answer).
+- The worker's readiness report is the same struct with type `WORKER_READY`,
+  sent with `sendmsg()` on the IPC descriptor, which is the one send call the
+  worker filter allows.
+- A hardening failure is reported through the worker's exit code,
+  `64 + step`, and decoded when the spawner reaps it, so `FAILED` carries the
+  step number. Any other exit before ready, including code 64 itself and
+  codes past the last step, is `FAILED(EXITED)` with the raw wait status.
+  Besides `FORK`, `HARDEN` and `TIMEOUT` there are `EXITED`, `PROTOCOL` (a
+  malformed ready report) and `RESOURCE` (`socketpair()` failed or a table is
+  full).
+- A pending worker whose socket reaches EOF is not failed on the spot: the
+  exit status, which names the hardening step, arrives with `SIGCHLD`, and
+  the startup deadline covers a worker that closed its socket and kept
+  running. The closed socket is also dropped from the `poll()` set, because a
+  closed `SEQPACKET` peer reports `POLLHUP` forever and would spin the loop.
+- Pending and live workers share one budget (256) with a smaller bound on
+  simultaneous spawns (64), so a pending worker can always be promoted. A
+  `SPAWN` over either bound is answered `FAILED(RESOURCE)` immediately.
+- A worker is named by `worker_id` only after `READY`, so a `KILL` can only
+  name a live worker. A pending one is bounded by the startup timeout.
+- The spawner's replies are blocking sends. If main stops draining the
+  channel the spawner stalls, which is why the reader thread in main must
+  always drain it, and why a send failure ends the spawner (main is gone).
+- The pid the worker compares `getppid()` against is recorded by the spawner
+  before `fork()`. Reading it in the child would also accept a spawner that
+  had already died and orphaned it.
 
 **Reaping and lifecycle.** The spawner is the parent of every worker, so it is
 the only process that can reap them, and it must. It blocks `SIGCHLD` and
@@ -498,6 +540,20 @@ and syscalls.
 - Worker count follows the existing scan pool size.
 
 ## Tests
+
+`tests/test_privsep_spawner.sh` covers the spawner and its channel: the
+message validation matrix and descriptor handling; spawn, round trip over the
+passed socket, `KILL`, `EXITED`; every failure reason; concurrent spawns
+answered out of order; reaping with no zombies and a stable descriptor set
+after churn; the spawner holding only its channel, the signalfd and stderr;
+orderly shutdown and parent death; the table limits; and, as root, real
+workers with real hardening read back from `/proc/<pid>/status`, a failure
+injected at each step, and the worker dying with the spawner. In the list
+below that covers the failure-injection, concurrent-`SPAWN`, zombie, spawner
+descriptor, `EXITED` status, spawner/avd death and rejected-`SCM_RIGHTS`
+items for the spawner side. The parent-side items (late replies, respawn
+under concurrent scans, the `/proc` check, `AVD_PRIVSEP=1`) arrive with the
+dispatch slice.
 
 - hardening failure injection: make each step (setuid, capset, seccomp, ...)
   fail in a test build; the worker must exit without reporting ready and the

@@ -37,6 +37,19 @@ SYMS='execl|execle|execlp|execv|execve|execvp|execvpe|fexecve|execveat|fork|vfor
 #   imports "magic" at all.
 ALLOW_LIBS='^libmagic\.so'
 
+# Source files allowed to call plain fork(), and nothing else exec-family
+# (#103). The privilege-separation spawner forks scan workers and never execs
+# them: a forked child that does not exec raises no FAN_OPEN_EXEC_PERM event,
+# so the re-entrancy argument above does not apply to it, and the design needs
+# the children to inherit the compiled rules copy-on-write, which an exec
+# would throw away (docs/privilege-separation.md, "The spawner"). Every
+# exec/spawn/system/popen/vfork/clone call stays banned in these files too.
+# Keyed on the file's basename. This allowlist covers the source scan only:
+# the import checks above still require avd itself to import no fork symbol,
+# so the slice that links the spawner into avd must revisit them deliberately.
+FORK_ALLOW_SRC='^privsep_spawner\.h$'
+SYMS_NO_FORK='execl|execle|execlp|execv|execve|execvp|execvpe|fexecve|execveat|vfork|_Fork|clone3?|system|popen|posix_spawnp?|wordexp'
+
 PASS=0
 FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -96,8 +109,17 @@ echo "=== sources ==="
 # then dropped crudely. Not grep -w: that also demands a non-word
 # character after the match, which ends in "(", so it would miss
 # execve(path, ...) and system(cmd) and only catch fork().
-hits="$(grep -nE "(^|[^[:alnum:]_])($SYMS)[[:space:]]*\(" "$AVD_DIR"/*.c "$AVD_DIR"/*.h |
-        grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+hits=""
+for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
+    syms="$SYMS"
+    if basename "$f" | grep -Eq "$FORK_ALLOW_SRC"; then
+        syms="$SYMS_NO_FORK"
+    fi
+    found="$(grep -nHE "(^|[^[:alnum:]_])($syms)[[:space:]]*\(" "$f" |
+             grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+    [ -n "$found" ] && hits+="$found"$'\n'
+done
+hits="${hits%$'\n'}"
 if [ -z "$hits" ]; then
     pass "no exec/fork/spawn-family call in userspace/avd sources"
 else

@@ -13,10 +13,10 @@
  *   ps_worker_run()     the request/reply loop: one SCM_RIGHTS fd in, one
  *                       fixed-size struct ps_reply out
  *
- * Nothing here is wired into avd yet. The spawner that forks workers, the
- * readiness report and the parent-side dispatch arrive in the next slices;
- * the scan itself plugs in as a callback so this header never needs YARA,
- * ssdeep or TLSH.
+ * Nothing here is wired into avd yet. The spawner that forks workers and the
+ * readiness report live in privsep_spawner.h (Stage 1c); the parent-side
+ * dispatch arrives in the next slice. The scan itself plugs in as a callback
+ * so this header never needs YARA, ssdeep or TLSH.
  *
  * x86-64 only: the seccomp filter checks AUDIT_ARCH_X86_64 and kills anything
  * else (including x32 syscall numbers). A port (#105) must add its own table.
