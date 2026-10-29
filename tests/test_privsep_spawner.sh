@@ -600,6 +600,16 @@ static void test_wire_recv(void) {
     CHECK(ps_ctl_recv(sv[1], PS_FROM_SPAWNER, 0, &m, &got) == PS_CTL_OK && m.type == PS_MSG_EXITED,
           "a valid message after a run of malformed ones is still accepted");
 
+    /* recvmsg() returns 0 for an empty SEQPACKET record just as it does for
+     * a closed peer; with the peer still open it must not read as EOF. */
+    (void)!send(sv[0], "", 0, MSG_NOSIGNAL);
+    CHECK(ps_ctl_recv(sv[1], PS_FROM_SPAWNER, 0, &m, &got) == PS_CTL_BAD,
+          "a zero-length record from a live peer is malformed, not EOF");
+    m = canon(PS_MSG_EXITED);
+    ps_ctl_send(sv[0], &m, -1);
+    CHECK(ps_ctl_recv(sv[1], PS_FROM_SPAWNER, 0, &m, &got) == PS_CTL_OK,
+          "and the channel is still usable afterwards");
+
     errno = 0;
     CHECK(ps_ctl_recv(sv[1], PS_FROM_SPAWNER, MSG_DONTWAIT, &m, &got) == PS_CTL_ERROR &&
               errno == EAGAIN,
@@ -815,6 +825,71 @@ static void test_failures(void) {
     CHECK(wait_reply(ctl, 602, 5000) >= 0 && REPLY[find_reply(602)].type == PS_MSG_READY,
           "and the next spawn succeeds again");
     stop_spawner(ctl, sp);
+
+    /* socketpair() failure is reported as RESOURCE, like a full table. */
+    ps_spawner_test_fail_socketpair = 2;
+    start_stubbed(&cfg, &ctl, &sp);
+    ps_spawner_test_fail_socketpair = 0;
+    send_spawn(ctl, 650);
+    send_spawn(ctl, 651);
+    send_spawn(ctl, 652);
+    CHECK(wait_reply(ctl, 650, 5000) >= 0 && REPLY[find_reply(650)].type == PS_MSG_READY,
+          "the first spawn succeeds");
+    i = wait_reply(ctl, 651, 5000);
+    CHECK(i >= 0 && REPLY[i].type == PS_MSG_FAILED && REPLY[i].reason == PS_FAIL_RESOURCE &&
+              REPLY[i].detail == EMFILE,
+          "a failing socketpair() is FAILED(RESOURCE, errno)");
+    CHECK(wait_reply(ctl, 652, 5000) >= 0 && REPLY[find_reply(652)].type == PS_MSG_READY,
+          "and the next spawn succeeds again");
+    CHECK(children_settle(sp, 2, 3000), "no stray child from the failed spawn");
+    stop_spawner(ctl, sp);
+}
+
+/* The caller's SIGCHLD disposition is inherited by the spawner. Ignored (or
+ * SA_NOCLDWAIT) it would make the kernel reap workers itself, and EXITED would
+ * never arrive. */
+static void test_inherited_sigchld(void) {
+    struct ps_spawner_cfg cfg = base_cfg();
+    static const char *name[] = {"SIG_IGN", "SA_NOCLDWAIT"};
+
+    printf("\nspawner: an inherited SIGCHLD disposition does not stop reaping\n");
+    for (int variant = 0; variant < 2; variant++) {
+        struct sigaction sa, restore;
+        int ctl, r;
+        pid_t sp;
+        char label[96];
+
+        memset(&sa, 0, sizeof(sa));
+        sigemptyset(&sa.sa_mask);
+        if (variant == 0) {
+            sa.sa_handler = SIG_IGN;
+        } else {
+            sa.sa_handler = SIG_DFL;
+            sa.sa_flags = SA_NOCLDWAIT;
+        }
+        NSCRIPT = 0;
+        sigaction(SIGCHLD, &sa, &restore); /* inherited across the fork */
+        start_stubbed(&cfg, &ctl, &sp);
+        sigaction(SIGCHLD, &restore, NULL);
+
+        send_spawn(ctl, 1000 + (uint64_t)variant);
+        r = wait_reply(ctl, 1000 + (uint64_t)variant, 5000);
+        if (r >= 0 && REPLY[r].type == PS_MSG_READY) {
+            uint64_t wid = REPLY[r].worker_id;
+            int i;
+
+            send_kill(ctl, wid);
+            i = wait_exit(ctl, wid, 3000);
+            snprintf(label, sizeof(label),
+                     "with %s inherited, KILL still produces EXITED with the SIGKILL status",
+                     name[variant]);
+            CHECK(i >= 0 && WIFSIGNALED(EXITS[i].detail) && WTERMSIG(EXITS[i].detail) == SIGKILL,
+                  label);
+        } else {
+            CHECK(false, "a worker to kill");
+        }
+        stop_spawner(ctl, sp);
+    }
 }
 
 static void test_concurrent(void) {
@@ -915,6 +990,7 @@ static void test_hostile_main(void) {
     before = fds_of(sp);
 
     (void)!send(ctl, "garbage", 7, MSG_NOSIGNAL);
+    (void)!send(ctl, "", 0, MSG_NOSIGNAL); /* must not look like EOF */
     tmp = make_file("x");
     m = canon(PS_MSG_SPAWN);
     ps_ctl_send(ctl, &m, tmp);                  /* SPAWN carrying a descriptor */
@@ -1013,6 +1089,7 @@ int main(void) {
     test_wire_recv();
     test_spawn_basic();
     test_failures();
+    test_inherited_sigchld();
     test_concurrent();
     test_churn();
     test_hostile_main();
@@ -1133,11 +1210,20 @@ cat > "$BUILD_DIR/kern.c" <<'EOF'
 
 #define WORKER_UID 65534
 
+/* Hardening needs these in the EFFECTIVE set: a root process whose bounding
+ * set holds them but whose effective set does not would pass a bounding-set
+ * check and then fail at the first credential step instead of skipping. */
+static bool have_cap(int cap) {
+    struct __user_cap_header_struct h = {.version = _LINUX_CAPABILITY_VERSION_3};
+    struct __user_cap_data_struct d[2];
+
+    if (syscall(SYS_capget, &h, d) < 0) return false;
+    return (d[cap / 32].effective >> (cap % 32)) & 1u;
+}
+
 static bool can_spawn_hardened(void) {
-    return geteuid() == 0 && prctl(PR_CAPBSET_READ, CAP_SETUID) == 1 &&
-           prctl(PR_CAPBSET_READ, CAP_SETGID) == 1 &&
-           prctl(PR_CAPBSET_READ, CAP_SETPCAP) == 1 &&
-           prctl(PR_CAPBSET_READ, CAP_KILL) == 1;
+    return geteuid() == 0 && have_cap(CAP_SETUID) && have_cap(CAP_SETGID) &&
+           have_cap(CAP_SETPCAP) && have_cap(CAP_KILL);
 }
 
 static bool status_field(pid_t pid, const char *key, char *out, size_t cap) {

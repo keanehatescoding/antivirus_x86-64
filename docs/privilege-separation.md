@@ -215,8 +215,10 @@ The spawner:
 This also answers "who keeps the bootstrap capabilities for respawns": the
 spawner does, and the main process does not need them (Stage 2).
 
-**As implemented (`privsep_spawner.h`).** The behaviour above is in, with
-these details worth knowing that the sketch did not say:
+**As implemented (`privsep_spawner.h`).** The behaviour above is in, except
+the spawner's own capability drop and seccomp superset filter, which are not
+implemented yet (see Status). These details are worth knowing that the sketch
+did not say:
 
 - One fixed 40-byte struct carries every message in both directions, and each
   receiver validates it per sender class: a type that sender may not send,
@@ -235,6 +237,13 @@ these details worth knowing that the sketch did not say:
   Besides `FORK`, `HARDEN` and `TIMEOUT` there are `EXITED`, `PROTOCOL` (a
   malformed ready report) and `RESOURCE` (`socketpair()` failed or a table is
   full).
+- The spawner resets `SIGCHLD` to its default disposition at startup. A
+  caller that had it ignored (or set `SA_NOCLDWAIT`) would make the kernel
+  reap workers itself, `waitpid()` would fail with `ECHILD`, and no `EXITED`
+  would ever be sent.
+- A zero-length record is not EOF. `recvmsg()` returns 0 for both a closed
+  peer and an empty `SEQPACKET` record, so EOF requires a hangup as well; an
+  empty record is malformed and dropped, and cannot shut the spawner down.
 - A pending worker whose socket reaches EOF is not failed on the spot: the
   exit status, which names the hardening step, arrives with `SIGCHLD`, and
   the startup deadline covers a worker that closed its socket and kept
@@ -460,9 +469,16 @@ name list in three ways:
 - `sendmsg` and `recvmsg` are allowed only on exactly the IPC descriptor,
   comparing all 64 bits of the argument, so a compromised worker cannot use
   them on any other descriptor
-- `newfstatat` is allowed only with `AT_EMPTY_PATH`, so it can describe an
-  open descriptor but not probe paths (a seccomp filter cannot inspect the
-  path argument itself, so this restricts the flag, not the path)
+- `newfstatat` is allowed only with `AT_EMPTY_PATH`. That makes the intended
+  use (describing an open descriptor) possible, but it does **not** stop path
+  probing: a seccomp filter cannot inspect the path argument, and Linux still
+  resolves a non-empty path under that flag (relative to the directory
+  descriptor, or to the working directory for `AT_FDCWD`). A compromised
+  worker can therefore read file metadata (existence, type, size, owner, mode)
+  of any path its uid can reach. Closing that needs a mount-level restriction,
+  which is what the optional `chroot` to an empty directory below is for; it
+  is not implemented, so this is a known residual exposure of metadata, not of
+  file contents
 
 The default action is `SECCOMP_RET_KILL_PROCESS`.
 

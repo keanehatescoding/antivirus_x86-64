@@ -290,8 +290,11 @@ static inline int ps_clear_capabilities(void) {
  * scan runs in a worker. Explicitly absent: open*, socket, connect, execve*,
  * clone/fork, ptrace, kill, write, and anything that changes the filesystem.
  *
- * `fstat` and `newfstatat` are only reachable on an open descriptor: the
- * latter is further restricted to AT_EMPTY_PATH below. */
+ * `fstat` is only reachable on an open descriptor. `newfstatat` is allowed
+ * only with AT_EMPTY_PATH (below), which does NOT stop it resolving a
+ * non-empty path: a seccomp filter cannot inspect the path argument, so a
+ * compromised worker can stat any path its uid can reach (metadata only).
+ * See docs/privilege-separation.md, "Seccomp allowlist (worker)". */
 static const int ps_allow_plain[] = {
     SYS_read,          SYS_pread64,        SYS_lseek,        SYS_fstat,
     SYS_mmap,          SYS_munmap,         SYS_mprotect,     SYS_mremap,

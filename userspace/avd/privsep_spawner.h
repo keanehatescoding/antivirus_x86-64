@@ -253,8 +253,16 @@ ps_ctl_recv(int sock, enum ps_ctl_from from, int flags, struct ps_ctl_msg *m,
     }
   }
 
-  if (len == 0 && nfds == 0 && !(msg.msg_flags & MSG_CTRUNC))
-    return PS_CTL_EOF;
+  if (len == 0 && nfds == 0 && !(msg.msg_flags & MSG_CTRUNC)) {
+    /* recvmsg() returns 0 both when the peer has closed and for a zero-length
+     * SEQPACKET record, which a peer can send while keeping its end open.
+     * Only a hangup is EOF; an empty record is a malformed message and must
+     * not be taken as an instruction to shut down. */
+    struct pollfd hup = {.fd = sock, .events = 0};
+
+    if (poll(&hup, 1, 0) > 0 && (hup.revents & POLLHUP))
+      return PS_CTL_EOF;
+  }
 
   if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))
     ok = false;
@@ -332,6 +340,9 @@ static int (*ps_spawner_test_harden)(const struct ps_harden_cfg *);
 /* Test builds only: makes the Nth fork (1-based) fail with EAGAIN. */
 static unsigned ps_spawner_test_fail_fork;
 static unsigned ps_spawner_test_forks;
+/* Test builds only: makes the Nth socketpair() (1-based) fail with EMFILE. */
+static unsigned ps_spawner_test_fail_socketpair;
+static unsigned ps_spawner_test_socketpairs;
 #endif
 
 struct ps_pending {
@@ -443,8 +454,21 @@ static inline int ps_spawner_do_spawn(struct ps_spawner *s,
   if (!p || ps_in_use(s) >= PS_SPAWNER_MAX_WORKERS)
     return ps_spawner_reply_failed(ctl, request_id, PS_FAIL_RESOURCE, EMFILE);
 
-  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
-    return ps_spawner_reply_failed(ctl, request_id, PS_FAIL_RESOURCE, errno);
+  {
+    int sp_rc;
+
+#ifdef PS_SPAWNER_TEST_HOOKS
+    ps_spawner_test_socketpairs++;
+    if (ps_spawner_test_fail_socketpair &&
+        ps_spawner_test_socketpairs == ps_spawner_test_fail_socketpair) {
+      errno = EMFILE;
+      sp_rc = -1;
+    } else
+#endif
+      sp_rc = socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv);
+    if (sp_rc < 0)
+      return ps_spawner_reply_failed(ctl, request_id, PS_FAIL_RESOURCE, errno);
+  }
 
 #ifdef PS_SPAWNER_TEST_HOOKS
   ps_spawner_test_forks++;
@@ -674,6 +698,19 @@ static inline int ps_spawner_run(const struct ps_spawner_cfg *cfg, int ctl) {
 
   /* SIGCHLD is blocked and read from a signalfd: a blocked signal never runs
    * a handler, so a self-pipe handler must not be combined with this. */
+  {
+    /* A disposition inherited from the caller must not survive: with SIGCHLD
+     * ignored, or SA_NOCLDWAIT set, the kernel reaps children itself and
+     * waitpid() fails with ECHILD, so no EXITED would ever be reported and
+     * live slots would stay occupied. */
+    struct sigaction dfl;
+
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    if (sigaction(SIGCHLD, &dfl, NULL) < 0)
+      return 1;
+  }
   sigemptyset(&mask);
   sigaddset(&mask, SIGCHLD);
   if (sigprocmask(SIG_BLOCK, &mask, &old) < 0)
