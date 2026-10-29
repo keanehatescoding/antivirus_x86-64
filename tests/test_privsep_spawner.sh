@@ -376,11 +376,32 @@ static struct ps_spawner_cfg base_cfg(void) {
 
 /* Close our end and wait for the spawner; then reap whatever it orphaned
  * (this process is a subreaper). Returns the spawner's wait status. */
+/* Wait up to `ms` for `pid` to exit. True only if waitpid() returned that
+ * pid: a status of 0 alone cannot show that, since WIFEXITED(0) is true. A
+ * regression must fail with its diagnostics, not wait out the alarm. */
+static bool reap_within(pid_t pid, int *st, int ms) {
+    int64_t end = ps_now_ms() + ms;
+    for (;;) {
+        if (waitpid(pid, st, WNOHANG) == pid) return true;
+        if (ps_now_ms() >= end) return false;
+        usleep(20 * 1000);
+    }
+}
+
 static int stop_spawner(int ctl, pid_t sp) {
     int st = 0;
     close(ctl);
-    waitpid(sp, &st, 0);
-    while (waitpid(-1, NULL, 0) > 0) {
+    if (!reap_within(sp, &st, 5000)) {
+        printf("    (spawner %d did not exit after its channel closed; killing)\n", (int)sp);
+        kill(sp, SIGKILL);
+        waitpid(sp, &st, 0);
+    }
+    /* Orphaned workers come to us (subreaper); they were SIGKILLed. */
+    for (int i = 0; i < 100; i++) {
+        pid_t w = waitpid(-1, NULL, WNOHANG);
+        if (w > 0) continue;
+        if (w < 0) break; /* ECHILD: none left */
+        usleep(20 * 1000);
     }
     return st;
 }
@@ -1060,14 +1081,23 @@ static void test_shutdown(void) {
     }
     CHECK(all, "three live workers");
     close(ctl);
-    waitpid(sp, &st, 0);
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0,
-          "when main closes the channel the spawner exits 0");
+    {
+        bool gone = reap_within(sp, &st, 5000);
+
+        CHECK(gone && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "when main closes the channel the spawner exits 0");
+        if (!gone) {
+            kill(sp, SIGKILL);
+            waitpid(sp, &st, 0);
+        }
+    }
     all = true;
     for (int k = 0; k < 3; k++) {
         int ws = 0;
-        if (waitpid(wp[k], &ws, 0) != wp[k] || !WIFSIGNALED(ws) || WTERMSIG(ws) != SIGKILL)
+        if (!reap_within(wp[k], &ws, 5000) || !WIFSIGNALED(ws) || WTERMSIG(ws) != SIGKILL) {
             all = false;
+            kill(wp[k], SIGKILL);
+        }
     }
     CHECK(all, "and every worker was killed with SIGKILL first");
     reset_queues();
@@ -1091,14 +1121,27 @@ static void test_shutdown(void) {
             t0 = cpu_ticks(s2);
             usleep(500 * 1000);
             t1 = cpu_ticks(s2);
-            CHECK(waitpid(s2, &st2, WNOHANG) == s2 || t1 - t0 < 10,
-                  "a half-closed channel does not spin the spawner");
-            if (waitpid(s2, &st2, WNOHANG) != s2) waitpid(s2, &st2, 0);
-            CHECK(WIFEXITED(st2) && WEXITSTATUS(st2) == 0,
+            bool reaped = (waitpid(s2, &st2, WNOHANG) == s2);
+
+            CHECK(reaped || t1 - t0 < 10, "a half-closed channel does not spin the spawner");
+            if (!reaped) reaped = reap_within(s2, &st2, 5000);
+            CHECK(reaped, "a half-closed channel shuts the spawner down within 5 s");
+            if (!reaped) {
+                kill(s2, SIGKILL);
+                waitpid(s2, &st2, 0);
+            }
+            CHECK(reaped && WIFEXITED(st2) && WEXITSTATUS(st2) == 0,
                   "and shuts it down in order (exit 0)");
             {
                 int ws = 0;
-                CHECK(waitpid(w2, &ws, 0) == w2 && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL,
+                bool reaped_w = reap_within(w2, &ws, 5000);
+
+                CHECK(reaped_w, "its worker is reaped within 5 s of the half-close");
+                if (!reaped_w) {
+                    kill(w2, SIGKILL);
+                    waitpid(w2, &ws, 0);
+                }
+                CHECK(reaped_w && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL,
                       "killing its worker first");
             }
         } else {
@@ -1133,9 +1176,14 @@ static void test_shutdown(void) {
         if (spawner > 0) {
             int ws = 0;
             /* We are a subreaper, so the orphaned spawner comes to us. */
-            CHECK(waitpid(spawner, &ws, 0) == spawner && WIFSIGNALED(ws) &&
-                      WTERMSIG(ws) == SIGKILL,
+            bool gone = reap_within(spawner, &ws, 5000);
+
+            CHECK(gone && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL,
                   "the spawner dies with SIGKILL when main dies (PR_SET_PDEATHSIG)");
+            if (!gone) {
+                kill(spawner, SIGKILL);
+                waitpid(spawner, &ws, 0);
+            }
         }
     }
 }
@@ -1423,12 +1471,20 @@ static void test_real_orphan(void) {
     }
     wp = REPLY[r].pid;
     kill(sp, SIGKILL);
-    waitpid(sp, NULL, 0);
+    waitpid(sp, NULL, 0); /* SIGKILLed just above: cannot block */
     /* As a subreaper the worker now comes to us. It set PR_SET_PDEATHSIG only
      * after its credential change (the kernel clears it on a uid change), so
      * this is the end-to-end check of that ordering. */
-    CHECK(waitpid(wp, &st, 0) == wp && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL,
-          "SIGKILL on the spawner takes its hardened worker down with SIGKILL");
+    {
+        bool gone = reap_within(wp, &st, 5000);
+
+        CHECK(gone && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL,
+              "SIGKILL on the spawner takes its hardened worker down with SIGKILL");
+        if (!gone) {
+            kill(wp, SIGKILL);
+            waitpid(wp, &st, 0);
+        }
+    }
     close(ctl);
     while (waitpid(-1, NULL, WNOHANG) > 0) {
     }
