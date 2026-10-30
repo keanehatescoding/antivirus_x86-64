@@ -297,6 +297,7 @@ static inline int ps_clear_capabilities(void) {
  * See docs/privilege-separation.md, "Seccomp allowlist (worker)". */
 static const int ps_allow_plain[] = {
     SYS_read,          SYS_pread64,        SYS_lseek,        SYS_fstat,
+    SYS_fstatfs, /* libyara calls it on the scan fd; descriptor only, no path */
     SYS_mmap,          SYS_munmap,         SYS_mprotect,     SYS_mremap,
     SYS_brk,           SYS_madvise,        SYS_futex,        SYS_dup,
     SYS_close,         SYS_clock_gettime,  SYS_clock_nanosleep,

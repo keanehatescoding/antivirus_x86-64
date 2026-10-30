@@ -447,15 +447,30 @@ spawner from the multithreaded main process, so it needs its own design.
 #### Seccomp allowlist (worker)
 
 Default action kill. Expected contents: `read`, `pread64`, `lseek`,
-`fstat`/`newfstatat` with `AT_EMPTY_PATH`, `mmap`, `munmap`, `mprotect`,
+`fstat`, `fstatfs`, `newfstatat` with `AT_EMPTY_PATH`, `mmap`, `munmap`, `mprotect`,
 `mremap`, `brk`, `madvise`, `futex`, `dup`, `close`, `recvmsg`/`sendmsg` on
 the IPC socket, `clock_gettime`, `clock_nanosleep`, `rt_sig*`, `getrandom`,
 `exit_group`. Explicitly absent: `open*`, `socket`, `connect`, `execve*`,
 `clone`/`fork`, `ptrace`, `kill`, anything that writes the filesystem. The
-real list must come from tracing a YARA scan with the shipped rules, and
-that has not been done: `privsep_worker.h` implements the list above, tested
-against a scan callback that uses only `pread` and large `malloc`/`free`, not
-against libyara itself. Expect to add to it when the scan is wired in.
+real list has now been checked against a trace of the real detection path
+(`analyze_content()`: libyara 4.5.0 with the shipped rules, ssdeep and TLSH,
+over small and large ELF files, random data, text and an empty file, on
+glibc 2.39, linked with `-z now` like the shipped binary). The scan makes
+12 distinct syscalls in a single thread with no `clone`, and the list above
+covered all of them except one: **`fstatfs`**, which libyara calls on the
+scan descriptor. It takes a descriptor and an output buffer and no path, so
+it is allowed without argument checks. Without it every scan was killed with
+`SIGSYS`; with it all of the traced cases complete under the real filter.
+
+Two caveats. The trace is of one libyara and libc; another distribution may
+call something else (`statx`, `fcntl`), and a worker killed for that would
+turn every scan into a fail-open result, so the parent must report a
+`SIGSYS` death loudly and a startup self-test scan must catch it before avd
+serves anything (see the dispatch notes). And the worker may never log:
+`analyze_content()` printed to stdout and stderr, and any such call, however
+rare (a buffer filling, an "over the size cap" notice), is killed by the
+filter. The content scan therefore has to return its findings in the reply
+and leave all logging to the parent.
 
 The filter is emitted by hand rather than through libseccomp, which keeps it
 a dependency-free, auditable program of about 40 instructions
