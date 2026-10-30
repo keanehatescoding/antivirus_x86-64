@@ -78,6 +78,10 @@ echo "### test_privsep_spawner.sh (spawner, control channel and reaping, #103) #
 "$REPO_ROOT/tests/test_privsep_spawner.sh" || FAIL=1
 
 echo
+echo "### test_privsep_client.sh (main-process dispatch client, #103) ###"
+"$REPO_ROOT/tests/test_privsep_client.sh" || FAIL=1
+
+echo
 echo "### test_avd_no_exec.sh (avd never execs - fanotify re-entrancy guard) ###"
 # No root needed: inspects the built binary's dynamic imports.
 "$REPO_ROOT/tests/test_avd_no_exec.sh" || FAIL=1

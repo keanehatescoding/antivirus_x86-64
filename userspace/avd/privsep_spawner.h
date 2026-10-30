@@ -159,12 +159,13 @@ static inline bool ps_ctl_msg_valid(const struct ps_ctl_msg *m,
   }
 }
 
-/* Send one message, with `fd` attached as SCM_RIGHTS when it is >= 0. Blocks
- * until the whole message is queued; returns 0 on success, -1 with errno set
- * otherwise (EPIPE: the peer is gone). MSG_NOSIGNAL so a dead peer is an
- * error, not a SIGPIPE. */
-static inline int ps_ctl_send(int sock, const struct ps_ctl_msg *m, int fd) {
-  struct iovec iov = {.iov_base = (void *)m, .iov_len = sizeof(*m)};
+/* Send `len` bytes as one message, with `fd` attached as SCM_RIGHTS when it is
+ * >= 0. Returns 0 only if the whole message went out, -1 with errno set
+ * otherwise (EPIPE: the peer is gone; EAGAIN with MSG_DONTWAIT: its queue is
+ * full). Always MSG_NOSIGNAL, so a dead peer is an error, not a SIGPIPE. */
+static inline int ps_sendmsg_fd(int sock, const void *buf, size_t len, int fd,
+                                int flags) {
+  struct iovec iov = {.iov_base = (void *)buf, .iov_len = len};
   union {
     char b[CMSG_SPACE(sizeof(int))];
     struct cmsghdr align;
@@ -188,9 +189,21 @@ static inline int ps_ctl_send(int sock, const struct ps_ctl_msg *m, int fd) {
     memcpy(CMSG_DATA(cm), &fd, sizeof(int));
   }
   do {
-    n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+    n = sendmsg(sock, &msg, MSG_NOSIGNAL | flags);
   } while (n < 0 && errno == EINTR);
-  return n == (ssize_t)sizeof(*m) ? 0 : -1;
+  return n == (ssize_t)len ? 0 : -1;
+}
+
+/* Send one control message, blocking until it is queued. */
+static inline int ps_ctl_send(int sock, const struct ps_ctl_msg *m, int fd) {
+  return ps_sendmsg_fd(sock, m, sizeof(*m), fd, 0);
+}
+
+/* Same with send flags, for a caller that must never block on a peer that has
+ * stopped reading (MSG_DONTWAIT). */
+static inline int ps_ctl_sendf(int sock, const struct ps_ctl_msg *m, int fd,
+                               int flags) {
+  return ps_sendmsg_fd(sock, m, sizeof(*m), fd, flags);
 }
 
 enum ps_ctl_recv_result {
@@ -323,7 +336,10 @@ static inline int ps_worker_report_ready(int sock) {
  * count and PS_SPAWNER_MAX_PENDING bounds simultaneous replacements. A SPAWN
  * that finds either table full is answered FAILED(PS_FAIL_RESOURCE). */
 #ifndef PS_SPAWNER_MAX_WORKERS /* overridable so tests can hit the limit */
-#define PS_SPAWNER_MAX_WORKERS 256
+/* Twice the largest scan pool (AVD_SCAN_THREADS_MAX, 256): a killed worker
+ * keeps its slot until the spawner reaps it, so a replacement can briefly
+ * coexist with its predecessor for every thread at once. avd.c asserts this. */
+#define PS_SPAWNER_MAX_WORKERS 512
 #endif
 #ifndef PS_SPAWNER_MAX_PENDING
 #define PS_SPAWNER_MAX_PENDING 64

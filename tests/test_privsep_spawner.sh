@@ -1166,6 +1166,10 @@ static void test_shutdown(void) {
             close(p[0]);
             if (ps_spawner_start(&cfg, &c, &s2) != 0) _exit(2);
             (void)!write(p[1], &s2, sizeof(s2));
+            /* Any reply (READY or FAILED) proves the spawner is in its main
+             * loop, i.e. past its startup handshake and PR_SET_PDEATHSIG.
+             * Only then does "main" die, so the only way out is PDEATHSIG. */
+            if (send_spawn(c, 1) != 0 || wait_reply(c, 1, 5000) < 0) _exit(3);
             _exit(0);
         }
         close(p[1]);
@@ -1179,7 +1183,7 @@ static void test_shutdown(void) {
             bool gone = reap_within(spawner, &ws, 5000);
 
             CHECK(gone && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL,
-                  "the spawner dies with SIGKILL when main dies (PR_SET_PDEATHSIG)");
+                  "the spawner does not outlive main: PR_SET_PDEATHSIG kills it");
             if (!gone) {
                 kill(spawner, SIGKILL);
                 waitpid(spawner, &ws, 0);

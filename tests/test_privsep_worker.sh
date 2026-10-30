@@ -212,6 +212,7 @@ static bool allowed(const struct sock_filter *p, size_t n, uint32_t arch,
 static bool want_plain(int nr) {
     switch (nr) {
     case SYS_read: case SYS_pread64: case SYS_lseek: case SYS_fstat:
+    case SYS_fstatfs:
     case SYS_mmap: case SYS_munmap: case SYS_mprotect: case SYS_mremap:
     case SYS_brk: case SYS_madvise: case SYS_futex: case SYS_dup:
     case SYS_close: case SYS_clock_gettime: case SYS_clock_nanosleep:
@@ -277,7 +278,7 @@ static void test_bpf(void) {
         }
     }
     CHECK(bad == 0, "only the allowlist is allowed, for syscall 0..1023");
-    CHECK(plain_ok == 20, "all twenty plain entries are exercised");
+    CHECK(plain_ok == 21, "all twenty-one plain entries are exercised");
 
     /* The explicit never-list, with every argument shape that might help. */
     bad = 0;
