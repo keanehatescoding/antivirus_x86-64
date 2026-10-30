@@ -249,7 +249,7 @@ did not say:
   the startup deadline covers a worker that closed its socket and kept
   running. The closed socket is also dropped from the `poll()` set, because a
   closed `SEQPACKET` peer reports `POLLHUP` forever and would spin the loop.
-- Pending and live workers share one budget (256) with a smaller bound on
+- Pending and live workers share one budget (512) with a smaller bound on
   simultaneous spawns (64), so a pending worker can always be promoted. A
   `SPAWN` over either bound is answered `FAILED(RESOURCE)` immediately.
 - A worker is named by `worker_id` only after `READY`, so a `KILL` can only

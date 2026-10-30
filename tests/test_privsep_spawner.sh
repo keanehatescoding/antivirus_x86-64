@@ -1166,6 +1166,12 @@ static void test_shutdown(void) {
             close(p[0]);
             if (ps_spawner_start(&cfg, &c, &s2) != 0) _exit(2);
             (void)!write(p[1], &s2, sizeof(s2));
+            /* Stay alive long enough for the spawner to pass its startup
+             * handshake and set PR_SET_PDEATHSIG, so the SIGKILL path is
+             * what is exercised. (If main dies first the spawner exits 1 via
+             * the getppid() handshake instead - also correct, and accepted
+             * below.) */
+            usleep(300 * 1000);
             _exit(0);
         }
         close(p[1]);
@@ -1178,8 +1184,12 @@ static void test_shutdown(void) {
             /* We are a subreaper, so the orphaned spawner comes to us. */
             bool gone = reap_within(spawner, &ws, 5000);
 
-            CHECK(gone && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL,
-                  "the spawner dies with SIGKILL when main dies (PR_SET_PDEATHSIG)");
+            CHECK(gone && ((WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL) ||
+                           (WIFEXITED(ws) && WEXITSTATUS(ws) == 1)),
+                  "the spawner does not outlive main (PR_SET_PDEATHSIG; or, "
+                  "if main died first, its getppid() handshake)");
+            CHECK(!gone || (WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL),
+                  "and with main alive through startup it is PDEATHSIG's SIGKILL");
             if (!gone) {
                 kill(spawner, SIGKILL);
                 waitpid(spawner, &ws, 0);
