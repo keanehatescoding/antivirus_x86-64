@@ -258,11 +258,19 @@ static inline void ps_client_logf(struct ps_client *c, const char *fmt, ...) {
 }
 
 /* Tell the owner the spawner is gone, once. Never holds a lock while the
- * callback runs. */
-static inline void ps_client_notify_dead(struct ps_client *c, const char *why) {
+ * callback runs. With `need_hung` the decision is made under the lock from
+ * the current miss count, so a reply the reader has just matched (which
+ * resets the count) cancels it instead of a stale decision killing the
+ * client for good. */
+static inline void ps_client_declare_dead(struct ps_client *c, const char *why,
+                                          bool need_hung) {
   bool first = false;
 
   pthread_mutex_lock(&c->lock);
+  if (need_hung && (c->dead || c->missed < PS_CLIENT_HANG_LIMIT)) {
+    pthread_mutex_unlock(&c->lock);
+    return;
+  }
   c->dead = true;
   if (!c->dead_notified && !c->stopping) {
     c->dead_notified = true;
@@ -275,6 +283,14 @@ static inline void ps_client_notify_dead(struct ps_client *c, const char *why) {
     if (c->on_dead)
       c->on_dead(c->on_dead_ctx);
   }
+}
+
+static inline void ps_client_notify_dead(struct ps_client *c, const char *why) {
+  ps_client_declare_dead(c, why, false);
+}
+
+static inline void ps_client_declare_hung(struct ps_client *c) {
+  ps_client_declare_dead(c, "no reply to several consecutive SPAWNs", true);
 }
 
 /* KILL by id, best effort and never blocking: if the spawner has stopped
@@ -331,7 +347,6 @@ static inline void *ps_client_reader(void *arg) {
     if (m.type == PS_MSG_READY || m.type == PS_MSG_FAILED) {
       struct ps_waiter *w = ps_waiter_find(c, m.request_id);
 
-      c->missed = 0;
       if (!w || w->done) {
         /* Nobody to hand it to. A READY still owns a live worker. */
         snprintf(note, sizeof(note), "privsep: %s for unknown request %llu",
@@ -340,6 +355,7 @@ static inline void *ps_client_reader(void *arg) {
         if (m.type == PS_MSG_READY)
           kill_id = m.worker_id;
       } else if (w->abandoned) {
+        c->missed = 0; /* only a reply that matches a SPAWN proves liveness */
         snprintf(note, sizeof(note),
                  "privsep: late %s for abandoned request %llu",
                  m.type == PS_MSG_READY ? "READY" : "FAILED",
@@ -349,6 +365,7 @@ static inline void *ps_client_reader(void *arg) {
         memset(w, 0, sizeof(*w));
         w->fd = -1;
       } else {
+        c->missed = 0;
         w->reply = m;
         w->fd = fd;
         fd = -1;
@@ -397,7 +414,10 @@ static inline void *ps_client_reader(void *arg) {
       ps_client_logf(c, "%s", note);
   }
 
-  if (!c->stopping)
+  pthread_mutex_lock(&c->lock);
+  bool stopping = c->stopping;
+  pthread_mutex_unlock(&c->lock);
+  if (!stopping)
     ps_client_notify_dead(c, why);
   else {
     pthread_mutex_lock(&c->lock);
@@ -545,7 +565,7 @@ ps_client_spawn(struct ps_client *c, struct ps_worker *w, int timeout_ms,
     pthread_mutex_unlock(&c->lock);
     if (!got) {
       if (hung)
-        ps_client_notify_dead(c, "no reply to several consecutive SPAWNs");
+        ps_client_declare_hung(c);
       return dead || hung ? PS_SPAWN_DEAD : PS_SPAWN_TIMEOUT;
     }
   }
@@ -725,7 +745,11 @@ static inline void ps_client_stop(struct ps_client *c) {
   close(c->ctl);
   c->ctl = -1;
   while (c->spawner_pid > 0) {
-    if (waitpid(c->spawner_pid, &st, WNOHANG) == c->spawner_pid) {
+    pid_t r = waitpid(c->spawner_pid, &st, WNOHANG);
+
+    /* ECHILD: already reaped elsewhere (SIGCHLD ignored, or a wait(-1)). It
+     * is gone, and its pid may be reused, so it must not be signalled. */
+    if (r == c->spawner_pid || (r < 0 && errno == ECHILD)) {
       gone = true;
       break;
     }

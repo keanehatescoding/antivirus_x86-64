@@ -831,6 +831,39 @@ static void test_fake_spawner(void) {
     ps_client_stop(&c);
 }
 
+/* Replies that match no SPAWN do not prove the spawner is draining requests. */
+static void test_unmatched_replies_keep_hang_count(void) {
+    int sv[2];
+    struct ps_client c;
+    struct ps_ctl_msg m;
+    struct ps_worker w;
+    struct ps_spawn_info info;
+    enum ps_spawn_status s[3];
+
+    printf("\nreader thread: unmatched replies do not reset the hang count\n");
+    log_clear();
+    socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv);
+    ps_client_attach(&c, sv[0], -1, 65534, 65534, false);
+    c.log = log_hook;
+    c.on_dead = dead_hook;
+    ps_client_start(&c);
+    for (int i = 0; i < 3; i++) {
+        s[i] = ps_client_spawn(&c, &w, 120, &info);
+        if (i < 2) {
+            ps_ctl_msg_init(&m, PS_MSG_FAILED);
+            m.request_id = 900000 + (uint64_t)i; /* matches nothing */
+            m.reason = PS_FAIL_TIMEOUT;
+            ps_ctl_send(sv[1], &m, -1);
+            if (!log_wait("unknown request 90000", 2000)) log_dump();
+        }
+    }
+    CHECK(s[0] == PS_SPAWN_TIMEOUT && s[1] == PS_SPAWN_TIMEOUT && s[2] == PS_SPAWN_DEAD &&
+              atomic_load(&DEAD_CALLS) == 1,
+          "three unanswered SPAWNs still declare the spawner hung, whatever else it sends");
+    close(sv[1]);
+    ps_client_stop(&c);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     alarm(240);
@@ -844,6 +877,7 @@ int main(void) {
     test_orderly_stop();
     test_concurrent();
     test_fake_spawner();
+    test_unmatched_replies_keep_hang_count();
     SUMMARY("privsep_client (behaviour)");
 }
 
@@ -934,6 +968,23 @@ static bool wait_ready(pid_t pid, int rd, int level) {
     return false;
 }
 
+/* A seccomp filter is inherited across fork(): under one (a container's
+ * default profile, say) even an otherwise unhardened child reports
+ * Seccomp: 2, so the "no filter yet" rung cannot be observed. */
+static bool self_has_seccomp(void) {
+    char buf[8192];
+    FILE *f = fopen("/proc/self/status", "r");
+    size_t l;
+    const char *v;
+
+    if (!f) return false;
+    l = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[l] = 0;
+    v = ps_status_value(buf, "Seccomp");
+    return v && *v == '2';
+}
+
 static void test_proc_ladder(void) {
     static const struct { int level; const char *want; const char *what; } L[] = {
         {0, "Uid", "an unhardened process (still root)"},
@@ -954,6 +1005,12 @@ static void test_proc_ladder(void) {
         char label[200];
         bool rejected;
 
+        if (L[i].level == 3 && self_has_seccomp()) {
+            if (pid > 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
+            close(rd);
+            SKIPT("the no-seccomp-yet rung: this process already runs under a seccomp filter");
+            continue;
+        }
         if (pid < 0 || !wait_ready(pid, rd, L[i].level)) { CHECK(false, L[i].what); continue; }
         rejected = !ps_verify_worker(pid, WORKER_UID, WORKER_UID, getpid(), why, sizeof(why));
         snprintf(label, sizeof(label), "%s is rejected, naming %s", L[i].what, L[i].want);

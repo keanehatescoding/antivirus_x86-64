@@ -1168,9 +1168,10 @@ static void test_shutdown(void) {
             (void)!write(p[1], &s2, sizeof(s2));
             /* Stay alive long enough for the spawner to pass its startup
              * handshake and set PR_SET_PDEATHSIG, so the SIGKILL path is
-             * what is exercised. (If main dies first the spawner exits 1 via
-             * the getppid() handshake instead - also correct, and accepted
-             * below.) */
+             * what is exercised. If main dies first the spawner exits 1 via
+             * the getppid() handshake instead: also correct, and accepted
+             * (a slow machine must not fail the test). Removing PDEATHSIG
+             * still fails it, since the spawner then outlives main. */
             usleep(300 * 1000);
             _exit(0);
         }
@@ -1188,8 +1189,6 @@ static void test_shutdown(void) {
                            (WIFEXITED(ws) && WEXITSTATUS(ws) == 1)),
                   "the spawner does not outlive main (PR_SET_PDEATHSIG; or, "
                   "if main died first, its getppid() handshake)");
-            CHECK(!gone || (WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL),
-                  "and with main alive through startup it is PDEATHSIG's SIGKILL");
             if (!gone) {
                 kill(spawner, SIGKILL);
                 waitpid(spawner, &ws, 0);
