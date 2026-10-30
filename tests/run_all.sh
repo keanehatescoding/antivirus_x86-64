@@ -66,6 +66,18 @@ echo "### test_privsep_proto.sh (worker IPC reply validation, #103) ###"
 "$REPO_ROOT/tests/test_privsep_proto.sh" || FAIL=1
 
 echo
+echo "### test_privsep_worker.sh (worker hardening, seccomp and IPC loop, #103) ###"
+# Runs unprivileged too: the steps that need root (credentials, capabilities)
+# print SKIP, never PASS, when it is not available.
+"$REPO_ROOT/tests/test_privsep_worker.sh" || FAIL=1
+
+echo
+echo "### test_privsep_spawner.sh (spawner, control channel and reaping, #103) ###"
+# Same root handling as test_privsep_worker.sh: the real-kernel tests print
+# SKIP, never PASS, without root.
+"$REPO_ROOT/tests/test_privsep_spawner.sh" || FAIL=1
+
+echo
 echo "### test_avd_no_exec.sh (avd never execs - fanotify re-entrancy guard) ###"
 # No root needed: inspects the built binary's dynamic imports.
 "$REPO_ROOT/tests/test_avd_no_exec.sh" || FAIL=1

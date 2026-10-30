@@ -1,9 +1,17 @@
 # avd privilege separation (design sketch for #103)
 
 Status: Stage 0 is merged (#200). Stage 1 is being built in slices: the
-wire format and reply validation (`userspace/avd/privsep_proto.h`) and the
-parent/content split inside `analyze_fd()` are in; the spawner, the hardened
-worker and `AVD_PRIVSEP` are not yet. Stage 2 is design only. Written against
+wire format and reply validation (`userspace/avd/privsep_proto.h`), the
+parent/content split inside `analyze_fd()`, the worker side
+(`userspace/avd/privsep_worker.h`: the hardening sequence, the seccomp
+filter and the request/reply loop) and the spawner with its control channel
+(`userspace/avd/privsep_spawner.h`: `SPAWN`/`KILL`/`READY`/`FAILED`/`EXITED`,
+the `poll()` + `signalfd` loop, reaping, the worker readiness report), all
+tested standalone, are in. Still to come: the spawner's own capability drop
+and seccomp superset filter, the parent-side dispatch (reader thread, request
+table, the `/proc/<pid>/status` check, canonical failure on any anomaly) and
+`AVD_PRIVSEP`. Stage 2 is design only.
+Written against
 master at `08ff847` and revised after review of #199.
 
 ## Problem
@@ -207,6 +215,52 @@ The spawner:
 This also answers "who keeps the bootstrap capabilities for respawns": the
 spawner does, and the main process does not need them (Stage 2).
 
+**As implemented (`privsep_spawner.h`).** The behaviour above is in, except
+the spawner's own capability drop and seccomp superset filter, which are not
+implemented yet (see Status). These details are worth knowing that the sketch
+did not say:
+
+- One fixed 40-byte struct carries every message in both directions, and each
+  receiver validates it per sender class: a type that sender may not send,
+  a field that type does not use being non-zero, a `READY` without exactly one
+  descriptor, or a descriptor on anything else is malformed, and every
+  descriptor that arrived is closed. Malformed input from main is dropped (the
+  channel is `SEQPACKET`, so there is no stream to resynchronise, and nobody
+  to answer).
+- The worker's readiness report is the same struct with type `WORKER_READY`,
+  sent with `sendmsg()` on the IPC descriptor, which is the one send call the
+  worker filter allows.
+- A hardening failure is reported through the worker's exit code,
+  `64 + step`, and decoded when the spawner reaps it, so `FAILED` carries the
+  step number. Any other exit before ready, including code 64 itself and
+  codes past the last step, is `FAILED(EXITED)` with the raw wait status.
+  Besides `FORK`, `HARDEN` and `TIMEOUT` there are `EXITED`, `PROTOCOL` (a
+  malformed ready report) and `RESOURCE` (`socketpair()` failed or a table is
+  full).
+- The spawner resets `SIGCHLD` to its default disposition at startup. A
+  caller that had it ignored (or set `SA_NOCLDWAIT`) would make the kernel
+  reap workers itself, `waitpid()` would fail with `ECHILD`, and no `EXITED`
+  would ever be sent.
+- A zero-length record is not EOF. `recvmsg()` returns 0 for both a closed
+  peer and an empty `SEQPACKET` record, so EOF requires a hangup as well; an
+  empty record is malformed and dropped, and cannot shut the spawner down.
+- A pending worker whose socket reaches EOF is not failed on the spot: the
+  exit status, which names the hardening step, arrives with `SIGCHLD`, and
+  the startup deadline covers a worker that closed its socket and kept
+  running. The closed socket is also dropped from the `poll()` set, because a
+  closed `SEQPACKET` peer reports `POLLHUP` forever and would spin the loop.
+- Pending and live workers share one budget (256) with a smaller bound on
+  simultaneous spawns (64), so a pending worker can always be promoted. A
+  `SPAWN` over either bound is answered `FAILED(RESOURCE)` immediately.
+- A worker is named by `worker_id` only after `READY`, so a `KILL` can only
+  name a live worker. A pending one is bounded by the startup timeout.
+- The spawner's replies are blocking sends. If main stops draining the
+  channel the spawner stalls, which is why the reader thread in main must
+  always drain it, and why a send failure ends the spawner (main is gone).
+- The pid the worker compares `getppid()` against is recorded by the spawner
+  before `fork()`. Reading it in the child would also accept a spawner that
+  had already died and orphaned it.
+
 **Reaping and lifecycle.** The spawner is the parent of every worker, so it is
 the only process that can reap them, and it must. It blocks `SIGCHLD` and
 reads it from a `signalfd` in the same `poll()` as the control channel and
@@ -254,27 +308,43 @@ value. Any failure ends the child with `_exit(1)` before it reports ready on
 its socket; the spawner then replies `FAILED`, so no request is ever sent to
 a worker that has not reported ready.
 
-1. rlimits: `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE=0` and a small
+1. close every inherited fd except the IPC socket (and one log fd if used)
+2. rlimits: `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE=0` and a small
    `RLIMIT_NOFILE` (not `RLIMIT_NPROC`: seccomp already forbids `fork`, and a
    low NPROC set before `setuid` is a known way to make `setuid` misbehave)
-2. close every inherited fd except the IPC socket (and one log fd if used)
-3. `setgroups(0)`, then `setresgid` and `setresuid` to the dedicated user
+3. empty the bounding set
+4. `setgroups(0)`, then `setresgid` and `setresuid` to the dedicated user
    (for example `hyprav-scan`, declared next to the existing group in
    `packaging/hyprav.sysusers` and its Debian twin), then confirm that
    `setuid(0)` now fails
-4. empty the bounding set, then clear the permitted, effective and
-   inheritable sets
-5. `prctl(PR_SET_NO_NEW_PRIVS, 1)`, then `prctl(PR_SET_PDEATHSIG, SIGKILL)`,
-   then read it back with `PR_GET_PDEATHSIG` and require `SIGKILL`, then
-   require `getppid()` to equal the pid the spawner recorded before the
-   `fork()`
-6. install the seccomp allowlist last
+5. clear the permitted, effective and inheritable sets, and read them back
+6. `prctl(PR_SET_NO_NEW_PRIVS, 1)`
+7. `prctl(PR_SET_PDEATHSIG, SIGKILL)`, then read it back with
+   `PR_GET_PDEATHSIG` and require `SIGKILL`, then require `getppid()` to equal
+   the pid the spawner recorded before the `fork()`
+8. install the seccomp allowlist last
+
+Two of these differ from the first draft of this document, both found while
+implementing `privsep_worker.h`:
+
+- The bounding set (3) is emptied *before* the credential change (4), not
+  after. `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective set, and
+  changing the real, effective and saved uid away from 0 clears it, so the
+  drop fails with `EPERM` if it comes second. The tests check this: swapping
+  the two makes hardening fail at the bounding-set step.
+- Descriptors are closed (1) *before* the rlimits (2). On a kernel without
+  `close_range()` the fallback walks descriptor numbers up to the current
+  `RLIMIT_NOFILE`, which would miss open descriptors above a limit that had
+  already been lowered.
+
+`ps_worker_harden()` returns the number of the step that failed (and leaves
+`errno`), so the spawner can say which one in `FAILED`.
 
 The parent-death signal needs both the order and the handshake above:
 
 - The kernel clears it whenever a process changes its effective or
   filesystem uid or gid (tried here: set, then `setresuid()`, and
-  `PR_GET_PDEATHSIG` reads back 0). So it is set *after* step 3, never
+  `PR_GET_PDEATHSIG` reads back 0). So it is set *after* step 4, never
   before, and read back so that a later reordering fails closed instead of
   silently leaving orphans.
 - Setting it is not enough by itself. If the spawner died before the child
@@ -382,10 +452,35 @@ Default action kill. Expected contents: `read`, `pread64`, `lseek`,
 the IPC socket, `clock_gettime`, `clock_nanosleep`, `rt_sig*`, `getrandom`,
 `exit_group`. Explicitly absent: `open*`, `socket`, `connect`, `execve*`,
 `clone`/`fork`, `ptrace`, `kill`, anything that writes the filesystem. The
-real list must come from tracing the test suite and a YARA scan with the
-shipped rules, not from this guess. libseccomp is not currently a dependency;
-either add it or emit the BPF program by hand (a short, auditable filter for
-this list).
+real list must come from tracing a YARA scan with the shipped rules, and
+that has not been done: `privsep_worker.h` implements the list above, tested
+against a scan callback that uses only `pread` and large `malloc`/`free`, not
+against libyara itself. Expect to add to it when the scan is wired in.
+
+The filter is emitted by hand rather than through libseccomp, which keeps it
+a dependency-free, auditable program of about 40 instructions
+(`ps_seccomp_build()`), and which is what lets it be tested exhaustively in
+userspace: the tests run it through a small classic-BPF interpreter for every
+syscall number on several architecture values. It is tighter than a plain
+name list in three ways:
+
+- the architecture must be x86-64 and the x32 bit clear; anything else is
+  killed (x86-64 only for now, see #105)
+- `sendmsg` and `recvmsg` are allowed only on exactly the IPC descriptor,
+  comparing all 64 bits of the argument, so a compromised worker cannot use
+  them on any other descriptor
+- `newfstatat` is allowed only with `AT_EMPTY_PATH`. That makes the intended
+  use (describing an open descriptor) possible, but it does **not** stop path
+  probing: a seccomp filter cannot inspect the path argument, and Linux still
+  resolves a non-empty path under that flag (relative to the directory
+  descriptor, or to the working directory for `AT_FDCWD`). A compromised
+  worker can therefore read file metadata (existence, type, size, owner, mode)
+  of any path its uid can reach. Closing that needs a mount-level restriction,
+  which is what the optional `chroot` to an empty directory below is for; it
+  is not implemented, so this is a known residual exposure of metadata, not of
+  file contents
+
+The default action is `SECCOMP_RET_KILL_PROCESS`.
 
 #### Seccomp filters stack
 
@@ -461,6 +556,20 @@ and syscalls.
 - Worker count follows the existing scan pool size.
 
 ## Tests
+
+`tests/test_privsep_spawner.sh` covers the spawner and its channel: the
+message validation matrix and descriptor handling; spawn, round trip over the
+passed socket, `KILL`, `EXITED`; every failure reason; concurrent spawns
+answered out of order; reaping with no zombies and a stable descriptor set
+after churn; the spawner holding only its channel, the signalfd and stderr;
+orderly shutdown and parent death; the table limits; and, as root, real
+workers with real hardening read back from `/proc/<pid>/status`, a failure
+injected at each step, and the worker dying with the spawner. In the list
+below that covers the failure-injection, concurrent-`SPAWN`, zombie, spawner
+descriptor, `EXITED` status, spawner/avd death and rejected-`SCM_RIGHTS`
+items for the spawner side. The parent-side items (late replies, respawn
+under concurrent scans, the `/proc` check, `AVD_PRIVSEP=1`) arrive with the
+dispatch slice.
 
 - hardening failure injection: make each step (setuid, capset, seccomp, ...)
   fail in a test build; the worker must exit without reporting ready and the
