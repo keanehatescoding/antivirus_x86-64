@@ -2297,10 +2297,27 @@ static void analyze_content(int fd, const char *path, const char *hash,
 #define AVD_PRIVSEP_STARTUP_MS 5000
 /* "A little above the spawner's own startup timeout" (privsep_client.h). */
 #define AVD_PRIVSEP_SPAWN_WAIT_MS (AVD_PRIVSEP_STARTUP_MS + 2000)
-/* YARA's own bound plus room for the ssdeep and TLSH passes that follow it. */
-#define AVD_PRIVSEP_SCAN_WAIT_MS (SCAN_TIMEOUT_SECS * 1000 + 5000)
+/* How long the parent waits for one worker reply: YARA's own bound, then a
+ * budget for each of the ssdeep and TLSH passes that follow it. Those two
+ * have no timeout of their own; they are only bounded by reading at most
+ * MAX_FUZZY_TLSH_FILE_SIZE (256 MiB). Measured on a 2.1 GHz Xeon with the
+ * shipped rules and corpora, a 255 MiB file takes about 0.4 s in YARA, 1.5-2 s
+ * in ssdeep and 2.5-2.7 s in TLSH (about 5 s together), for random and for
+ * text content. 20 s per pass is roughly 8x that worst case, so a loaded or
+ * slower machine still gets a real verdict instead of a worker that is killed
+ * and an inconclusive CLEAN that would have convicted. A worker that really
+ * hangs is still bounded by this wait. */
+#define AVD_PRIVSEP_HASH_BUDGET_MS 20000
+#define AVD_PRIVSEP_SCAN_WAIT_MS                                               \
+  (SCAN_TIMEOUT_SECS * 1000 + 2 * AVD_PRIVSEP_HASH_BUDGET_MS)
 #define AVD_PRIVSEP_MAX_SCANS 256
-#define AVD_PRIVSEP_CPU_SECONDS 3600
+/* RLIMIT_CPU is cumulative over the worker's life, and a scan can use at most
+ * its wait in CPU seconds (the worker is one thread), so this covers every
+ * scan of a worker that is recycled after AVD_PRIVSEP_MAX_SCANS, with a second
+ * of slack each. It is a backstop for a runaway worker whose parent is gone;
+ * the wait above is what bounds a single scan. */
+#define AVD_PRIVSEP_CPU_SECONDS                                                \
+  (AVD_PRIVSEP_MAX_SCANS * (AVD_PRIVSEP_SCAN_WAIT_MS / 1000 + 1))
 #define AVD_PRIVSEP_NOFILE 32
 /* RLIMIT_AS counts the compiled rules and corpora a worker inherits, and
  * libyara maps the scanned file whole, so the limit is "what the spawner had

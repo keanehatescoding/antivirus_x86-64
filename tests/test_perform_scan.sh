@@ -284,17 +284,29 @@ int main(int argc, char **argv) {
       int bad = 0, changes = 0;
 
       snprintf(p, sizeof(p), "%s/clean.txt", w);
+      int started = 0;
+
       for (int i = 0; i < THREADS; i++) {
         a[i] = (struct stress_arg){.path = p, .scans = SCANS};
-        pthread_create(&t[i], NULL, stress_thread, &a[i]);
+        if (pthread_create(&t[i], NULL, stress_thread, &a[i]) != 0) {
+          fprintf(stderr, "pthread_create failed for stress thread %d\n", i);
+          break;
+        }
+        started++;
       }
-      for (int i = 0; i < THREADS; i++) {
+      /* Join only what started, and report what actually ran, so a failed
+       * create can neither crash the join nor pass as the full count. */
+      for (int i = 0; i < started; i++) {
         pthread_join(t[i], NULL);
         bad += a[i].bad;
         changes += a[i].pid_changes;
       }
-      printf("STRESS threads=%d scans=%d bad=%d worker_changes=%d\n", THREADS,
-             THREADS * SCANS, bad, changes);
+      printf("STRESS threads=%d scans=%d bad=%d worker_changes=%d\n", started,
+             started * SCANS, bad, changes);
+      if (started != THREADS) {
+        privsep_stop();
+        return 2;
+      }
       privsep_stop();
       return 0;
     }
@@ -570,6 +582,81 @@ else
         fail "scans carried on after the spawner was lost"
     else
         pass "no scan was done in the root process after the spawner was lost"
+    fi
+
+    # The harness above calls privsep_start() directly, so it never reaches
+    # avd's own AVD_PRIVSEP read or the hyprav-scan account check. Run the
+    # real avd for those. Each case runs in a private mount namespace with a
+    # bind-mounted copy of /etc/passwd, so the host's accounts are never
+    # touched, and checks with getent that the namespace really shows the
+    # entry it intends (nscd or another NSS source could bypass the copy)
+    # before starting avd; if it does not, the case is skipped, not passed.
+    # The refusal comes before avd needs the kernel module.
+    echo "startup with AVD_PRIVSEP=1:"
+    AVD_BIN="$BUILD_DIR/avd"
+    AVD_START="$BUILD_DIR/avd-start"
+    mkdir -p "$AVD_START/rules" "$AVD_START/q"
+    chmod 700 "$AVD_START/q"
+    # shellcheck disable=SC2016 # $a is YARA syntax, not a shell variable
+    printf 'rule T { strings: $a = "XYZ" condition: $a }\n' > "$AVD_START/rules/t.yar"
+    : > "$AVD_START/fuzzy.txt"
+    : > "$AVD_START/tlsh.txt"
+    # shellcheck disable=SC2086 # $CFLAGS_PC and $LIBS are intentionally word-split
+    if ! cc -O2 -w -I"$AVD_DIR" $CFLAGS_PC -o "$AVD_BIN" "$AVD_DIR/avd.c" \
+            "$AVD_DIR/sha256.c" "$AVD_DIR/tlsh_core.c" "$AVD_DIR/tlsh_shim.c" \
+            $LIBS 2> "$BUILD_DIR/cc-avd.log"; then
+        fail "could not build avd for the startup cases"
+        cat "$BUILD_DIR/cc-avd.log"
+    elif ! command -v unshare >/dev/null 2>&1; then
+        echo "  SKIP: unshare is not available"
+    else
+        # startup_case <name> <passwd line, or empty for "no such user"> <want>
+        # want: refuse | proceed
+        startup_case() {
+            local name="$1" line="$2" want="$3"
+            local pw="$BUILD_DIR/passwd-$name" log="$BUILD_DIR/start-$name.log" rc
+            grep -v '^hyprav-scan:' /etc/passwd > "$pw"
+            [ -n "$line" ] && echo "$line" >> "$pw"
+            # shellcheck disable=SC2016 # expanded by the inner shell, on purpose
+            unshare -m --propagation private env PW="$pw" EXPECT="$line" \
+                AVD_PRIVSEP=1 bash -c '
+                mount --bind "$PW" /etc/passwd || exit 77
+                [ "$(getent passwd hyprav-scan)" = "$EXPECT" ] || exit 77
+                exec timeout 15 "$@"' _ \
+                "$AVD_BIN" "$AVD_START/rules" "$AVD_START/fuzzy.txt" \
+                "$AVD_START/q" "$AVD_START/tlsh.txt" > "$log" 2>&1
+            rc=$?
+            if [ "$rc" -eq 77 ]; then
+                echo "  SKIP: $name (could not give the namespace the intended hyprav-scan entry)"
+                return
+            fi
+            if [ "$want" = refuse ]; then
+                if [ "$rc" -eq 1 ] &&
+                   grep -qF 'the unprivileged user "hyprav-scan" is missing or is root' "$log" &&
+                   ! grep -q 'privilege separation on' "$log"; then
+                    pass "$name: avd exits 1 and names the hyprav-scan user"
+                else
+                    fail "$name: expected exit 1 and the refusal message (exit $rc)"
+                    head -5 "$log"
+                fi
+            else
+                # Past the check: no refusal, and the spawner came up. Without
+                # the kernel module avd then stops at the netlink family
+                # lookup (exit 1); with it loaded avd runs until the timeout.
+                if { [ "$rc" -eq 1 ] || [ "$rc" -eq 124 ]; } &&
+                   grep -q 'privilege separation on' "$log" &&
+                   ! grep -qF 'is missing or is root' "$log"; then
+                    pass "$name: a valid hyprav-scan user is accepted"
+                else
+                    fail "$name: expected avd to get past the account check (exit $rc)"
+                    head -5 "$log"
+                fi
+            fi
+        }
+        startup_case user-missing ""                                                        refuse
+        startup_case uid-zero     "hyprav-scan:x:0:65534::/:/usr/sbin/nologin"              refuse
+        startup_case gid-zero     "hyprav-scan:x:65534:0::/:/usr/sbin/nologin"              refuse
+        startup_case user-valid   "hyprav-scan:x:65534:65534::/:/usr/sbin/nologin"          proceed
     fi
 fi
 

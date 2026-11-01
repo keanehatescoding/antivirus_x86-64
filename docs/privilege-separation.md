@@ -597,20 +597,42 @@ and syscalls.
 - Any worker failure (no worker, crash, timeout, malformed reply) returns the
   canonical failure result, logged to stderr with the reason. Losing the
   spawner makes avd exit 1 so systemd restarts it.
-- Limits, chosen without measurement and to be revisited with the latency
-  numbers (open question 3): a worker is recycled after 256 scans, so it stays
-  well under its cumulative `RLIMIT_CPU` (3600 s); `RLIMIT_NOFILE` is 32; and
+- Limits. The reply wait is YARA's 10 s plus 20 s each for the ssdeep and TLSH
+  passes (50 s), which have no timeout of their own and read at most 256 MiB.
+  Measured on a 2.1 GHz Xeon with the shipped rules and corpora, a 255 MiB
+  file takes about 5 s end to end (YARA 0.4 s, ssdeep 1.5-2 s, TLSH 2.5-2.7 s),
+  so the budget is roughly 8x the worst case. `RLIMIT_CPU` is cumulative, so it
+  is derived rather than guessed: 256 scans (the recycle point) times the wait
+  plus a second, 13056 s, which a worker cannot reach before it is recycled.
+  The recycle count itself is still unmeasured and to be revisited with the
+  latency numbers (open question 3). `RLIMIT_NOFILE` is 32; and
   `RLIMIT_AS` is the spawner's virtual size at fork plus 2 GiB, because the
   compiled rules and corpora count against it and libyara maps the scanned
   file whole. A file too large to map comes back inconclusive (fail open)
   instead of being scanned. That is a behaviour difference from the
-  in-process path.
+  in-process path, and a real one: shown with a 256 MiB headroom and a 1 GiB
+  file that an override rule convicts, the in-process scan returns MALICIOUS
+  and the worker returns CLEAN plus inconclusive. With the shipped 2 GiB
+  headroom the window is narrow, since YARA's own 10 s timeout also fails open
+  (a 3 GiB file took 19 s to scan here and timed out in both paths), so it
+  covers files above the headroom that still scan inside the timeout. It is
+  still an evasion of the fail-open kind (pad a sample past the headroom), and
+  it is not closed. The obvious fix, `RLIMIT_DATA` instead of `RLIMIT_AS`,
+  does let the worker scan that file, but `RLIMIT_DATA` does not count shared
+  mappings (checked: a 1 GiB `MAP_SHARED|MAP_ANONYMOUS` succeeds under a
+  256 MiB `RLIMIT_DATA` and fails under `RLIMIT_AS`), so a compromised worker
+  could then exhaust memory. Open question 6 below.
 - `tests/test_perform_scan.sh` runs the whole case table twice, in process and
   in workers, and requires identical verdicts, rule names, scores, quarantine
   contents and metrics. As root it also reads a live worker back from `/proc`
   (dedicated uid and gid, empty `CapEff`, `NoNewPrivs`, `Seccomp: 2`) and
-  checks that losing the spawner makes avd exit without scanning. Without root
-  the worker half prints SKIP.
+  checks that losing the spawner makes avd exit without scanning. It also
+  starts the real avd with `AVD_PRIVSEP=1` in a private mount namespace with a
+  bind-mounted copy of `/etc/passwd` (the host's accounts are never touched)
+  and asserts exit 1 and the refusal message when `hyprav-scan` is missing,
+  has uid 0 or has gid 0, plus a control where a valid user is accepted; a
+  case whose namespace does not show the intended entry is skipped, not
+  passed. Without root the worker half prints SKIP.
 
 ## Tests
 
@@ -693,6 +715,14 @@ dispatch slice.
 5. Whether to kill a worker whose scan has already missed the fanotify
    deadline, instead of letting it finish and only logging the late result as
    today.
+6. Files too large for the worker's address-space limit fail open, where the
+   in-process scan would convict them (see "As wired into avd"). Options:
+   keep `RLIMIT_AS` and accept the gap; move to `RLIMIT_DATA` and bound the
+   worker's memory another way (shared mappings are not counted by it), for
+   example a cgroup memory limit on the unit or a seccomp rule that rejects
+   `MAP_SHARED` on anonymous mappings; or have the parent refuse to send
+   files above the limit and treat them by policy (for example a size-only
+   verdict, or quarantine-on-doubt).
 
 ## Out of scope
 
