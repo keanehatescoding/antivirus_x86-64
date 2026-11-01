@@ -631,8 +631,8 @@ and syscalls.
   bind-mounted copy of `/etc/passwd` (the host's accounts are never touched)
   and asserts exit 1 and the refusal message when `hyprav-scan` is missing,
   has uid 0 or has gid 0, a control where a valid user is accepted, and a
-  default-off case (`AVD_PRIVSEP` unset must skip the account check and start
-  no workers). These avd runs use an empty rules directory, so even with the
+  default-off pair (`AVD_PRIVSEP` unset, and set to `0`, must skip the account
+  check and start no workers; only the exact value `1` enables it). These avd runs use an empty rules directory, so even with the
   kernel module loaded nothing they see can be convicted or quarantined. A
   case whose namespace does not show the intended entry is skipped, not
   passed, and the whole group is skipped where mount namespaces are not

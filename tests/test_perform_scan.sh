@@ -657,7 +657,7 @@ else
                    { [ "$rc" -eq 124 ] || grep -q 'av module loaded' "$log"; } &&
                    ! grep -qF 'is missing or is root' "$log" &&
                    ! grep -q 'privilege separation on' "$log"; then
-                    pass "$name: with AVD_PRIVSEP unset avd skips the account check and starts no workers"
+                    pass "$name: with AVD_PRIVSEP ${psval:+set to $psval}${psval:-unset} avd skips the account check and starts no workers"
                 else
                     fail "$name: avd did not behave as default-off (exit $rc)"
                     head -5 "$log"
@@ -681,6 +681,7 @@ else
         startup_case gid-zero     "hyprav-scan:x:65534:0::/:/usr/sbin/nologin"              refuse
         startup_case user-valid   "hyprav-scan:x:65534:65534::/:/usr/sbin/nologin"          proceed
         startup_case default-off  ""                                                        off     ""
+        startup_case privsep-zero ""                                                        off     "0"
     fi
 fi
 
