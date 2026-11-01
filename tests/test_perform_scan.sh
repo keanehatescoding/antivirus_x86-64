@@ -592,13 +592,16 @@ else
     # entry it intends (nscd or another NSS source could bypass the copy)
     # before starting avd; if it does not, the case is skipped, not passed.
     # The refusal comes before avd needs the kernel module.
-    echo "startup with AVD_PRIVSEP=1:"
+    echo "startup (AVD_PRIVSEP):"
     AVD_BIN="$BUILD_DIR/avd"
     AVD_START="$BUILD_DIR/avd-start"
     mkdir -p "$AVD_START/rules" "$AVD_START/q"
     chmod 700 "$AVD_START/q"
-    # shellcheck disable=SC2016 # $a is YARA syntax, not a shell variable
-    printf 'rule T { strings: $a = "XYZ" condition: $a }\n' > "$AVD_START/rules/t.yar"
+    # Deliberately no rules, fuzzy or TLSH entries: avd accepts an empty rules
+    # directory (it warns that every scan will report clean). The cases that
+    # get past the account check start a real avd, and if the kernel module
+    # is loaded it registers for scan requests until the timeout, so nothing
+    # it sees may be convictable or quarantinable.
     : > "$AVD_START/fuzzy.txt"
     : > "$AVD_START/tlsh.txt"
     # shellcheck disable=SC2086 # $CFLAGS_PC and $LIBS are intentionally word-split
@@ -609,17 +612,22 @@ else
         cat "$BUILD_DIR/cc-avd.log"
     elif ! command -v unshare >/dev/null 2>&1; then
         echo "  SKIP: unshare is not available"
+    elif ! unshare -m --propagation private true >/dev/null 2>&1; then
+        # Installed but not allowed (a restricted container): skip, do not fail.
+        echo "  SKIP: mount namespaces are not available"
     else
         # startup_case <name> <passwd line, or empty for "no such user"> <want>
-        # want: refuse | proceed
+        #              [AVD_PRIVSEP value; default 1, empty means unset]
+        # want: refuse | proceed | off
         startup_case() {
-            local name="$1" line="$2" want="$3"
+            local name="$1" line="$2" want="$3" psval="${4-1}"
             local pw="$BUILD_DIR/passwd-$name" log="$BUILD_DIR/start-$name.log" rc
             grep -v '^hyprav-scan:' /etc/passwd > "$pw"
             [ -n "$line" ] && echo "$line" >> "$pw"
             # shellcheck disable=SC2016 # expanded by the inner shell, on purpose
             unshare -m --propagation private env PW="$pw" EXPECT="$line" \
-                AVD_PRIVSEP=1 bash -c '
+                PSVAL="$psval" bash -c '
+                if [ -n "$PSVAL" ]; then export AVD_PRIVSEP="$PSVAL"; else unset AVD_PRIVSEP; fi
                 mount --bind "$PW" /etc/passwd || exit 77
                 [ "$(getent passwd hyprav-scan)" = "$EXPECT" ] || exit 77
                 exec timeout 15 "$@"' _ \
@@ -637,6 +645,21 @@ else
                     pass "$name: avd exits 1 and names the hyprav-scan user"
                 else
                     fail "$name: expected exit 1 and the refusal message (exit $rc)"
+                    head -5 "$log"
+                fi
+            elif [ "$want" = off ]; then
+                # Opt-in means off by default: with AVD_PRIVSEP unset avd must
+                # not look at the account (here it is missing, which would be a
+                # refusal if the default were on), must not start workers, and
+                # must get as far as the netlink stage like the cases below
+                # (exit 1 at the family lookup, or 124 if the module is loaded).
+                if { [ "$rc" -eq 1 ] || [ "$rc" -eq 124 ]; } &&
+                   { [ "$rc" -eq 124 ] || grep -q 'av module loaded' "$log"; } &&
+                   ! grep -qF 'is missing or is root' "$log" &&
+                   ! grep -q 'privilege separation on' "$log"; then
+                    pass "$name: with AVD_PRIVSEP unset avd skips the account check and starts no workers"
+                else
+                    fail "$name: avd did not behave as default-off (exit $rc)"
                     head -5 "$log"
                 fi
             else
@@ -657,6 +680,7 @@ else
         startup_case uid-zero     "hyprav-scan:x:0:65534::/:/usr/sbin/nologin"              refuse
         startup_case gid-zero     "hyprav-scan:x:65534:0::/:/usr/sbin/nologin"              refuse
         startup_case user-valid   "hyprav-scan:x:65534:65534::/:/usr/sbin/nologin"          proceed
+        startup_case default-off  ""                                                        off     ""
     fi
 fi
 
