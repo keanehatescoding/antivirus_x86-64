@@ -1,16 +1,18 @@
 # avd privilege separation (design sketch for #103)
 
-Status: Stage 0 is merged (#200). Stage 1 is being built in slices: the
+Status: Stage 0 is merged (#200). Stage 1 is built in slices, all tested: the
 wire format and reply validation (`userspace/avd/privsep_proto.h`), the
 parent/content split inside `analyze_fd()`, the worker side
-(`userspace/avd/privsep_worker.h`: the hardening sequence, the seccomp
-filter and the request/reply loop) and the spawner with its control channel
-(`userspace/avd/privsep_spawner.h`: `SPAWN`/`KILL`/`READY`/`FAILED`/`EXITED`,
-the `poll()` + `signalfd` loop, reaping, the worker readiness report), all
-tested standalone, are in. Still to come: the spawner's own capability drop
-and seccomp superset filter, the parent-side dispatch (reader thread, request
-table, the `/proc/<pid>/status` check, canonical failure on any anomaly) and
-`AVD_PRIVSEP`. Stage 2 is design only.
+(`privsep_worker.h`: the hardening sequence, the seccomp filter and the
+request/reply loop), the spawner with its control channel
+(`privsep_spawner.h`) and the parent-side dispatch client
+(`privsep_client.h`: reader thread, request table, the `/proc/<pid>/status`
+check, canonical failure on any anomaly). Stage 1e wires them into avd behind
+`AVD_PRIVSEP=1` (see "As wired into avd" under Rollout). Still to come: the
+spawner's own capability drop and seccomp superset filter (until then the
+spawner keeps root's capabilities; it never reads a scanned file) and the
+real-QEMU run of the boot and fanotify tests with `AVD_PRIVSEP=1`. Stage 2 is
+design only.
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -569,6 +571,46 @@ and syscalls.
   but it should be measured, not assumed. The same measurement decides the
   worker-recycling question.
 - Worker count follows the existing scan pool size.
+
+### As wired into avd (Stage 1e)
+
+- `AVD_PRIVSEP=1` is read once at startup. avd then looks up the user
+  `hyprav-scan` (declared in `packaging/hyprav.sysusers` and its Debian twin)
+  and **refuses to start** if the user is missing or is root, or if the
+  spawner cannot be started. It never falls back to scanning as root.
+- The spawner is forked in the window the design names: after
+  `load_tlsh_corpus()`, while single-threaded, before `nl_socket_alloc()`.
+  stdio is flushed first so no buffered output is duplicated into the spawner
+  and every worker.
+- Each scan thread owns one worker (thread-local handle), spawned on its first
+  scan and released when the thread exits. `analyze_fd()` does SHA-256 and the
+  signature lookup in the parent as before, then calls `analyze_in_worker()`
+  instead of `analyze_content()`.
+- The worker writes no logs: it has no `write()` under its filter, so its
+  `stdout` and `stderr` are pointed at fixed in-memory buffers (`fmemopen`, no
+  syscalls) and discarded. The parent prints the `scan` line itself and, for a
+  conviction, a `MATCH`, `FUZZY MATCH` or `TLSH MATCH` line built from the
+  validated rule name. The reply carries no YARA match count, so the
+  YARA line reads `avd: MATCH "<path>" -> score=<n>: "<rules>"`, and the
+  "matched but below threshold" line is not reproduced. Relying on assigning
+  `stdout`/`stderr` is a glibc property, which is all avd targets.
+- Any worker failure (no worker, crash, timeout, malformed reply) returns the
+  canonical failure result, logged to stderr with the reason. Losing the
+  spawner makes avd exit 1 so systemd restarts it.
+- Limits, chosen without measurement and to be revisited with the latency
+  numbers (open question 3): a worker is recycled after 256 scans, so it stays
+  well under its cumulative `RLIMIT_CPU` (3600 s); `RLIMIT_NOFILE` is 32; and
+  `RLIMIT_AS` is the spawner's virtual size at fork plus 2 GiB, because the
+  compiled rules and corpora count against it and libyara maps the scanned
+  file whole. A file too large to map comes back inconclusive (fail open)
+  instead of being scanned. That is a behaviour difference from the
+  in-process path.
+- `tests/test_perform_scan.sh` runs the whole case table twice, in process and
+  in workers, and requires identical verdicts, rule names, scores, quarantine
+  contents and metrics. As root it also reads a live worker back from `/proc`
+  (dedicated uid and gid, empty `CapEff`, `NoNewPrivs`, `Seccomp: 2`) and
+  checks that losing the spawner makes avd exit without scanning. Without root
+  the worker half prints SKIP.
 
 ## Tests
 

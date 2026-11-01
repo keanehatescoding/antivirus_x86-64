@@ -1,7 +1,8 @@
 # systemd-sysusers declaration for the hyprav trusted-reader group
-# (shipped as packaging/hyprav.sysusers, see #143). Debian consumes
+# (shipped as packaging/hyprav.sysusers, see #143) and the unprivileged
+# scan-worker user (#103). Debian consumes
 # the twin copy at debian/hyprav.sysusers via dh_installsysusers -
-# both declare the same single line, keep them in sync.
+# both declare the same two lines, keep them in sync.
 #
 # The three IOC /proc entries are 0640; membership in this group is
 # what lets a non-root desktop user read them via the GUI dashboard
@@ -11,3 +12,9 @@
 # (the modprobe hook and apply-ioc-group.sh reference the group by
 # name, never by number).
 g hyprav - -
+#
+# hyprav-scan: the user avd's scan workers drop to when AVD_PRIVSEP=1
+# (docs/privilege-separation.md). It owns nothing, has no login shell and
+# no home, and is not in the hyprav group. `u` also creates a group of the
+# same name. avd refuses to start with AVD_PRIVSEP=1 if it is missing.
+u hyprav-scan - "HyprAV scan worker (avd privilege separation)" - /usr/sbin/nologin
