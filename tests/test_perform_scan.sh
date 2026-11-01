@@ -622,6 +622,8 @@ else
         startup_case() {
             local name="$1" line="$2" want="$3" psval="${4-1}"
             local pw="$BUILD_DIR/passwd-$name" log="$BUILD_DIR/start-$name.log" rc
+            local shown="set to $psval"
+            [ -n "$psval" ] || shown="unset"
             grep -v '^hyprav-scan:' /etc/passwd > "$pw"
             [ -n "$line" ] && echo "$line" >> "$pw"
             # shellcheck disable=SC2016 # expanded by the inner shell, on purpose
@@ -657,7 +659,7 @@ else
                    { [ "$rc" -eq 124 ] || grep -q 'av module loaded' "$log"; } &&
                    ! grep -qF 'is missing or is root' "$log" &&
                    ! grep -q 'privilege separation on' "$log"; then
-                    pass "$name: with AVD_PRIVSEP ${psval:+set to $psval}${psval:-unset} avd skips the account check and starts no workers"
+                    pass "$name: with AVD_PRIVSEP $shown avd skips the account check and starts no workers"
                 else
                     fail "$name: avd did not behave as default-off (exit $rc)"
                     head -5 "$log"
