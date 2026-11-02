@@ -369,6 +369,23 @@ int main(int argc, char **argv) {
     if (sf)
       fclose(sf);
   }
+  /* And the spawner that made it (Stage 1f): still root, but cut to four
+   * capabilities, with NoNewPrivs and its own seccomp filter. */
+  if (privsep_enabled) {
+    char sp[64], line[256];
+    FILE *sf;
+
+    snprintf(sp, sizeof(sp), "/proc/%d/status", (int)privsep_cl.spawner_pid);
+    sf = fopen(sp, "r");
+    while (sf && fgets(line, sizeof(line), sf))
+      if (!strncmp(line, "Uid:", 4) || !strncmp(line, "CapEff:", 7) ||
+          !strncmp(line, "CapPrm:", 7) || !strncmp(line, "CapBnd:", 7) ||
+          !strncmp(line, "CapAmb:", 7) || !strncmp(line, "NoNewPrivs:", 11) ||
+          !strncmp(line, "Seccomp:", 8))
+        printf("SPAWNER %s", line);
+    if (sf)
+      fclose(sf);
+  }
   privsep_stop();
   return 0;
 }
@@ -538,6 +555,19 @@ else
         pass "the worker ran as the unprivileged user, no capabilities, NoNewPrivs, seccomp filter"
     else
         fail "the worker was not confined as expected ($(grep '^WORKER' "$OUT" | tr '\n\t' '; '))"
+    fi
+    # The spawner keeps exactly CAP_KILL, CAP_SETGID, CAP_SETUID and
+    # CAP_SETPCAP (bits 5-8 = 0x1e0), in every set that matters.
+    if grep -qP '^SPAWNER Uid:\t0\t0\t0\t0$' "$OUT" &&
+       grep -qP '^SPAWNER CapEff:\t0+1e0$' "$OUT" &&
+       grep -qP '^SPAWNER CapPrm:\t0+1e0$' "$OUT" &&
+       grep -qP '^SPAWNER CapBnd:\t0+1e0$' "$OUT" &&
+       grep -qP '^SPAWNER CapAmb:\t0+$' "$OUT" &&
+       grep -qP '^SPAWNER NoNewPrivs:\t1$' "$OUT" &&
+       grep -qP '^SPAWNER Seccomp:\t2$' "$OUT"; then
+        pass "the spawner kept only SETUID, SETGID, SETPCAP and KILL, with NoNewPrivs and a seccomp filter"
+    else
+        fail "the spawner was not locked down as expected ($(grep '^SPAWNER' "$OUT" | tr '\n\t' '; '))"
     fi
     if grep -qE 'privsep: .*(failed|no worker)' "$BUILD_DIR/err-privsep.txt"; then
         fail "a worker failed during the run"

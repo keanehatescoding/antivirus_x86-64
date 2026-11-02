@@ -8,11 +8,12 @@ request/reply loop), the spawner with its control channel
 (`privsep_spawner.h`) and the parent-side dispatch client
 (`privsep_client.h`: reader thread, request table, the `/proc/<pid>/status`
 check, canonical failure on any anomaly). Stage 1e wires them into avd behind
-`AVD_PRIVSEP=1` (see "As wired into avd" under Rollout). Still to come: the
-spawner's own capability drop and seccomp superset filter (until then the
-spawner keeps root's capabilities; it never reads a scanned file) and the
-real-QEMU run of the boot and fanotify tests with `AVD_PRIVSEP=1`. Stage 2 is
-design only.
+`AVD_PRIVSEP=1` (see "As wired into avd" under Rollout). Stage 1f locks the
+spawner itself down (`privsep_lockdown.h`: capabilities cut to four,
+`NO_NEW_PRIVS`, a seccomp superset filter; see "As implemented" under "The
+spawner"). Still to come: the real-QEMU run of the boot and fanotify tests with
+`AVD_PRIVSEP=1`, and logging why the spawner died (see "Open items"). Stage 2
+is design only.
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -217,10 +218,9 @@ The spawner:
 This also answers "who keeps the bootstrap capabilities for respawns": the
 spawner does, and the main process does not need them (Stage 2).
 
-**As implemented (`privsep_spawner.h`).** The behaviour above is in, except
-the spawner's own capability drop and seccomp superset filter, which are not
-implemented yet (see Status). These details are worth knowing that the sketch
-did not say:
+**As implemented (`privsep_spawner.h`).** The behaviour above is in, and the
+spawner's own lockdown is described in the next subsection. These details are
+worth knowing that the sketch did not say:
 
 - One fixed 40-byte struct carries every message in both directions, and each
   receiver validates it per sender class: a type that sender may not send,
@@ -262,6 +262,50 @@ did not say:
 - The pid the worker compares `getppid()` against is recorded by the spawner
   before `fork()`. Reading it in the child would also accept a spawner that
   had already died and orphaned it.
+
+**As implemented: the spawner's lockdown (`privsep_lockdown.h`).** The spawner
+locks itself down inside `ps_spawner_run()`, once its own setup is done and
+before it serves anything. It cannot be switched off in a production build.
+The steps run in this order and each is read back; a failure ends the spawner
+with exit status `16 + step`, avd sees the channel close and refuses to run:
+
+1. bounding set cut to `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`, `CAP_KILL`
+   (a missing one is an error: the next step could not raise it)
+2. effective and permitted set to the same four, inheritable empty (which also
+   empties the ambient set)
+3. `NO_NEW_PRIVS`
+4. `PR_SET_PDEATHSIG` again, read back, and `getppid()` must still be avd. A
+   capability drop should not clear it, but the contract is "if avd dies, so
+   do I", so a kernel or a reordering that disagrees fails closed
+5. the seccomp filter, last
+
+The filter is built by a small label assembler (about 75 instructions) rather
+than by hand-computed offsets. It is a superset of the worker allowlist plus
+what only the spawner needs, and the extra list came from tracing a real
+spawner and the hardening of a real worker with `strace -f`, not from reading
+the code. Things the trace turned up that the sketch missed:
+
+- `set_robust_list`: glibc calls it in every fork child, so it runs after the
+  spawner's filter is installed
+- `setuid` and `setgid`: worker hardening probes that `setuid(0)` now fails,
+  and a killed probe would be a worker that can never start
+- `signalfd4` and `rt_sigaction` are not on the list at all: the spawner does
+  those before the filter exists, which is why the lockdown comes last
+
+Argument checks: `prctl` only for the seven options in use, `kill` only with
+`SIGKILL`, `clone` only with exactly `fork()`'s flags (`CHILD_SETTID`,
+`CHILD_CLEARTID`, exit signal `SIGCHLD`, upper half zero, so no threads and no
+`CLONE_NEW*`), `socketpair` only `AF_UNIX`, `prlimit64` only on pid 0,
+`newfstatat` only with `AT_EMPTY_PATH`. Everything else, including `open*`,
+`socket`, `execve*`, `ptrace`, `write`, `mount`, `bpf` and `clone3`, kills the
+spawner.
+
+The filter depends on glibc's behaviour: `fork()` is `clone`, not `clone3`,
+and `poll` is `poll`, not `ppoll` (glibc 2.39 on x86-64, checked here). On a
+libc that differs the spawner dies on its first spawn, avd exits and the
+failure is loud, but nothing in avd's log yet says the cause was a seccomp
+kill (see "Open items"). `tests/test_privsep_lockdown.sh` runs a real `fork()`
+under the filter, so a build host that differs fails there first.
 
 **Reaping and lifecycle.** The spawner is the parent of every worker, so it is
 the only process that can reap them, and it must. It blocks `SIGCHLD` and
@@ -505,8 +549,10 @@ A seccomp filter is inherited across `fork()`. A child may add filters but can
 never loosen one it inherited; every attached filter is evaluated and the
 strictest result wins. Three consequences:
 
-1. The spawner's own filter must allow everything a worker needs, so it is a
-   superset of the worker allowlist plus what only the spawner needs
+1. The spawner's own filter (implemented, `privsep_lockdown.h`; the test suite
+   checks the superset property over every syscall number) must allow everything
+   a worker needs, so it is a superset of the worker allowlist plus what only
+   the spawner needs
    (`clone`/`fork`, `wait4`, `kill`, `socketpair`, `sendmsg`/`recvmsg`,
    `poll`, `signalfd`, the credential, capability and rlimit calls,
    `prctl`, `seccomp`). A narrow spawner filter would kill the workers it
@@ -654,6 +700,21 @@ items for the spawner side. The parent-side items (late replies, respawn
 under concurrent scans, the `/proc` check, `AVD_PRIVSEP=1`) arrive with the
 dispatch slice.
 
+`tests/test_privsep_lockdown.sh` covers the spawner's lockdown. Under
+ASan+UBSan it runs the seccomp program through a classic-BPF interpreter
+against an independent statement of what the spawner may do: every syscall
+number, every argument-checked call, the architecture and x32 checks, the
+superset property against the worker filter, and the assembler's failure modes.
+Against the real kernel it installs the same filter in forked children (no root
+needed) to show that what the spawner uses works, including a real glibc
+`fork()`, and that what it must never do kills it with `SIGSYS`. As root it
+reads a real spawner back from `/proc` (four capabilities in every set,
+`NoNewPrivs`, `Seccomp: 2`) and the worker it made (still fully hardened under
+both filters), injects a failure at each lockdown step, shows that a missing
+`CAP_SETPCAP` or a wrong parent pid is refused before anything serves, and
+kills avd to show the locked-down spawner dies with it. `tests/test_perform_scan.sh`
+reads the spawner back from inside the real avd.
+
 - hardening failure injection: make each step (setuid, capset, seccomp, ...)
   fail in a test build; the worker must exit without reporting ready and the
   parent must never send it a request
@@ -702,7 +763,7 @@ dispatch slice.
   with the listener never blocking (contracts 3 and 4)
 - seccomp kill is observed if a worker attempts `open()` (test hook)
 - `tests/test_perform_scan.sh` and the existing QEMU boot and fanotify tests
-  pass with `AVD_PRIVSEP=1`
+  pass with `AVD_PRIVSEP=1` (the first does; the QEMU run is still to do)
 
 ## Open questions
 
@@ -727,6 +788,14 @@ dispatch slice.
    `MAP_SHARED` on anonymous mappings; or have the parent refuse to send
    files above the limit and treat them by policy (for example a size-only
    verdict, or quarantine-on-doubt).
+
+## Open items
+
+- When the spawner dies, avd only logs that it is gone. A spawner killed by its
+  own seccomp filter (a libc that issues a call this list lacks) looks the same
+  as any other death. avd should reap it and log the wait status the way the
+  client already does for workers, with a short wait because the channel closes
+  a moment before the process becomes reapable.
 
 ## Out of scope
 

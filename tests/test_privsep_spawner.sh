@@ -443,6 +443,7 @@ static void script(int n, const struct step *s) {
 
 static int start_stubbed(const struct ps_spawner_cfg *cfg, int *ctl, pid_t *sp) {
     ps_spawner_test_harden = stub_harden;
+    ps_spawner_test_no_lockdown = 1; /* the lockdown needs root; test_privsep_lockdown.sh covers it */
     reset_queues();
     return ps_spawner_start(cfg, ctl, sp);
 }
