@@ -757,8 +757,8 @@ static inline int ps_spawner_run(const struct ps_spawner_cfg *cfg, int ctl) {
   if (sfd < 0)
     return 1;
 
-  /* Everything above needed calls the filter does not allow (rt_sigaction,
-   * signalfd4), so the lockdown comes last. A failure ends the spawner: avd
+  /* The signalfd4 above is a call the filter does not allow, so the lockdown
+   * comes last. A failure ends the spawner: avd
    * sees the channel close and refuses to run rather than serve from a
    * spawner that kept root's full power. */
 #ifdef PS_SPAWNER_TEST_HOOKS

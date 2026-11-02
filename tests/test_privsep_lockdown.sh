@@ -705,8 +705,9 @@ static void test_spawner_state(void) {
     struct ps_ctl_msg r;
     struct ps_verdict v;
     char want[32];
-    int ctl, w = -1;
-    pid_t sp;
+    int ctl = -1, w = -1;
+    pid_t sp = 0;
+    bool started;
 
     printf("\na real spawner, read back from /proc (root):\n");
     if (!can_lock_down()) {
@@ -715,7 +716,9 @@ static void test_spawner_state(void) {
     }
     ps_test_fail_step = 0;
     ps_test_lock_fail_step = 0;
-    CHECK(ps_spawner_start(&cfg, &ctl, &sp) == 0, "the spawner starts");
+    started = ps_spawner_start(&cfg, &ctl, &sp) == 0;
+    CHECK(started, "the spawner starts");
+    if (!started) return; /* ctl and sp are not set on failure */
     /* A reply proves the spawner is past its lockdown and in its loop. */
     CHECK(spawn_one(ctl, 1, &r, &w), "a locked-down spawner still spawns a hardened worker");
     if (w < 0) { stop_spawner(ctl, sp); return; }
@@ -751,10 +754,17 @@ static void test_spawner_state(void) {
           "the worker convicts under both filters");
     CHECK(roundtrip(w, 78, "clean", &v) && v.verdict == PS_VERDICT_CLEAN && !v.inconclusive,
           "and clears under both filters");
-    close(w);
+    /* Close the channel first, with the worker's socket still open. The other
+     * order lets the worker exit on EOF while the spawner reports it on a
+     * channel main closes a moment later; a failed send ends the spawner with
+     * status 1 by design, which would make this check racy, not wrong. */
     {
         int st = stop_spawner(ctl, sp);
 
+        close(w);
+        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0))
+            printf("    spawner status: %s %d\n", WIFSIGNALED(st) ? "signal" : "exit",
+                   WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0,
               "closing the channel ends the locked-down spawner in an orderly way");
     }
@@ -861,6 +871,12 @@ static void test_dies_with_parent(void) {
     }
     if (pipe(p) < 0) { CHECK(false, "pipe"); return; }
     mid = fork();
+    if (mid < 0) { /* never go on to kill(mid): kill(-1) signals everything */
+        close(p[0]);
+        close(p[1]);
+        CHECK(false, "fork");
+        return;
+    }
     if (mid == 0) {
         struct ps_ctl_msg r;
         int c, w = -1;

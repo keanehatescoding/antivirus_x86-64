@@ -163,8 +163,9 @@ static inline int ps_set_capabilities_to(uint64_t keep) {
  *
  * Deliberately absent, so a compromised spawner cannot use them: open*,
  * socket, connect, bind, execve*, ptrace, write, every filesystem call,
- * mount, unshare, setns, bpf, io_uring, clone3 and signalfd4/rt_sigaction
- * (the spawner sets those up before this filter exists). */
+ * mount, unshare, setns, bpf, io_uring, clone3 and signalfd4 (the spawner
+ * calls it before this filter exists). rt_sigaction is allowed, through the
+ * worker list. */
 static const int ps_allow_spawner_extra[] = {
     SYS_poll,       SYS_wait4,     SYS_getpid,    SYS_getppid,
     SYS_recvmsg,    SYS_sendmsg,   SYS_set_robust_list,
@@ -391,8 +392,8 @@ static inline int ps_seccomp_install_spawner(void) {
 /* Run every step in order; stop at the first failure and return its step
  * number, or 0 once the spawner is locked down. `expect_ppid` is the pid of
  * the process that forked the spawner (avd). Call it once the spawner has
- * finished its own setup (signal handling, signalfd), because the filter does
- * not allow the calls that need. */
+ * finished its own setup (the signalfd), because the filter does not allow
+ * signalfd4. */
 static inline int ps_spawner_lockdown(pid_t expect_ppid) {
   PS_LOCK_HOOK(PS_L_BOUNDING_SET);
   if (ps_bounding_set_to(PS_SPAWNER_CAPS) < 0)

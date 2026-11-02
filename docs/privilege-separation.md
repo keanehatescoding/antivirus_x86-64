@@ -266,8 +266,10 @@ worth knowing that the sketch did not say:
 **As implemented: the spawner's lockdown (`privsep_lockdown.h`).** The spawner
 locks itself down inside `ps_spawner_run()`, once its own setup is done and
 before it serves anything. It cannot be switched off in a production build.
-The steps run in this order and each is read back; a failure ends the spawner
-with exit status `16 + step`, avd sees the channel close and refuses to run:
+The steps run in this order. Steps 1 to 4 are read back; step 5 (seccomp) is
+checked only by the return value of `prctl(PR_SET_SECCOMP)`. A failure at any
+step ends the spawner with exit status `16 + step`, avd sees the channel close
+and refuses to run:
 
 1. bounding set cut to `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`, `CAP_KILL`
    (a missing one is an error: the next step could not raise it)
@@ -289,8 +291,9 @@ the code. Things the trace turned up that the sketch missed:
   spawner's filter is installed
 - `setuid` and `setgid`: worker hardening probes that `setuid(0)` now fails,
   and a killed probe would be a worker that can never start
-- `signalfd4` and `rt_sigaction` are not on the list at all: the spawner does
-  those before the filter exists, which is why the lockdown comes last
+- `signalfd4` is not on the list at all: the spawner calls it before the
+  filter exists, which is why the lockdown comes last. (`rt_sigaction` is on
+  the list, through the worker allowlist.)
 
 Argument checks: `prctl` only for the seven options in use, `kill` only with
 `SIGKILL`, `clone` only with exactly `fork()`'s flags (`CHILD_SETTID`,
@@ -554,12 +557,13 @@ strictest result wins. Three consequences:
    a worker needs, so it is a superset of the worker allowlist plus what only
    the spawner needs
    (`clone`/`fork`, `wait4`, `kill`, `socketpair`, `sendmsg`/`recvmsg`,
-   `poll`, `signalfd`, the credential, capability and rlimit calls,
-   `prctl`, `seccomp`). A narrow spawner filter would kill the workers it
-   creates. The tight worker-only filter above is installed last, inside the
+   `poll`, the credential, capability and rlimit calls, `prctl`). A narrow
+   spawner filter would kill the workers it creates. The tight worker-only filter above is installed last, inside the
    worker, after hardening.
 2. A `SystemCallFilter=` in `packaging/avd.service` applies to the whole unit,
    spawner and workers included, so it must be a superset of both as well.
+   The spawner also calls `signalfd4` before it locks itself down, so that
+   filter has to allow it too, though the spawner's own filter does not.
 3. The main process installs its own Stage 2 filter only after it has forked
    the spawner. Installed earlier, the spawner would inherit it.
 
