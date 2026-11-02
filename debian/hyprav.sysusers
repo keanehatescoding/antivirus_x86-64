@@ -1,5 +1,5 @@
 # systemd-sysusers declaration for the hyprav trusted-reader group
-# (see #143). Installed by dh_installsysusers (enabled via the
+# (see #143) and the unprivileged scan-worker user (#103). Installed by dh_installsysusers (enabled via the
 # dh-sequence-installsysusers Build-Depends in debian/control), which
 # also generates the postinst snippet that runs systemd-sysusers on
 # install - so the group exists before the modprobe.d hook ever
@@ -8,6 +8,10 @@
 #
 # Content twin of packaging/hyprav.sysusers (shipped to
 # /usr/lib/sysusers.d by the Arch and Fedora packaging) - both declare
-# the same single line, keep them in sync. A Debian-side copy is
+# the same two lines, keep them in sync. A Debian-side copy is
 # needed because dh_installsysusers only acts on debian/<pkg>.sysusers.
 g hyprav - -
+#
+# hyprav-scan: the user avd's scan workers drop to when AVD_PRIVSEP=1
+# (docs/privilege-separation.md). See packaging/hyprav.sysusers.
+u hyprav-scan - "HyprAV scan worker (avd privilege separation)" - /usr/sbin/nologin

@@ -1,16 +1,18 @@
 # avd privilege separation (design sketch for #103)
 
-Status: Stage 0 is merged (#200). Stage 1 is being built in slices: the
+Status: Stage 0 is merged (#200). Stage 1 is built in slices, all tested: the
 wire format and reply validation (`userspace/avd/privsep_proto.h`), the
 parent/content split inside `analyze_fd()`, the worker side
-(`userspace/avd/privsep_worker.h`: the hardening sequence, the seccomp
-filter and the request/reply loop) and the spawner with its control channel
-(`userspace/avd/privsep_spawner.h`: `SPAWN`/`KILL`/`READY`/`FAILED`/`EXITED`,
-the `poll()` + `signalfd` loop, reaping, the worker readiness report), all
-tested standalone, are in. Still to come: the spawner's own capability drop
-and seccomp superset filter, the parent-side dispatch (reader thread, request
-table, the `/proc/<pid>/status` check, canonical failure on any anomaly) and
-`AVD_PRIVSEP`. Stage 2 is design only.
+(`privsep_worker.h`: the hardening sequence, the seccomp filter and the
+request/reply loop), the spawner with its control channel
+(`privsep_spawner.h`) and the parent-side dispatch client
+(`privsep_client.h`: reader thread, request table, the `/proc/<pid>/status`
+check, canonical failure on any anomaly). Stage 1e wires them into avd behind
+`AVD_PRIVSEP=1` (see "As wired into avd" under Rollout). Still to come: the
+spawner's own capability drop and seccomp superset filter (until then the
+spawner keeps root's capabilities; it never reads a scanned file) and the
+real-QEMU run of the boot and fanotify tests with `AVD_PRIVSEP=1`. Stage 2 is
+design only.
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -570,6 +572,72 @@ and syscalls.
   worker-recycling question.
 - Worker count follows the existing scan pool size.
 
+### As wired into avd (Stage 1e)
+
+- `AVD_PRIVSEP=1` is read once at startup. avd then looks up the user
+  `hyprav-scan` (declared in `packaging/hyprav.sysusers` and its Debian twin)
+  and **refuses to start** if the user is missing or is root, or if the
+  spawner cannot be started. It never falls back to scanning as root.
+- The spawner is forked in the window the design names: after
+  `load_tlsh_corpus()`, while single-threaded, before `nl_socket_alloc()`.
+  stdio is flushed first so no buffered output is duplicated into the spawner
+  and every worker.
+- Each scan thread owns one worker (thread-local handle), spawned on its first
+  scan and released when the thread exits. `analyze_fd()` does SHA-256 and the
+  signature lookup in the parent as before, then calls `analyze_in_worker()`
+  instead of `analyze_content()`.
+- The worker writes no logs: it has no `write()` under its filter, so its
+  `stdout` and `stderr` are pointed at fixed in-memory buffers (`fmemopen`, no
+  syscalls) and discarded. The parent prints the `scan` line itself and, for a
+  conviction, a `MATCH`, `FUZZY MATCH` or `TLSH MATCH` line built from the
+  validated rule name. The reply carries no YARA match count, so the
+  YARA line reads `avd: MATCH "<path>" -> score=<n>: "<rules>"`, and the
+  "matched but below threshold" line is not reproduced. Relying on assigning
+  `stdout`/`stderr` is a glibc property, which is all avd targets.
+- Any worker failure (no worker, crash, timeout, malformed reply) returns the
+  canonical failure result, logged to stderr with the reason. Losing the
+  spawner makes avd exit 1 so systemd restarts it.
+- Limits. The reply wait is YARA's 10 s plus 20 s each for the ssdeep and TLSH
+  passes (50 s), which have no timeout of their own and read at most 256 MiB.
+  Measured on a 2.1 GHz Xeon with the shipped rules and corpora, a 255 MiB
+  file takes about 5 s end to end (YARA 0.4 s, ssdeep 1.5-2 s, TLSH 2.5-2.7 s),
+  so the budget is roughly 8x the worst case. `RLIMIT_CPU` is cumulative, so it
+  is derived rather than guessed: 256 scans (the recycle point) times the wait
+  plus a second, 13056 s, which a worker cannot reach before it is recycled.
+  The recycle count itself is still unmeasured and to be revisited with the
+  latency numbers (open question 3). `RLIMIT_NOFILE` is 32; and
+  `RLIMIT_AS` is the spawner's virtual size at fork plus 2 GiB, because the
+  compiled rules and corpora count against it and libyara maps the scanned
+  file whole. A file too large to map comes back inconclusive (fail open)
+  instead of being scanned. That is a behaviour difference from the
+  in-process path, and a real one: shown with a 256 MiB headroom and a 1 GiB
+  file that an override rule convicts, the in-process scan returns MALICIOUS
+  and the worker returns CLEAN plus inconclusive. With the shipped 2 GiB
+  headroom the window is narrow, since YARA's own 10 s timeout also fails open
+  (a 3 GiB file took 19 s to scan here and timed out in both paths), so it
+  covers files above the headroom that still scan inside the timeout. It is
+  still an evasion of the fail-open kind (pad a sample past the headroom), and
+  it is not closed. The obvious fix, `RLIMIT_DATA` instead of `RLIMIT_AS`,
+  does let the worker scan that file, but `RLIMIT_DATA` does not count shared
+  mappings (checked: a 1 GiB `MAP_SHARED|MAP_ANONYMOUS` succeeds under a
+  256 MiB `RLIMIT_DATA` and fails under `RLIMIT_AS`), so a compromised worker
+  could then exhaust memory. Open question 6 below.
+- `tests/test_perform_scan.sh` runs the whole case table twice, in process and
+  in workers, and requires identical verdicts, rule names, scores, quarantine
+  contents and metrics. As root it also reads a live worker back from `/proc`
+  (dedicated uid and gid, empty `CapEff`, `NoNewPrivs`, `Seccomp: 2`) and
+  checks that losing the spawner makes avd exit without scanning. It also
+  starts the real avd with `AVD_PRIVSEP=1` in a private mount namespace with a
+  bind-mounted copy of `/etc/passwd` (the host's accounts are never touched)
+  and asserts exit 1 and the refusal message when `hyprav-scan` is missing,
+  has uid 0 or has gid 0, a control where a valid user is accepted, and a
+  default-off pair (`AVD_PRIVSEP` unset, and set to `0`, must skip the account
+  check and start no workers; only the exact value `1` enables it). These avd runs use an empty rules directory, so even with the
+  kernel module loaded nothing they see can be convicted or quarantined. A
+  case whose namespace does not show the intended entry is skipped, not
+  passed, and the whole group is skipped where mount namespaces are not
+  available. Without root the worker half prints SKIP.
+
 ## Tests
 
 `tests/test_privsep_spawner.sh` covers the spawner and its channel: the
@@ -651,6 +719,14 @@ dispatch slice.
 5. Whether to kill a worker whose scan has already missed the fanotify
    deadline, instead of letting it finish and only logging the late result as
    today.
+6. Files too large for the worker's address-space limit fail open, where the
+   in-process scan would convict them (see "As wired into avd"). Options:
+   keep `RLIMIT_AS` and accept the gap; move to `RLIMIT_DATA` and bound the
+   worker's memory another way (shared mappings are not counted by it), for
+   example a cgroup memory limit on the unit or a seccomp rule that rejects
+   `MAP_SHARED` on anonymous mappings; or have the parent refuse to send
+   files above the limit and treat them by policy (for example a size-only
+   verdict, or quarantine-on-doubt).
 
 ## Out of scope
 

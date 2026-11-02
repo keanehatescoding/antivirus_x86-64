@@ -100,6 +100,43 @@ static void run_case(const char *label, const char *path, bool with_hash) {
   fflush(stdout);
 }
 
+/* HARNESS_STRESS=1: several threads, each owning one worker, scanning a clean
+ * file far more often than AVD_PRIVSEP_MAX_SCANS so every thread recycles its
+ * worker. Counts scans that were not a clean conclusive result and how often
+ * each thread's worker pid changed. */
+struct stress_arg {
+  const char *path;
+  int scans;
+  int bad;
+  int pid_changes;
+};
+
+static void *stress_thread(void *a) {
+  struct stress_arg *s = a;
+  pid_t last = 0;
+
+  for (int i = 0; i < s->scans; i++) {
+    struct scan_result r;
+    int fd = open(s->path, O_RDONLY);
+
+    if (fd < 0) {
+      s->bad++;
+      continue;
+    }
+    perform_scan(fd, s->path, NULL, 0, true, &r);
+    close(fd);
+    if (r.verdict != AV_VERDICT_CLEAN || r.inconclusive)
+      s->bad++;
+    if (privsep_w.pid != last) {
+      if (last)
+        s->pid_changes++;
+      last = privsep_w.pid;
+    }
+  }
+  privsep_release_thread_worker();
+  return NULL;
+}
+
 static void count_quarantine(const char *dir) {
   DIR *d = opendir(dir);
   struct dirent *e;
@@ -224,6 +261,57 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  /* HARNESS_PRIVSEP=1: run the same cases with the content analysis in
+   * unprivileged workers, started the way avd's main() starts them (after
+   * the rules and corpora are loaded, while still single-threaded). 65534 is
+   * nobody, as in the spawner and client tests. Needs root; the shell side
+   * only sets this when it is root. */
+  if (getenv("HARNESS_PRIVSEP")) {
+    if (privsep_start(65534, 65534) != 0) {
+      fprintf(stderr, "privsep_start failed\n");
+      return 2;
+    }
+    /* HARNESS_KILL_SPAWNER=1: lose the spawner before any scan. avd must
+     * exit (privsep_on_dead) rather than scan the cases itself as root. */
+    if (getenv("HARNESS_KILL_SPAWNER")) {
+      kill(privsep_cl.spawner_pid, SIGKILL);
+      sleep(2);
+    }
+    if (getenv("HARNESS_STRESS")) {
+      enum { THREADS = 4, SCANS = 600 };
+      pthread_t t[THREADS];
+      struct stress_arg a[THREADS];
+      int bad = 0, changes = 0;
+
+      snprintf(p, sizeof(p), "%s/clean.txt", w);
+      int started = 0;
+
+      for (int i = 0; i < THREADS; i++) {
+        a[i] = (struct stress_arg){.path = p, .scans = SCANS};
+        if (pthread_create(&t[i], NULL, stress_thread, &a[i]) != 0) {
+          fprintf(stderr, "pthread_create failed for stress thread %d\n", i);
+          break;
+        }
+        started++;
+      }
+      /* Join only what started, and report what actually ran, so a failed
+       * create can neither crash the join nor pass as the full count. */
+      for (int i = 0; i < started; i++) {
+        pthread_join(t[i], NULL);
+        bad += a[i].bad;
+        changes += a[i].pid_changes;
+      }
+      printf("STRESS threads=%d scans=%d bad=%d worker_changes=%d\n", started,
+             started * SCANS, bad, changes);
+      if (started != THREADS) {
+        privsep_stop();
+        return 2;
+      }
+      privsep_stop();
+      return 0;
+    }
+  }
+
   /* Exact-signature snapshot for sigfile.txt (normally fanotify-only). */
   snprintf(p, sizeof(p), "%s/sigfile.txt", w);
   fd = open(p, O_RDONLY);
@@ -265,6 +353,23 @@ int main(int argc, char **argv) {
   count_quarantine(qdir);
   printf("METRICS scans_total=%llu scans_malicious=%llu\n",
          (unsigned long long)scans_total, (unsigned long long)scans_malicious);
+  /* Proof the cases above really ran in a worker: read this thread's worker
+   * back from /proc while it is still alive. */
+  if (privsep_enabled && privsep_w.sock >= 0) {
+    char sp[64], line[256];
+    FILE *sf;
+
+    snprintf(sp, sizeof(sp), "/proc/%d/status", (int)privsep_w.pid);
+    sf = fopen(sp, "r");
+    while (sf && fgets(line, sizeof(line), sf))
+      if (!strncmp(line, "Uid:", 4) || !strncmp(line, "Gid:", 4) ||
+          !strncmp(line, "CapEff:", 7) || !strncmp(line, "NoNewPrivs:", 11) ||
+          !strncmp(line, "Seccomp:", 8))
+        printf("WORKER %s", line);
+    if (sf)
+      fclose(sf);
+  }
+  privsep_stop();
   return 0;
 }
 EOF
@@ -288,28 +393,22 @@ if ! cc -Wall -Wextra -O2 -w -I"$AVD_DIR" $CFLAGS_PC \
     exit 1
 fi
 
-WORK="$BUILD_DIR/work"
-mkdir -p "$WORK"
 # A real-text clean sample (numbers, not the generated word text above).
 seq 1 5000 > "$BUILD_DIR/clean-sample.txt"
-
-if ! "$BUILD_DIR/harness" "$WORK" "$BUILD_DIR/clean-sample.txt" \
-        > "$BUILD_DIR/out.txt" 2> "$BUILD_DIR/err.txt"; then
-    echo "FAIL: harness exited non-zero:"
-    cat "$BUILD_DIR/err.txt"
-    exit 1
-fi
 
 PASS=0
 FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# Output file of the mode being checked; set by the caller of verify().
+OUT=""
+
 # Compare each CASE line with its sha= field removed (the digest is checked
 # separately below), so the expectation table is independent of the clean
 # sample's contents.
 actual_case() {
-    grep -F "CASE $1 " "$BUILD_DIR/out.txt" | sed -E 's/ sha=[0-9a-f]*//'
+    grep -F "CASE $1 " "$OUT" | sed -E 's/ sha=[0-9a-f]*//'
 }
 
 expect_case() {
@@ -324,65 +423,268 @@ expect_case() {
     fi
 }
 
-echo "scan outcomes:"
-expect_case clean_ondemand            'verdict=0 rule="" score=0 inconclusive=0 still_at_path=1'
-expect_case clean_kernelhash          'verdict=0 rule="" score=0 inconclusive=0 still_at_path=1'
-expect_case tiny_clean                'verdict=0 rule="" score=0 inconclusive=0 still_at_path=1'
-expect_case yara_override             'verdict=1 rule="T_Override" score=10 inconclusive=0 still_at_path=0'
-expect_case yara_sum_over_threshold   'verdict=1 rule="T_Sum_A,T_Sum_B" score=120 inconclusive=0 still_at_path=0'
-expect_case yara_weak_clean           'verdict=0 rule="" score=10 inconclusive=0 still_at_path=1'
-expect_case yara_weak_then_fuzzy      'verdict=1 rule="Fuzzy:TestWeakFuzzy(100)" score=10 inconclusive=0 still_at_path=0'
-expect_case fuzzy_only                'verdict=1 rule="Fuzzy:TestFuzzy(100)" score=0 inconclusive=0 still_at_path=0'
-expect_case tlsh_only                 'verdict=1 rule="TLSH:TestTlsh(0)" score=0 inconclusive=0 still_at_path=0'
-expect_case signature                 'verdict=1 rule="Sig:TestSig" score=0 inconclusive=0 still_at_path=0'
-expect_case no_rules                  'verdict=0 rule="" score=0 inconclusive=1 still_at_path=1'
+# The expectations are the same for both modes: moving the content analysis
+# into a worker must not change a single verdict, rule name, score or
+# quarantine outcome (#103).
+verify() {
+    echo "scan outcomes:"
+    expect_case clean_ondemand            'verdict=0 rule="" score=0 inconclusive=0 still_at_path=1'
+    expect_case clean_kernelhash          'verdict=0 rule="" score=0 inconclusive=0 still_at_path=1'
+    expect_case tiny_clean                'verdict=0 rule="" score=0 inconclusive=0 still_at_path=1'
+    expect_case yara_override             'verdict=1 rule="T_Override" score=10 inconclusive=0 still_at_path=0'
+    expect_case yara_sum_over_threshold   'verdict=1 rule="T_Sum_A,T_Sum_B" score=120 inconclusive=0 still_at_path=0'
+    expect_case yara_weak_clean           'verdict=0 rule="" score=10 inconclusive=0 still_at_path=1'
+    expect_case yara_weak_then_fuzzy      'verdict=1 rule="Fuzzy:TestWeakFuzzy(100)" score=10 inconclusive=0 still_at_path=0'
+    expect_case fuzzy_only                'verdict=1 rule="Fuzzy:TestFuzzy(100)" score=0 inconclusive=0 still_at_path=0'
+    expect_case tlsh_only                 'verdict=1 rule="TLSH:TestTlsh(0)" score=0 inconclusive=0 still_at_path=0'
+    expect_case signature                 'verdict=1 rule="Sig:TestSig" score=0 inconclusive=0 still_at_path=0'
+    expect_case no_rules                  'verdict=0 rule="" score=0 inconclusive=1 still_at_path=1'
 
-echo "quarantine and metrics:"
-if grep -qx 'CASE rescan_gone open-failed' "$BUILD_DIR/out.txt"; then
-    pass "convicted file no longer at its original path"
-else
-    fail "convicted file no longer at its original path"
-fi
-# Six convictions: yara_override, yara_sum, weak_then_fuzzy, fuzzy_only,
-# tlsh_only, signature - each leaves exactly one file plus one sidecar.
-if grep -qx 'QDIR files=6 metas=6' "$BUILD_DIR/out.txt"; then
-    pass "6 quarantined files, 6 sidecars"
-else
-    fail "6 quarantined files, 6 sidecars ($(grep '^QDIR' "$BUILD_DIR/out.txt"))"
-fi
-if grep -qx 'METRICS scans_total=11 scans_malicious=6' "$BUILD_DIR/out.txt"; then
-    pass "metrics: 11 scans, 6 malicious"
-else
-    fail "metrics: 11 scans, 6 malicious ($(grep '^METRICS' "$BUILD_DIR/out.txt"))"
-fi
-
-echo "digests:"
-bad_sha="$(grep '^CASE .* sha=' "$BUILD_DIR/out.txt" | sed -E 's/.* sha=([0-9a-f]*) .*/\1/' | grep -vcE '^[0-9a-f]{64}$')"
-if [ "$bad_sha" = "0" ]; then
-    pass "every scan reports a 64-hex SHA-256"
-else
-    fail "$bad_sha scan(s) reported a missing or malformed SHA-256"
-fi
-want_sha="$(sha256sum "$BUILD_DIR/clean-sample.txt" | cut -d' ' -f1)"
-for c in clean_ondemand clean_kernelhash; do
-    got_sha="$(grep -F "CASE $c " "$BUILD_DIR/out.txt" | sed -E 's/.* sha=([0-9a-f]*) .*/\1/')"
-    if [ "$got_sha" = "$want_sha" ]; then
-        pass "$c digest matches sha256sum"
+    echo "quarantine and metrics:"
+    if grep -qx 'CASE rescan_gone open-failed' "$OUT"; then
+        pass "convicted file no longer at its original path"
     else
-        fail "$c digest matches sha256sum (got $got_sha)"
+        fail "convicted file no longer at its original path"
     fi
-done
+    # Six convictions: yara_override, yara_sum, weak_then_fuzzy, fuzzy_only,
+    # tlsh_only, signature - each leaves exactly one file plus one sidecar.
+    if grep -qx 'QDIR files=6 metas=6' "$OUT"; then
+        pass "6 quarantined files, 6 sidecars"
+    else
+        fail "6 quarantined files, 6 sidecars ($(grep '^QDIR' "$OUT"))"
+    fi
+    if grep -qx 'METRICS scans_total=11 scans_malicious=6' "$OUT"; then
+        pass "metrics: 11 scans, 6 malicious"
+    else
+        fail "metrics: 11 scans, 6 malicious ($(grep '^METRICS' "$OUT"))"
+    fi
 
-echo "log output:"
-# The acting half (quarantine) runs after the analysis half has logged its
-# verdict, so each QUARANTINED line must follow the matching match line.
-if awk '
-    /SIGNATURE MATCH|avd: MATCH |FUZZY MATCH|TLSH MATCH/ { pending = 1; next }
-    /QUARANTINED/ { if (!pending) bad++; pending = 0 }
-    END { exit bad ? 1 : 0 }' "$BUILD_DIR/out.txt"; then
-    pass "every QUARANTINED line is preceded by its match line"
+    echo "digests:"
+    local bad_sha want_sha got_sha c
+    bad_sha="$(grep '^CASE .* sha=' "$OUT" | sed -E 's/.* sha=([0-9a-f]*) .*/\1/' | grep -vcE '^[0-9a-f]{64}$')"
+    if [ "$bad_sha" = "0" ]; then
+        pass "every scan reports a 64-hex SHA-256"
+    else
+        fail "$bad_sha scan(s) reported a missing or malformed SHA-256"
+    fi
+    want_sha="$(sha256sum "$BUILD_DIR/clean-sample.txt" | cut -d' ' -f1)"
+    for c in clean_ondemand clean_kernelhash; do
+        got_sha="$(grep -F "CASE $c " "$OUT" | sed -E 's/.* sha=([0-9a-f]*) .*/\1/')"
+        if [ "$got_sha" = "$want_sha" ]; then
+            pass "$c digest matches sha256sum"
+        else
+            fail "$c digest matches sha256sum (got $got_sha)"
+        fi
+    done
+
+    echo "log output:"
+    # The acting half (quarantine) runs after the analysis half has logged its
+    # verdict, so each QUARANTINED line must follow the matching match line.
+    if awk '
+        /SIGNATURE MATCH|avd: MATCH |FUZZY MATCH|TLSH MATCH/ { pending = 1; next }
+        /QUARANTINED/ { if (!pending) bad++; pending = 0 }
+        END { exit bad ? 1 : 0 }' "$OUT"; then
+        pass "every QUARANTINED line is preceded by its match line"
+    else
+        fail "a QUARANTINED line appeared without a preceding match line"
+    fi
+}
+
+# run_mode <name> [VAR=value ...]: a fresh work dir per mode, since each run
+# quarantines the files it convicts.
+run_mode() {
+    local name="$1"
+    shift
+    local work="$BUILD_DIR/work-$name"
+    mkdir -p "$work"
+    if ! env "$@" "$BUILD_DIR/harness" "$work" "$BUILD_DIR/clean-sample.txt" \
+            > "$BUILD_DIR/out-$name.txt" 2> "$BUILD_DIR/err-$name.txt"; then
+        echo "FAIL: harness ($name) exited non-zero:"
+        cat "$BUILD_DIR/err-$name.txt"
+        exit 1
+    fi
+    OUT="$BUILD_DIR/out-$name.txt"
+}
+
+echo "== in-process analysis =="
+run_mode inproc
+verify
+
+# The worker mode needs root: workers drop to another uid, empty their
+# capabilities and install a seccomp filter, and the parent checks all of it
+# in /proc before sending a scan. Without root this prints SKIP, never PASS
+# (the same convention as the privsep_* tests):
+#   sudo tests/test_perform_scan.sh
+echo
+echo "== analysis in unprivileged workers (AVD_PRIVSEP) =="
+if [ "$(id -u)" -ne 0 ]; then
+    echo "  SKIP: needs root (workers change uid and install seccomp)"
 else
-    fail "a QUARANTINED line appeared without a preceding match line"
+    run_mode privsep HARNESS_PRIVSEP=1
+    verify
+    echo "worker mode:"
+    if grep -q 'privilege separation on' "$OUT"; then
+        pass "the scans ran with privilege separation on"
+    else
+        fail "privilege separation did not start"
+    fi
+    # The convictions above carry inconclusive=0, so they cannot have come
+    # from a failed-open worker; this checks the worker itself.
+    if grep -qP '^WORKER Uid:\t65534\t65534\t65534\t65534$' "$OUT" &&
+       grep -qP '^WORKER Gid:\t65534\t65534\t65534\t65534$' "$OUT" &&
+       grep -qP '^WORKER CapEff:\t0+$' "$OUT" &&
+       grep -qP '^WORKER NoNewPrivs:\t1$' "$OUT" &&
+       grep -qP '^WORKER Seccomp:\t2$' "$OUT"; then
+        pass "the worker ran as the unprivileged user, no capabilities, NoNewPrivs, seccomp filter"
+    else
+        fail "the worker was not confined as expected ($(grep '^WORKER' "$OUT" | tr '\n\t' '; '))"
+    fi
+    if grep -qE 'privsep: .*(failed|no worker)' "$BUILD_DIR/err-privsep.txt"; then
+        fail "a worker failed during the run"
+        grep -E 'privsep:' "$BUILD_DIR/err-privsep.txt" | head -5
+    else
+        pass "no worker failure was logged"
+    fi
+
+    # Four scan threads, 600 scans each: every scan must be a conclusive
+    # clean, and each thread must have replaced its worker twice (after 256
+    # and 512 scans), which is the recycle path.
+    echo "concurrency and recycling:"
+    mkdir -p "$BUILD_DIR/work-stress"
+    if env HARNESS_PRIVSEP=1 HARNESS_STRESS=1 "$BUILD_DIR/harness" \
+            "$BUILD_DIR/work-stress" "$BUILD_DIR/clean-sample.txt" \
+            > "$BUILD_DIR/out-stress.txt" 2> "$BUILD_DIR/err-stress.txt"; then
+        if grep -qx 'STRESS threads=4 scans=2400 bad=0 worker_changes=8' "$BUILD_DIR/out-stress.txt"; then
+            pass "2400 scans over 4 threads, none failed, 8 worker recycles"
+        else
+            fail "stress result ($(grep '^STRESS' "$BUILD_DIR/out-stress.txt"))"
+        fi
+    else
+        fail "stress run exited non-zero"
+        head -5 "$BUILD_DIR/err-stress.txt"
+    fi
+
+    # Losing the spawner means no worker can ever be replaced. avd must exit
+    # non-zero (systemd restarts it) and must not carry on scanning in the
+    # root process, so no CASE line may have been produced.
+    echo "spawner loss:"
+    mkdir -p "$BUILD_DIR/work-spawnerloss"
+    env HARNESS_PRIVSEP=1 HARNESS_KILL_SPAWNER=1 "$BUILD_DIR/harness" \
+        "$BUILD_DIR/work-spawnerloss" "$BUILD_DIR/clean-sample.txt" \
+        > "$BUILD_DIR/out-loss.txt" 2> "$BUILD_DIR/err-loss.txt"
+    rc=$?
+    if [ "$rc" -eq 1 ] && grep -q 'the spawner is gone' "$BUILD_DIR/err-loss.txt"; then
+        pass "avd exits 1 when the spawner is lost"
+    else
+        fail "avd did not exit 1 on spawner loss (exit $rc)"
+    fi
+    if grep -q '^CASE ' "$BUILD_DIR/out-loss.txt"; then
+        fail "scans carried on after the spawner was lost"
+    else
+        pass "no scan was done in the root process after the spawner was lost"
+    fi
+
+    # The harness above calls privsep_start() directly, so it never reaches
+    # avd's own AVD_PRIVSEP read or the hyprav-scan account check. Run the
+    # real avd for those. Each case runs in a private mount namespace with a
+    # bind-mounted copy of /etc/passwd, so the host's accounts are never
+    # touched, and checks with getent that the namespace really shows the
+    # entry it intends (nscd or another NSS source could bypass the copy)
+    # before starting avd; if it does not, the case is skipped, not passed.
+    # The refusal comes before avd needs the kernel module.
+    echo "startup (AVD_PRIVSEP):"
+    AVD_BIN="$BUILD_DIR/avd"
+    AVD_START="$BUILD_DIR/avd-start"
+    mkdir -p "$AVD_START/rules" "$AVD_START/q"
+    chmod 700 "$AVD_START/q"
+    # Deliberately no rules, fuzzy or TLSH entries: avd accepts an empty rules
+    # directory (it warns that every scan will report clean). The cases that
+    # get past the account check start a real avd, and if the kernel module
+    # is loaded it registers for scan requests until the timeout, so nothing
+    # it sees may be convictable or quarantinable.
+    : > "$AVD_START/fuzzy.txt"
+    : > "$AVD_START/tlsh.txt"
+    # shellcheck disable=SC2086 # $CFLAGS_PC and $LIBS are intentionally word-split
+    if ! cc -O2 -w -I"$AVD_DIR" $CFLAGS_PC -o "$AVD_BIN" "$AVD_DIR/avd.c" \
+            "$AVD_DIR/sha256.c" "$AVD_DIR/tlsh_core.c" "$AVD_DIR/tlsh_shim.c" \
+            $LIBS 2> "$BUILD_DIR/cc-avd.log"; then
+        fail "could not build avd for the startup cases"
+        cat "$BUILD_DIR/cc-avd.log"
+    elif ! command -v unshare >/dev/null 2>&1; then
+        echo "  SKIP: unshare is not available"
+    elif ! unshare -m --propagation private true >/dev/null 2>&1; then
+        # Installed but not allowed (a restricted container): skip, do not fail.
+        echo "  SKIP: mount namespaces are not available"
+    else
+        # startup_case <name> <passwd line, or empty for "no such user"> <want>
+        #              [AVD_PRIVSEP value; default 1, empty means unset]
+        # want: refuse | proceed | off
+        startup_case() {
+            local name="$1" line="$2" want="$3" psval="${4-1}"
+            local pw="$BUILD_DIR/passwd-$name" log="$BUILD_DIR/start-$name.log" rc
+            local shown="set to $psval"
+            [ -n "$psval" ] || shown="unset"
+            grep -v '^hyprav-scan:' /etc/passwd > "$pw"
+            [ -n "$line" ] && echo "$line" >> "$pw"
+            # shellcheck disable=SC2016 # expanded by the inner shell, on purpose
+            unshare -m --propagation private env PW="$pw" EXPECT="$line" \
+                PSVAL="$psval" bash -c '
+                if [ -n "$PSVAL" ]; then export AVD_PRIVSEP="$PSVAL"; else unset AVD_PRIVSEP; fi
+                mount --bind "$PW" /etc/passwd || exit 77
+                [ "$(getent passwd hyprav-scan)" = "$EXPECT" ] || exit 77
+                exec timeout 15 "$@"' _ \
+                "$AVD_BIN" "$AVD_START/rules" "$AVD_START/fuzzy.txt" \
+                "$AVD_START/q" "$AVD_START/tlsh.txt" > "$log" 2>&1
+            rc=$?
+            if [ "$rc" -eq 77 ]; then
+                echo "  SKIP: $name (could not give the namespace the intended hyprav-scan entry)"
+                return
+            fi
+            if [ "$want" = refuse ]; then
+                if [ "$rc" -eq 1 ] &&
+                   grep -qF 'the unprivileged user "hyprav-scan" is missing or is root' "$log" &&
+                   ! grep -q 'privilege separation on' "$log"; then
+                    pass "$name: avd exits 1 and names the hyprav-scan user"
+                else
+                    fail "$name: expected exit 1 and the refusal message (exit $rc)"
+                    head -5 "$log"
+                fi
+            elif [ "$want" = off ]; then
+                # Opt-in means off by default: with AVD_PRIVSEP unset avd must
+                # not look at the account (here it is missing, which would be a
+                # refusal if the default were on), must not start workers, and
+                # must get as far as the netlink stage like the cases below
+                # (exit 1 at the family lookup, or 124 if the module is loaded).
+                if { [ "$rc" -eq 1 ] || [ "$rc" -eq 124 ]; } &&
+                   { [ "$rc" -eq 124 ] || grep -q 'av module loaded' "$log"; } &&
+                   ! grep -qF 'is missing or is root' "$log" &&
+                   ! grep -q 'privilege separation on' "$log"; then
+                    pass "$name: with AVD_PRIVSEP $shown avd skips the account check and starts no workers"
+                else
+                    fail "$name: avd did not behave as default-off (exit $rc)"
+                    head -5 "$log"
+                fi
+            else
+                # Past the check: no refusal, and the spawner came up. Without
+                # the kernel module avd then stops at the netlink family
+                # lookup (exit 1); with it loaded avd runs until the timeout.
+                if { [ "$rc" -eq 1 ] || [ "$rc" -eq 124 ]; } &&
+                   grep -q 'privilege separation on' "$log" &&
+                   ! grep -qF 'is missing or is root' "$log"; then
+                    pass "$name: a valid hyprav-scan user is accepted"
+                else
+                    fail "$name: expected avd to get past the account check (exit $rc)"
+                    head -5 "$log"
+                fi
+            fi
+        }
+        startup_case user-missing ""                                                        refuse
+        startup_case uid-zero     "hyprav-scan:x:0:65534::/:/usr/sbin/nologin"              refuse
+        startup_case gid-zero     "hyprav-scan:x:65534:0::/:/usr/sbin/nologin"              refuse
+        startup_case user-valid   "hyprav-scan:x:65534:65534::/:/usr/sbin/nologin"          proceed
+        startup_case default-off  ""                                                        off     ""
+        startup_case privsep-zero ""                                                        off     "0"
+    fi
 fi
 
 echo

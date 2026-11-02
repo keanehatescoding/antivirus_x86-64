@@ -88,6 +88,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +113,7 @@
 #include "../../av/netlink_proto.h"
 #include "control_parse.h"
 #include "fan_parse.h"
+#include "privsep_client.h"
 #include "privsep_proto.h"
 #include "sha256.h"
 #include "tlsh_shim.h"
@@ -1918,6 +1920,7 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
  * ever closed under fan_pending_lock once threads exist, and is -1
  * from then on. */
 static bool fan_enabled; /* AVD_FANOTIFY=1 */
+static bool privsep_requested; /* AVD_PRIVSEP=1, see privsep_start() */
 static atomic_bool fan_active;
 static int fan_fd = -1;
 static int avd_fan_timeout_ms;
@@ -2267,6 +2270,277 @@ static void analyze_content(int fd, const char *path, const char *hash,
   }
 }
 
+/* ---- Privilege separation (#103, Stage 1e; AVD_PRIVSEP=1) ----
+ *
+ * With AVD_PRIVSEP=1 the content half of the analysis (analyze_content():
+ * YARA, ssdeep, TLSH) runs in an unprivileged, seccomp-confined worker
+ * process instead of in this root process. SHA-256, the signature lookup and
+ * everything that acts on a verdict (quarantine, history, metrics) stay here.
+ * See docs/privilege-separation.md. Opt-in for now, like AVD_FANOTIFY.
+ *
+ * Each scan thread owns one worker (a thread-local handle), spawned lazily on
+ * its first scan, so the queue, the pool size and the fanotify deadline
+ * handling are unchanged (contracts 3 and 4).
+ *
+ * Any worker failure (spawn failure, crash, timeout, malformed reply) leaves
+ * the canonical failure result - CLEAN plus inconclusive - which is exactly
+ * how the in-process pipeline already fails open (contract 5). Losing the
+ * spawner is different: no worker can ever be replaced, so avd exits and
+ * systemd restarts it. It never falls back to scanning in the root process,
+ * which would silently defeat the point.
+ *
+ * Provisional numbers, to be revisited with the latency measurement the
+ * design doc asks for (open question 3, worker lifetime): a worker is
+ * recycled after AVD_PRIVSEP_MAX_SCANS scans, which also keeps it clear of
+ * the cumulative RLIMIT_CPU. */
+#define AVD_PRIVSEP_USER "hyprav-scan"
+#define AVD_PRIVSEP_STARTUP_MS 5000
+/* "A little above the spawner's own startup timeout" (privsep_client.h). */
+#define AVD_PRIVSEP_SPAWN_WAIT_MS (AVD_PRIVSEP_STARTUP_MS + 2000)
+/* How long the parent waits for one worker reply: YARA's own bound, then a
+ * budget for each of the ssdeep and TLSH passes that follow it. Those two
+ * have no timeout of their own; they are only bounded by reading at most
+ * MAX_FUZZY_TLSH_FILE_SIZE (256 MiB). Measured on a 2.1 GHz Xeon with the
+ * shipped rules and corpora, a 255 MiB file takes about 0.4 s in YARA, 1.5-2 s
+ * in ssdeep and 2.5-2.7 s in TLSH (about 5 s together), for random and for
+ * text content. 20 s per pass is roughly 8x that worst case, so a loaded or
+ * slower machine still gets a real verdict instead of a worker that is killed
+ * and an inconclusive CLEAN that would have convicted. A worker that really
+ * hangs is still bounded by this wait. */
+#define AVD_PRIVSEP_HASH_BUDGET_MS 20000
+#define AVD_PRIVSEP_SCAN_WAIT_MS                                               \
+  (SCAN_TIMEOUT_SECS * 1000 + 2 * AVD_PRIVSEP_HASH_BUDGET_MS)
+#define AVD_PRIVSEP_MAX_SCANS 256
+/* RLIMIT_CPU is cumulative over the worker's life, and a scan can use at most
+ * its wait in CPU seconds (the worker is one thread), so this covers every
+ * scan of a worker that is recycled after AVD_PRIVSEP_MAX_SCANS, with a second
+ * of slack each. It is a backstop for a runaway worker whose parent is gone;
+ * the wait above is what bounds a single scan. */
+#define AVD_PRIVSEP_CPU_SECONDS                                                \
+  (AVD_PRIVSEP_MAX_SCANS * (AVD_PRIVSEP_SCAN_WAIT_MS / 1000 + 1))
+#define AVD_PRIVSEP_NOFILE 32
+/* RLIMIT_AS counts the compiled rules and corpora a worker inherits, and
+ * libyara maps the scanned file whole, so the limit is "what the spawner had
+ * when it was forked" plus this much. A larger file fails the mapping and
+ * comes back inconclusive instead of being scanned. */
+#define AVD_PRIVSEP_AS_HEADROOM (2ULL << 30)
+
+/* Each scan thread holds one worker and a replacement can briefly coexist
+ * with its predecessor, so the spawner's table must cover twice the pool. */
+_Static_assert(2 * AVD_SCAN_THREADS_MAX <= PS_SPAWNER_MAX_WORKERS,
+               "the spawner's worker table must cover twice the scan pool");
+_Static_assert(AVD_SCAN_THREADS_MAX <= PS_CLIENT_MAX_WAITERS,
+               "every scan thread may have one SPAWN outstanding");
+
+static bool privsep_enabled; /* AVD_PRIVSEP=1 and the spawner is up */
+static struct ps_client privsep_cl;
+static __thread struct ps_worker privsep_w;
+static __thread bool privsep_w_init;
+static __thread unsigned privsep_w_scans;
+
+/* Worker side: runs under the worker's seccomp filter, which has no write()
+ * and no open(). analyze_content() logs through stdout and stderr, so both
+ * are pointed at fixed in-memory buffers (no syscalls) and the output is
+ * dropped: the worker writes no logs, the parent logs from the verdict.
+ * Assigning to stdout/stderr is a glibc property, which is all avd targets.
+ * If either stream cannot be set up the reply stays the canonical failure,
+ * since an unsuppressed log write would be a seccomp kill. */
+static void privsep_worker_scan(int fd, void *ctx, struct ps_reply *rep) {
+  static char out_buf[4096], err_buf[4096];
+  static bool quiet;
+  struct scan_result r;
+
+  (void)ctx;
+  if (!quiet) {
+    FILE *o = fmemopen(out_buf, sizeof(out_buf), "w");
+    FILE *e = fmemopen(err_buf, sizeof(err_buf), "w");
+
+    if (!o || !e)
+      return;
+    stdout = o;
+    stderr = e;
+    quiet = true;
+  }
+  /* Start each scan at the beginning so the fixed buffers never fill up for
+   * good, and clear any error a full buffer left behind. */
+  rewind(stdout);
+  rewind(stderr);
+
+  memset(&r, 0, sizeof(r));
+  r.verdict = AV_VERDICT_CLEAN;
+  /* The path, digest, pid and mode only feed log lines in there, and the
+   * logs are discarded in this process. */
+  analyze_content(fd, "", "", 0, false, &r);
+
+  rep->verdict = r.verdict == AV_VERDICT_MALICIOUS ? PS_VERDICT_MALICIOUS
+                                                   : PS_VERDICT_CLEAN;
+  rep->inconclusive = r.inconclusive ? 1u : 0u;
+  rep->score = r.score;
+  snprintf(rep->rule_name, sizeof(rep->rule_name), "%s", r.rule_name);
+}
+
+static void privsep_log(void *ctx, const char *msg) {
+  (void)ctx;
+  fprintf(stderr, "avd: privsep: %s\n", msg);
+}
+
+static void privsep_on_dead(void *ctx) {
+  (void)ctx;
+  fprintf(stderr, "avd: privsep: the spawner is gone, so no worker can be "
+                  "replaced - exiting so the service manager restarts avd "
+                  "(never falling back to scanning as root)\n");
+  fflush(stdout);
+  fflush(stderr);
+  _exit(1);
+}
+
+/* Current virtual size of this process in bytes, 0 if it cannot be read. */
+static unsigned long long privsep_vmsize_bytes(void) {
+  FILE *f = fopen("/proc/self/status", "re");
+  char line[256];
+  unsigned long long kb = 0;
+
+  if (!f)
+    return 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (sscanf(line, "VmSize: %llu kB", &kb) == 1)
+      break;
+    kb = 0;
+  }
+  fclose(f);
+  return kb * 1024ULL;
+}
+
+/* Fork the spawner and attach the client. Must be called while the process is
+ * still single-threaded, after the rules and corpora are loaded (the spawner
+ * and so every worker inherits them copy-on-write) and before any socket is
+ * opened (it inherits nothing but its own channel). Returns 0 on success. */
+static int privsep_start(uid_t uid, gid_t gid) {
+  struct ps_spawner_cfg cfg;
+  unsigned long long vm = privsep_vmsize_bytes();
+  pid_t spawner_pid;
+  int ctl_fd;
+
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.harden.uid = uid;
+  cfg.harden.gid = gid;
+  cfg.harden.ipc_fd = -1; /* filled in per worker */
+  cfg.harden.log_fd = -1;
+  cfg.harden.as_bytes =
+      (rlim_t)(vm ? vm + AVD_PRIVSEP_AS_HEADROOM : 8ULL << 30);
+  cfg.harden.cpu_seconds = AVD_PRIVSEP_CPU_SECONDS;
+  cfg.harden.nofile = AVD_PRIVSEP_NOFILE;
+  cfg.scan = privsep_worker_scan;
+  cfg.startup_timeout_ms = AVD_PRIVSEP_STARTUP_MS;
+
+  /* fork() would otherwise copy unflushed stdio into the spawner, and from
+   * there into every worker. */
+  fflush(stdout);
+  fflush(stderr);
+  if (ps_spawner_start(&cfg, &ctl_fd, &spawner_pid) < 0) {
+    fprintf(stderr, "avd: privsep: could not start the spawner: %s\n",
+            strerror(errno));
+    return -1;
+  }
+  if (ps_client_attach(&privsep_cl, ctl_fd, spawner_pid, uid, gid, true) != 0)
+    return -1;
+  privsep_cl.log = privsep_log;
+  privsep_cl.on_dead = privsep_on_dead;
+  if (ps_client_start(&privsep_cl) != 0) {
+    fprintf(stderr, "avd: privsep: could not start the reader thread\n");
+    ps_client_stop(&privsep_cl);
+    return -1;
+  }
+  privsep_enabled = true;
+  printf("avd: privilege separation on: scans run in workers as uid %u gid "
+         "%u (spawner pid %d)\n",
+         (unsigned)uid, (unsigned)gid, (int)spawner_pid);
+  return 0;
+}
+
+/* Orderly shutdown, after the scan threads have been joined. */
+static void privsep_stop(void) {
+  if (!privsep_enabled)
+    return;
+  privsep_enabled = false;
+  ps_client_stop(&privsep_cl);
+}
+
+/* Called by a scan thread as it exits. */
+static void privsep_release_thread_worker(void) {
+  if (privsep_enabled && privsep_w_init)
+    ps_client_release(&privsep_cl, &privsep_w);
+}
+
+/* Parent side of analyze_content(): same contract, same `out`, but the
+ * parsing happens in this thread's worker. The log lines that analyze_content()
+ * writes are re-created here from the validated verdict, where the worker
+ * cannot write them. */
+static void analyze_in_worker(int fd, const char *path, const char *hash,
+                              uint32_t pid, bool on_demand,
+                              struct scan_result *out) {
+  struct ps_spawn_info si;
+  struct ps_verdict v;
+  const char *why = "";
+
+  if (!compiled_rules) {
+    out->inconclusive = true;
+    return;
+  }
+  printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
+         on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
+
+  if (!privsep_w_init) {
+    ps_worker_init(&privsep_w);
+    privsep_w_init = true;
+  }
+  if (privsep_w.sock >= 0 && privsep_w_scans >= AVD_PRIVSEP_MAX_SCANS)
+    ps_client_release(&privsep_cl, &privsep_w);
+  if (privsep_w.sock < 0) {
+    enum ps_spawn_status st = ps_client_spawn(
+        &privsep_cl, &privsep_w, AVD_PRIVSEP_SPAWN_WAIT_MS, &si);
+
+    if (st != PS_SPAWN_OK) {
+      fprintf(stderr,
+              "avd: privsep: no worker for \"%s\" (status %d, reason %u, "
+              "detail %d%s%s) - result inconclusive\n",
+              path, (int)st, (unsigned)si.reason, si.detail,
+              si.why[0] ? ", " : "", si.why);
+      out->inconclusive = true;
+      return;
+    }
+    privsep_w_scans = 0;
+  }
+  privsep_w_scans++;
+
+  if (!ps_client_scan(&privsep_cl, &privsep_w, fd, AVD_PRIVSEP_SCAN_WAIT_MS,
+                      &v, &why)) {
+    /* The worker has been killed and its socket dropped. This is either a
+     * bug or an exploit attempt, so it is logged as loudly as a scan error. */
+    fprintf(stderr,
+            "avd: privsep: scan of \"%s\" failed: %s - worker replaced, "
+            "result inconclusive\n",
+            path, why);
+    out->inconclusive = true;
+    return;
+  }
+
+  out->score = v.score;
+  if (v.inconclusive)
+    out->inconclusive = true;
+  if (v.verdict == PS_VERDICT_MALICIOUS) {
+    out->verdict = AV_VERDICT_MALICIOUS;
+    snprintf(out->rule_name, sizeof(out->rule_name), "%s", v.rule_name);
+    if (strncmp(v.rule_name, "Fuzzy:", 6) == 0)
+      printf("avd: FUZZY MATCH \"%s\" -> \"%s\"\n", path, v.rule_name);
+    else if (strncmp(v.rule_name, "TLSH:", 5) == 0)
+      printf("avd: TLSH MATCH \"%s\" -> \"%s\"\n", path, v.rule_name);
+    else
+      printf("avd: MATCH \"%s\" -> score=%d: \"%s\"\n", path, v.score,
+             v.rule_name);
+  }
+}
+
 /*
  * Analysis half of a scan: SHA-256, exact-signature lookup, then the content
  * detectors (analyze_content(): YARA, ssdeep, TLSH). Everything in here
@@ -2328,7 +2602,10 @@ static void analyze_fd(int fd, const char *path, const char *sha256_hex,
     }
   }
 
-  analyze_content(fd, path, hash, pid, on_demand, out);
+  if (privsep_enabled)
+    analyze_in_worker(fd, path, hash, pid, on_demand, out);
+  else
+    analyze_content(fd, path, hash, pid, on_demand, out);
 }
 
 /*
@@ -3477,6 +3754,9 @@ static void *scan_worker_main(void *arg) {
     free(task);
   }
 
+  /* Closing this thread's worker socket makes the worker exit; with
+   * privilege separation off this does nothing. */
+  privsep_release_thread_worker();
   return NULL;
 }
 
@@ -4726,6 +5006,13 @@ int main(int argc, char **argv) {
   avd_fan_timeout_ms = parse_tunable_env(
       "AVD_FANOTIFY_TIMEOUT_MS", AVD_FAN_TIMEOUT_MS_DEFAULT,
       AVD_FAN_TIMEOUT_MS_MIN, AVD_FAN_TIMEOUT_MS_MAX);
+  /* Opt-in (#103): content parsing moves into unprivileged worker
+   * processes - see the privilege-separation block above analyze_fd(). */
+  {
+    const char *ps_env = getenv("AVD_PRIVSEP");
+
+    privsep_requested = ps_env && strcmp(ps_env, "1") == 0;
+  }
 
   printf("avd: quarantine directory: %s\n", quarantine_dir);
   printf("avd: control socket: %s\n", control_sock_path);
@@ -4822,6 +5109,29 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  /* The one window where the spawner can be forked safely: the rules and
+   * corpora are loaded (workers inherit them), there is still exactly one
+   * thread, and no netlink, control or fanotify descriptor exists yet. When
+   * the operator asked for privilege separation and it cannot be set up, avd
+   * refuses to start rather than quietly scanning as root. */
+  if (privsep_requested) {
+    struct passwd *pw = getpwnam(AVD_PRIVSEP_USER);
+
+    if (!pw || pw->pw_uid == 0 || pw->pw_gid == 0) {
+      fprintf(stderr,
+              "avd: AVD_PRIVSEP=1 but the unprivileged user \"%s\" is "
+              "missing or is root - install the hyprav sysusers entry "
+              "(systemd-sysusers) - aborting\n",
+              AVD_PRIVSEP_USER);
+      return 1;
+    }
+    if (privsep_start(pw->pw_uid, pw->pw_gid) != 0) {
+      fprintf(stderr, "avd: privilege separation could not be started - "
+                      "aborting\n");
+      return 1;
+    }
+  }
+
   sock = nl_socket_alloc();
   if (!sock) {
     fprintf(stderr, "avd: nl_socket_alloc failed\n");
@@ -4915,6 +5225,7 @@ int main(int argc, char **argv) {
     if (spawned == 0) {
       fprintf(stderr, "avd: no scan workers could be started - aborting\n");
       fan_teardown(fan_thread, fan_started, fan_mi_fd);
+      privsep_stop();
       free(workers);
       nl_socket_free(sock);
       return 1;
@@ -4972,6 +5283,7 @@ int main(int argc, char **argv) {
         for (i = 0; i < spawned; i++)
           pthread_join(workers[i], NULL);
         fan_teardown(fan_thread, fan_started, fan_mi_fd);
+        privsep_stop();
         if (control_started) {
           /* Same self-connect wake-up as the normal shutdown path
            * below: joining the accept thread without it hangs. */
@@ -5060,6 +5372,8 @@ int main(int argc, char **argv) {
      * answered, so stopping the listener and closing the group now
      * cannot strand one - see fan_listener_main()'s exit comment. */
     fan_teardown(fan_thread, fan_started, fan_mi_fd);
+    /* Workers are joined, so no scan can still be using a worker. */
+    privsep_stop();
 
     if (control_started) {
       /* Closing control_sock_fd out from under control_accept_main()'s
