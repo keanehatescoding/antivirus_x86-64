@@ -38,6 +38,12 @@
  * which makes a future reordering or a kernel that behaves differently fail
  * closed instead of leaving an orphaned process holding CAP_SETUID.
  *
+ * This guards against mistakes, not against a compromised spawner: it keeps
+ * CAP_SETUID and CAP_SETGID, the filter has to allow the credential calls
+ * (workers make them under it), and changing the effective uid or gid clears
+ * the signal. See docs/privilege-separation.md, "Residual risk: a compromised
+ * spawner can outlive avd".
+ *
  * Same arrangement as privsep_worker.h: header-only, dependency-free, compiled
  * standalone by tests/test_privsep_lockdown.sh. x86-64 only (the worker header
  * already refuses anything else).
@@ -343,10 +349,11 @@ static inline size_t ps_seccomp_build_spawner(struct ps_asm *a) {
                 i + 1 == PS_ALLOW_PRCTL_OPTS_N ? PSL_KILL : PSL_NONE);
 
   /* PR_SET_PDEATHSIG only with SIGKILL. The option is on the list so that
-   * hardening can set it, but with any other signal (0 clears it) a
-   * compromised spawner could outlive avd, which is the one thing the
-   * parent-death handshake exists to prevent. The argument is an unsigned
-   * long, so the upper half must be zero too. */
+   * hardening can set it, and with any other signal (0 clears it) it would
+   * be the easiest way for a compromised spawner to outlive avd. This closes
+   * that route only: setresgid() and friends are allowed (workers need them
+   * under this filter) and clear the signal too, so it is not a guarantee.
+   * The argument is an unsigned long, so the upper half must be zero too. */
   ps_asm_bind(a, PSL_PDEATH);
   ps_asm_stmt(a, BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_HI(1));
   ps_asm_jump(a, BPF_JMP | BPF_JEQ | BPF_K, 0, PSL_NONE, PSL_KILL);

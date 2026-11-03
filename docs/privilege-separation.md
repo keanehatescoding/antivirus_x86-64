@@ -296,8 +296,9 @@ the code. Things the trace turned up that the sketch missed:
   the list, through the worker allowlist.)
 
 Argument checks: `prctl` only for the seven options in use (and
-`PR_SET_PDEATHSIG` only with `SIGKILL`, so a compromised spawner cannot clear
-it and outlive avd), `kill` only with `SIGKILL` (the signal only, not the
+`PR_SET_PDEATHSIG` only with `SIGKILL`, which stops it being cleared with
+`prctl` but not by a credential change; see "Residual risk: a compromised
+spawner can outlive avd" below), `kill` only with `SIGKILL` (the signal only, not the
 target; see "Residual risk: the spawner can signal any process" below), `clone` only with exactly `fork()`'s flags (`CHILD_SETTID`,
 `CHILD_CLEARTID`, exit signal `SIGCHLD`, upper half zero, so no threads and no
 `CLONE_NEW*`), `socketpair` only `AF_UNIX`, `prlimit64` only on pid 0,
@@ -333,7 +334,8 @@ guarantee. The main process also needs no `CAP_KILL` for this.
 
 Orphans. Each worker sets `PR_SET_PDEATHSIG` to `SIGKILL`, and so does the
 spawner with respect to the main process, so killing avd leaves nothing
-running. The signal follows the thread that forked; the spawner is forked by
+running, unless the spawner is compromised (see "Residual risk: a compromised
+spawner can outlive avd"). The signal follows the thread that forked; the spawner is forked by
 the main thread, which lives as long as the process.
 
 Pool shape: each existing scan thread owns one worker process. The queue, the
@@ -609,8 +611,55 @@ Real fixes are boundary changes, so this is an open question below and not
 part of Stage 1f: run the spawner and its workers in their own PID namespace
 (`CLONE_NEWPID` when avd forks the spawner, which needs `CAP_SYS_ADMIN` at that
 moment; the pid avd's `/proc` check reads from `READY` would then need
-translating), or remove the spawner's need for `CAP_KILL`.
+translating), or remove the spawner's need for `CAP_KILL`. The next subsection
+has a way of doing the second that also closes its own problem.
 
+#### Residual risk: a compromised spawner can outlive avd
+
+The parent-death signal is what ends the spawner when avd dies. The kernel
+clears it whenever the process's effective or filesystem uid or gid changes,
+and the spawner keeps `CAP_SETUID` and `CAP_SETGID` and has to allow
+`setresuid`, `setresgid`, `setuid`, `setgid` and `setgroups` in its filter,
+because every worker it forks runs its own credential change and its
+`setuid(0)` probe under that inherited filter before its tight filter exists.
+So the `PR_SET_PDEATHSIG` rule in the filter only closes the direct route
+(`prctl(PR_SET_PDEATHSIG, 0)`); a compromised spawner can still call
+`setresgid()` and the signal is gone.
+
+Measured, as root, with the real lockdown (`ps_spawner_lockdown()`) and the
+real filter, the spawner reading `PR_GET_PDEATHSIG` before and after: with no
+credential change it reads 9 (`SIGKILL`) throughout and is killed when its
+parent is killed; after `setresgid(65534, 65534, 65534)` or
+`setresuid(65534, 65534, 65534)` it reads 0 and keeps running after its parent
+is killed. The filter cannot prevent it: the values the workers need (the
+dedicated uid and gid) are the ones that change the effective id, so pinning
+the arguments does not help, and a filter cannot tell the spawner from the
+workers it forks. `tests/test_privsep_lockdown.sh` records this as a known gap.
+
+What bounds it today. A surviving spawner is not a root process with free
+rein: it is cut to four capabilities and cannot open files, execute programs
+or create sockets. When avd runs under the packaged unit, which sets no
+`KillMode=` and so gets systemd's default `control-group`, systemd kills every
+process left in the unit's cgroup when it stops the unit, before
+`Restart=on-failure` starts it again. That is systemd's documented behaviour
+and has not been exercised here. A manual launch has no such backstop.
+
+A way to close this and the `CAP_KILL` risk together, not built or tested:
+run the spawner as the workers' uid. avd (root) forks the spawner, and the
+spawner's first act is what a worker's hardening does today (empty the
+bounding set, drop to the dedicated uid and gid, clear the capabilities,
+`NO_NEW_PRIVS`, parent-death signal, filter), so its workers inherit all of it
+and need only their rlimits and their tight filter. With no capabilities the
+spawner needs no `CAP_KILL` (a process may signal another whose real or saved
+uid is its own effective uid, which the workers share), no `CAP_SETUID` or
+`CAP_SETGID` (so the filter can drop the whole credential family and the
+effective ids can no longer change) and no `CAP_SETPCAP` (the bounding set is
+already empty and inherited). The spawner would stop being a root process at
+all. The cost: the uid separation between the spawner and its workers goes (a
+worker that escaped its filter through a kernel bug would be the spawner's
+uid, though the spawner would hold nothing worth taking), and worker hardening
+and its tests (Stages 1b and 1c) are reworked, so it is a design change to
+review and not a fix to this slice.
 ### Stage 2: shrink the parent
 
 After init the parent still needs real power, so this stage is smaller than
@@ -832,13 +881,17 @@ cannot lock itself down stops avd at startup.
    `MAP_SHARED` on anonymous mappings; or have the parent refuse to send
    files above the limit and treat them by policy (for example a size-only
    verdict, or quarantine-on-doubt).
-7. The spawner holds `CAP_KILL` and the filter cannot limit its target (see
-   "Residual risk: the spawner can signal any process"). Options: a separate
-   PID namespace for the spawner and its workers, with the `/proc` check
-   reworked for namespace-local pids; or workers that never need a signal
-   from a more privileged process (exit on socket EOF, `RLIMIT_CPU` as the
-   backstop for a hang), which removes `CAP_KILL` but not the case of a worker
-   stuck in a call that does neither.
+7. The spawner holds `CAP_KILL`, which the filter cannot limit to its
+   workers, and `CAP_SETUID`/`CAP_SETGID`, which let it clear its own
+   parent-death signal (see "Residual risk: the spawner can signal any
+   process" and "Residual risk: a compromised spawner can outlive avd").
+   Options: run the spawner as the workers' uid with no capabilities, which
+   closes both (described under the second risk); a separate PID namespace for
+   the spawner and its workers, with the `/proc` check reworked for
+   namespace-local pids, which closes only the first; or workers that never
+   need a signal from a more privileged process (exit on socket EOF,
+   `RLIMIT_CPU` as the backstop for a hang), which removes `CAP_KILL` but not
+   the case of a worker stuck in a call that does neither.
 
 ## Open items
 

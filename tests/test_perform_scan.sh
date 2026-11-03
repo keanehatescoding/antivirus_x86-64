@@ -627,21 +627,27 @@ else
             "$BUILD_DIR/work-lockfail" "$BUILD_DIR/clean-sample.txt" \
             > "$BUILD_DIR/out-lockfail.txt" 2> "$BUILD_DIR/err-lockfail.txt"
         rc=$?
-        if [ "$rc" -ne 0 ]; then
+        # A non-zero exit alone proves nothing: the harness also exits non-zero
+        # when its own setup fails (a missing sample, rules or corpora that do
+        # not load), before privsep_start() ever runs. Require privsep's own
+        # diagnostic, so this can only pass for the failure it is about.
+        diag="$(grep -m1 -E 'avd: privsep: (privsep spawner lost|the spawner did not produce)' \
+                "$BUILD_DIR/err-lockfail.txt")"
+        if [ "$rc" -ne 0 ] && [ -n "$diag" ]; then
             pass "avd stops when the spawner cannot lock itself down (exit $rc)"
-            echo "        avd said: $(grep -m1 'privsep' "$BUILD_DIR/err-lockfail.txt")"
+            echo "        avd said: $diag"
+            if grep -q 'privilege separation on' "$BUILD_DIR/out-lockfail.txt"; then
+                fail "avd reported privilege separation as on before the spawner was locked down"
+            else
+                pass "avd never reported privilege separation as on"
+            fi
+            if grep -q '^CASE ' "$BUILD_DIR/out-lockfail.txt"; then
+                fail "scans ran with a spawner that was never locked down"
+            else
+                pass "no scan ran"
+            fi
         else
-            fail "avd carried on with a spawner that could not lock itself down"
-        fi
-        if grep -q 'privilege separation on' "$BUILD_DIR/out-lockfail.txt"; then
-            fail "avd reported privilege separation as on before the spawner was locked down"
-        else
-            pass "avd never reported privilege separation as on"
-        fi
-        if grep -q '^CASE ' "$BUILD_DIR/out-lockfail.txt"; then
-            fail "scans ran with a spawner that was never locked down"
-        else
-            pass "no scan ran"
+            fail "avd did not stop for a failed spawner lockdown (exit $rc, no privsep diagnostic): $(head -3 "$BUILD_DIR/err-lockfail.txt" | tr '\n' ' ')"
         fi
     else
         echo "  SKIP: setpriv with --bounding-set is not available"

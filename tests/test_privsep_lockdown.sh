@@ -854,6 +854,22 @@ static int in_child(int (*fn)(void), uint64_t drop_effective) {
 }
 
 static int lockdown_right_ppid(void) { return ps_spawner_lockdown(getppid()); }
+
+/* Lock down for real, then do what a compromised spawner could: change the
+ * effective gid, which the filter allows (workers do it under the same filter).
+ * Under the filter only exit_group and a few others work, so the answer goes
+ * out as the exit status: 10 = the signal was set and the credential change
+ * cleared it, 11 = it survived, anything else = the setup went wrong. */
+static int pdeathsig_after_credential_change(void) {
+    int before = -1, after = -1;
+
+    if (ps_spawner_lockdown(getppid()) != 0) return 1;
+    if (prctl(PR_GET_PDEATHSIG, &before, 0, 0, 0) < 0) return 2;
+    if (before != SIGKILL) return 3;
+    if (syscall(SYS_setresgid, WORKER_UID, WORKER_UID, WORKER_UID) < 0) return 4;
+    if (prctl(PR_GET_PDEATHSIG, &after, 0, 0, 0) < 0) return 5;
+    return after == 0 ? 10 : 11;
+}
 static int lockdown_wrong_ppid(void) { return ps_spawner_lockdown(getppid() + 4242); }
 static int lockdown_no_ppid(void) { return ps_spawner_lockdown(0); }
 
@@ -903,6 +919,29 @@ static void test_refuses(void) {
     CHECK(rc == PS_L_PDEATHSIG, "no parent pid at all is refused");
     rc = in_child(lockdown_right_ppid, 0);
     CHECK(rc == 0, "with the real parent pid the whole sequence succeeds");
+}
+
+/* KNOWN GAP, deliberately recorded (docs/privilege-separation.md, "Residual
+ * risk: a compromised spawner can outlive avd"). The spawner keeps CAP_SETGID
+ * and its filter has to allow the credential calls its workers make, so it can
+ * still clear its own parent-death signal. This asserts the gap is there. When
+ * the spawner stops holding those capabilities and the calls leave its filter,
+ * this check will fail: flip it to expect 11 and update that section. */
+static void test_known_gap(void) {
+    int rc;
+
+    printf("\nknown gap: the parent-death signal and credential changes (root):\n");
+    if (!can_lock_down()) {
+        SKIPT("needs root with CAP_SETUID, CAP_SETGID, CAP_SETPCAP and CAP_KILL");
+        return;
+    }
+    rc = in_child(pdeathsig_after_credential_change, 0);
+    /* 1-3 are setup errors. 4, 5 or a SIGSYS death (231) mean the credential
+     * change itself no longer works, i.e. the gap may have been closed. */
+    CHECK(rc != 1 && rc != 2 && rc != 3,
+          "the lockdown ran and the parent-death signal was SIGKILL before the credential change");
+    CHECK(rc == 10,
+          "KNOWN GAP: setresgid() after the lockdown clears the parent-death signal (see the docs)");
 }
 
 static void test_dies_with_parent(void) {
@@ -970,6 +1009,7 @@ int main(void) {
     test_refuses();
     test_spawner_state();
     test_failure_injection();
+    test_known_gap();
     test_dies_with_parent();
     SUMMARY("privsep_lockdown (kernel)");
 }
