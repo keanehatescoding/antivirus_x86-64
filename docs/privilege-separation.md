@@ -295,8 +295,10 @@ the code. Things the trace turned up that the sketch missed:
   filter exists, which is why the lockdown comes last. (`rt_sigaction` is on
   the list, through the worker allowlist.)
 
-Argument checks: `prctl` only for the seven options in use, `kill` only with
-`SIGKILL`, `clone` only with exactly `fork()`'s flags (`CHILD_SETTID`,
+Argument checks: `prctl` only for the seven options in use (and
+`PR_SET_PDEATHSIG` only with `SIGKILL`, so a compromised spawner cannot clear
+it and outlive avd), `kill` only with `SIGKILL` (the signal only, not the
+target; see "Residual risk: the spawner can signal any process" below), `clone` only with exactly `fork()`'s flags (`CHILD_SETTID`,
 `CHILD_CLEARTID`, exit signal `SIGCHLD`, upper half zero, so no threads and no
 `CLONE_NEW*`), `socketpair` only `AF_UNIX`, `prlimit64` only on pid 0,
 `newfstatat` only with `AT_EMPTY_PATH`. Everything else, including `open*`,
@@ -584,6 +586,31 @@ use a fresh worker per scan from the spawner (removes it, at the price of one
 `fork()` per scan, which must be measured against the fanotify deadline). This
 is an open question below.
 
+#### Residual risk: the spawner can signal any process
+
+The spawner keeps `CAP_KILL` so that it can `SIGKILL` a worker that runs as
+another uid. The seccomp filter pins the signal to `SIGKILL` but not the
+target, so a compromised spawner could `kill(-1, SIGKILL)` or signal avd
+itself. The filter cannot close this: it cannot know which pids are workers,
+and pinning avd's pid would not help either, because `kill()` on any of avd's
+thread ids signals the whole process (checked here, and the thread ids are not
+fixed). The result is a loss of protection, not code execution as root: avd
+dies, the kernel module's own fail-open or fail-closed policy applies until
+systemd restarts it, and an attacker who can do this can also kill other
+services.
+
+How likely it is: the spawner never reads a scanned file. Its only inputs are
+fixed 40-byte control messages from avd and, until a worker reports ready, that
+worker's readiness message, all validated; once a worker is ready its socket
+belongs to avd and the worker can no longer reach the spawner. Compromising it
+takes a bug in that validation, which sees no file content.
+
+Real fixes are boundary changes, so this is an open question below and not
+part of Stage 1f: run the spawner and its workers in their own PID namespace
+(`CLONE_NEWPID` when avd forks the spawner, which needs `CAP_SYS_ADMIN` at that
+moment; the pid avd's `/proc` check reads from `READY` would then need
+translating), or remove the spawner's need for `CAP_KILL`.
+
 ### Stage 2: shrink the parent
 
 After init the parent still needs real power, so this stage is smaller than
@@ -632,6 +659,15 @@ and syscalls.
   `load_tlsh_corpus()`, while single-threaded, before `nl_socket_alloc()`.
   stdio is flushed first so no buffered output is duplicated into the spawner
   and every worker.
+- avd does not report privilege separation as on until the spawner has
+  produced a hardened worker: `privsep_start()` spawns one probe worker, which
+  the client verifies from `/proc` like any other, and releases it. The
+  spawner is forked before it locks itself down and `ps_spawner_start()`
+  returns at once, so without this a spawner that failed its lockdown still
+  got a "privilege separation on" line and let startup carry on until the
+  channel closed. `tests/test_perform_scan.sh` makes the lockdown fail for real
+  (`CAP_SETPCAP` removed from the bounding set) and checks that avd stops and
+  never prints that line.
 - Each scan thread owns one worker (thread-local handle), spawned on its first
   scan and released when the thread exits. `analyze_fd()` does SHA-256 and the
   signature lookup in the parent as before, then calls `analyze_in_worker()`
@@ -716,8 +752,12 @@ reads a real spawner back from `/proc` (four capabilities in every set,
 `NoNewPrivs`, `Seccomp: 2`) and the worker it made (still fully hardened under
 both filters), injects a failure at each lockdown step, shows that a missing
 `CAP_SETPCAP` or a wrong parent pid is refused before anything serves, and
-kills avd to show the locked-down spawner dies with it. `tests/test_perform_scan.sh`
-reads the spawner back from inside the real avd.
+kills avd to show the locked-down spawner dies with it. The suite also runs
+cleanly inside a bounding set already cut to the four capabilities (the
+packaged unit's future `CapabilityBoundingSet=`), where the first refusal
+moves from the bounding-set step to the capabilities step. `tests/test_perform_scan.sh`
+reads the spawner back from inside the real avd and checks that a spawner that
+cannot lock itself down stops avd at startup.
 
 - hardening failure injection: make each step (setuid, capset, seccomp, ...)
   fail in a test build; the worker must exit without reporting ready and the
@@ -792,12 +832,21 @@ reads the spawner back from inside the real avd.
    `MAP_SHARED` on anonymous mappings; or have the parent refuse to send
    files above the limit and treat them by policy (for example a size-only
    verdict, or quarantine-on-doubt).
+7. The spawner holds `CAP_KILL` and the filter cannot limit its target (see
+   "Residual risk: the spawner can signal any process"). Options: a separate
+   PID namespace for the spawner and its workers, with the `/proc` check
+   reworked for namespace-local pids; or workers that never need a signal
+   from a more privileged process (exit on socket EOF, `RLIMIT_CPU` as the
+   backstop for a hang), which removes `CAP_KILL` but not the case of a worker
+   stuck in a call that does neither.
 
 ## Open items
 
-- When the spawner dies, avd only logs that it is gone. A spawner killed by its
-  own seccomp filter (a libc that issues a call this list lacks) looks the same
-  as any other death. avd should reap it and log the wait status the way the
+- When the spawner dies, avd only logs that it is gone ("privsep spawner lost:
+  read error on the control channel"), also at startup now that avd waits for a
+  probe worker. A spawner killed by its own seccomp filter (a libc that issues
+  a call this list lacks), one that failed a lockdown step, and any other death
+  all look the same. avd should reap it and log the wait status the way the
   client already does for workers, with a short wait because the channel closes
   a moment before the process becomes reapable.
 

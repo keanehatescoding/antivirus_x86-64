@@ -207,6 +207,7 @@ enum ps_lbl {
   PSL_KILL,
   PSL_STAT,
   PSL_PRCTL,
+  PSL_PDEATH,
   PSL_KILLSIG,
   PSL_CLONE,
   PSL_SOCKPAIR,
@@ -293,8 +294,9 @@ static inline size_t ps_asm_finish(struct ps_asm *a) {
  *   arch must be x86-64 and the x32 bit clear
  *   worker list + spawner list                    -> allow
  *   newfstatat   only with AT_EMPTY_PATH          (as the worker's filter)
- *   prctl        only the options listed above
- *   kill         only with SIGKILL
+ *   prctl        only the options listed above; PR_SET_PDEATHSIG only with
+ *                SIGKILL
+ *   kill         only with SIGKILL (any target, see below)
  *   clone        only exactly fork()'s flags
  *   socketpair   only AF_UNIX
  *   prlimit64    only on itself (pid 0)
@@ -336,8 +338,26 @@ static inline size_t ps_seccomp_build_spawner(struct ps_asm *a) {
   ps_asm_stmt(a, BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_LO(0));
   for (size_t i = 0; i < PS_ALLOW_PRCTL_OPTS_N; i++)
     ps_asm_jump(a, BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)ps_allow_prctl_opts[i],
-                PSL_ALLOW, i + 1 == PS_ALLOW_PRCTL_OPTS_N ? PSL_KILL : PSL_NONE);
+                ps_allow_prctl_opts[i] == PR_SET_PDEATHSIG ? PSL_PDEATH
+                                                           : PSL_ALLOW,
+                i + 1 == PS_ALLOW_PRCTL_OPTS_N ? PSL_KILL : PSL_NONE);
 
+  /* PR_SET_PDEATHSIG only with SIGKILL. The option is on the list so that
+   * hardening can set it, but with any other signal (0 clears it) a
+   * compromised spawner could outlive avd, which is the one thing the
+   * parent-death handshake exists to prevent. The argument is an unsigned
+   * long, so the upper half must be zero too. */
+  ps_asm_bind(a, PSL_PDEATH);
+  ps_asm_stmt(a, BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_HI(1));
+  ps_asm_jump(a, BPF_JMP | BPF_JEQ | BPF_K, 0, PSL_NONE, PSL_KILL);
+  ps_asm_stmt(a, BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_LO(1));
+  ps_asm_jump(a, BPF_JMP | BPF_JEQ | BPF_K, SIGKILL, PSL_ALLOW, PSL_KILL);
+
+  /* Only the SIGNAL is pinned, not the target: the spawner holds CAP_KILL and
+   * the filter cannot know which pids are its workers. Pinning avd's pid would
+   * not close this either, since kill() on any of avd's thread ids signals the
+   * whole process. See docs/privilege-separation.md, "Residual risk: the
+   * spawner can signal any process". */
   ps_asm_bind(a, PSL_KILLSIG);
   ps_asm_stmt(a, BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_LO(1));
   ps_asm_jump(a, BPF_JMP | BPF_JEQ | BPF_K, SIGKILL, PSL_ALLOW, PSL_KILL);

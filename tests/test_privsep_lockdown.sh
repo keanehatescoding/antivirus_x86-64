@@ -153,8 +153,11 @@ static bool want_plain(int nr) {
     }
 }
 
-static bool want_prctl(uint32_t opt) {
-    return opt == 1 /* PR_SET_PDEATHSIG */ || opt == 2 /* PR_GET_PDEATHSIG */ ||
+/* PR_SET_PDEATHSIG (1) only with SIGKILL, argument checked whole; the rest of
+ * the options do not look at it. */
+static bool want_prctl(uint32_t opt, uint64_t a1) {
+    if (opt == 1) return a1 == 9;
+    return opt == 2 /* PR_GET_PDEATHSIG */ ||
            opt == 22 /* PR_SET_SECCOMP */ || opt == 23 /* PR_CAPBSET_READ */ ||
            opt == 24 /* PR_CAPBSET_DROP */ || opt == 38 /* PR_SET_NO_NEW_PRIVS */ ||
            opt == 39 /* PR_GET_NO_NEW_PRIVS */;
@@ -289,19 +292,23 @@ static void test_arguments(void) {
 
     printf("\nthe argument checks:\n");
 
-    /* newfstatat: describing an open descriptor only, as in the worker. */
+    /* newfstatat: the filter checks only the AT_EMPTY_PATH flag, as the
+     * worker's does; it cannot see the pathname (docs, "Seccomp allowlist"). */
     CHECK(sp_ok(SYS_newfstatat, 5, 0, AT_EMPTY_PATH) &&
               sp_ok(SYS_newfstatat, 5, 0, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW),
           "newfstatat(AT_EMPTY_PATH) is allowed");
     CHECK(!sp_ok(SYS_newfstatat, 5, 0, 0) &&
               !sp_ok(SYS_newfstatat, 5, 0, AT_SYMLINK_NOFOLLOW),
-          "newfstatat by path is killed");
+          "newfstatat without AT_EMPTY_PATH is killed");
 
     /* prctl: exactly seven options, everything else killed. */
     bad = 0;
-    for (uint32_t opt = 0; opt < 4096; opt++)
-        for (uint64_t a1 = 0; a1 < 3; a1++)
-            if (sp_ok(SYS_prctl, opt, a1, 0) != want_prctl(opt)) bad++;
+    for (uint32_t opt = 0; opt < 4096; opt++) {
+        static const uint64_t a1s_prctl[] = {0, 1, 2, 9, 15, 64, 9ull | (1ull << 32),
+                                             1ull << 32, ~0ull};
+        for (size_t k = 0; k < sizeof(a1s_prctl) / sizeof(a1s_prctl[0]); k++)
+            if (sp_ok(SYS_prctl, opt, a1s_prctl[k], 0) != want_prctl(opt, a1s_prctl[k])) bad++;
+    }
     {
         static const uint32_t odd[] = {0x59616d61 /* PR_SET_PTRACER */, 0x80000000u,
                                        0xffffffffu, 0x7fffffffu, 4 /* DUMPABLE */,
@@ -309,12 +316,24 @@ static void test_arguments(void) {
                                        36 /* CHILD_SUBREAPER */, 8 /* KEEPCAPS */,
                                        28 /* SECUREBITS */, 47 /* CAP_AMBIENT */};
         for (size_t i = 0; i < sizeof(odd) / sizeof(odd[0]); i++)
-            if (sp_ok(SYS_prctl, odd[i], 0, 0) != want_prctl(odd[i])) bad++;
+            if (sp_ok(SYS_prctl, odd[i], 0, 0) != want_prctl(odd[i], 0)) bad++;
     }
     CHECK(bad == 0, "prctl is allowed for exactly the seven options in use");
     CHECK(sp_ok(SYS_prctl, 38, 1, 0) && sp_ok(SYS_prctl, 22, 2, 0) &&
               sp_ok(SYS_prctl, 24, 20, 0),
           "the options hardening uses pass: NO_NEW_PRIVS, SET_SECCOMP, CAPBSET_DROP");
+
+    /* The parent-death signal can be set to SIGKILL (hardening does) and to
+     * nothing else: clearing it would let a compromised spawner outlive avd. */
+    bad = 0;
+    for (uint64_t sig = 0; sig < 130; sig++)
+        if (sp_ok(SYS_prctl, 1 /* PR_SET_PDEATHSIG */, sig, 0) != (sig == 9)) bad++;
+    CHECK(bad == 0 && sp_ok(SYS_prctl, 1, 9, 0),
+          "PR_SET_PDEATHSIG is allowed only with SIGKILL");
+    CHECK(!sp_ok(SYS_prctl, 1, 0, 0) && !sp_ok(SYS_prctl, 1, 9ull | (1ull << 32), 0),
+          "clearing the parent-death signal, or hiding a bit above SIGKILL, is killed");
+    CHECK(sp_ok(SYS_prctl, 2 /* PR_GET_PDEATHSIG */, 0, 0),
+          "reading it back (PR_GET_PDEATHSIG) is still allowed");
 
     /* kill: only SIGKILL, on any pid. */
     bad = 0;
@@ -453,6 +472,7 @@ enum act {
     A_OPEN, A_OPENAT, A_SOCKET, A_EXECVE, A_PTRACE, A_WRITE, A_THREAD_CLONE,
     A_NEWUSER_CLONE, A_KILL_TERM, A_PRCTL_DUMPABLE, A_SIGNALFD, A_MOUNT,
     A_UNSHARE, A_SOCKPAIR_INET, A_PRLIMIT_OTHER, A_CLONE3, A_MEMFD, A_BPF,
+    A_PDEATHSIG_CLEAR,
 };
 
 static const struct { enum act a; const char *name; } forbidden[] = {
@@ -463,6 +483,7 @@ static const struct { enum act a; const char *name; } forbidden[] = {
     {A_SIGNALFD, "signalfd4()"}, {A_MOUNT, "mount()"}, {A_UNSHARE, "unshare()"},
     {A_SOCKPAIR_INET, "socketpair(AF_INET)"}, {A_PRLIMIT_OTHER, "prlimit64 on another pid"},
     {A_CLONE3, "clone3()"}, {A_MEMFD, "memfd_create()"}, {A_BPF, "bpf()"},
+    {A_PDEATHSIG_CLEAR, "prctl(PR_SET_PDEATHSIG, 0) (clearing it)"},
 };
 
 /* Install the spawner's filter in a forked child, perform `a`, report. A
@@ -494,6 +515,7 @@ static int filter_child(enum act a) {
             if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) _exit(4);
             if (kill(999999999, SIGKILL) != -1 || errno != ESRCH) _exit(5); /* allowed, finds nobody */
             if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) _exit(6);
+            if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) < 0) _exit(13); /* what hardening sets */
             if (getrlimit(RLIMIT_NOFILE, &rl) < 0) _exit(7);   /* prlimit64 on itself */
             if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0) _exit(8);
             /* sendmsg/recvmsg, which is what the spawner uses: glibc's send()
@@ -552,6 +574,7 @@ static int filter_child(enum act a) {
         case A_CLONE3:       r = syscall(SYS_clone3, NULL, 0); break;
         case A_MEMFD:        r = syscall(SYS_memfd_create, "x", 0); break;
         case A_BPF:          r = syscall(SYS_bpf, 0, NULL, 0); break;
+        case A_PDEATHSIG_CLEAR: r = syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0); break;
         default:             r = 0; break;
         }
         _exit(r == 0 ? 0 : 91); /* a forbidden call that returned: not killed */
@@ -834,16 +857,40 @@ static int lockdown_right_ppid(void) { return ps_spawner_lockdown(getppid()); }
 static int lockdown_wrong_ppid(void) { return ps_spawner_lockdown(getppid() + 4242); }
 static int lockdown_no_ppid(void) { return ps_spawner_lockdown(0); }
 
+/* Which step refuses first when CAP_SETPCAP is gone. Emptying the bounding set
+ * needs it, so with anything beyond the four kept capabilities still in the
+ * set (the usual case) the bounding-set step fails. Started with the set
+ * already cut to exactly the four (under the packaged unit's
+ * CapabilityBoundingSet=, say) that step has nothing to drop and passes, and
+ * the next one fails instead, because the permitted set cannot hold what
+ * was just given up. Either way nothing has been changed yet. */
+static int step_refusing_without_setpcap(void) {
+    bool extra = false, missing = false;
+
+    for (int cap = 0;; cap++) {
+        int r = prctl(PR_CAPBSET_READ, cap, 0, 0, 0);
+        bool keep;
+
+        if (r < 0) break; /* EINVAL: past the last capability */
+        keep = cap < 64 && ((PS_SPAWNER_CAPS >> cap) & 1u);
+        if (r == 1 && !keep) extra = true;
+        if (r == 0 && keep) missing = true;
+    }
+    return (!extra && !missing) ? PS_L_CAPABILITIES : PS_L_BOUNDING_SET;
+}
+
 static void test_refuses(void) {
-    int rc;
+    int rc, want = step_refusing_without_setpcap();
 
     printf("\nthe lockdown refuses to run half-way:\n");
 
     /* Works as root and without: giving up CAP_SETPCAP (or never having it)
-     * must fail at the very first step, before anything is changed. */
+     * must be refused before anything is changed. */
     rc = in_child(lockdown_right_ppid, 1ull << CAP_SETPCAP);
-    CHECK(rc == PS_L_BOUNDING_SET,
-          "without CAP_SETPCAP it fails at the bounding-set step, not later");
+    CHECK(rc == want,
+          want == PS_L_BOUNDING_SET
+              ? "without CAP_SETPCAP it fails at the bounding-set step, not later"
+              : "without CAP_SETPCAP it fails at the capabilities step (the bounding set was already cut)");
 
     if (!can_lock_down()) {
         SKIPT("a wrong or missing parent pid is refused (needs root)");

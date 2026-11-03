@@ -2451,6 +2451,35 @@ static int privsep_start(uid_t uid, gid_t gid) {
     ps_client_stop(&privsep_cl);
     return -1;
   }
+
+  /* ps_spawner_start() returns as soon as the spawner is forked; it locks
+   * itself down afterwards, in the child, and nothing above says how that
+   * went. Get one worker from it now and check it the way every later worker
+   * is checked. A spawner that failed its lockdown (or was killed by its own
+   * filter) never answers, and the channel closing ends avd through
+   * privsep_on_dead(); a worker that cannot harden under both filters is
+   * reported here with its reason. Either way avd does not claim privilege
+   * separation is on, and does not go on starting up, until a real worker has
+   * come back. */
+  {
+    struct ps_worker probe;
+    struct ps_spawn_info si;
+    enum ps_spawn_status st;
+
+    ps_worker_init(&probe);
+    memset(&si, 0, sizeof(si));
+    st = ps_client_spawn(&privsep_cl, &probe, AVD_PRIVSEP_SPAWN_WAIT_MS, &si);
+    if (st != PS_SPAWN_OK) {
+      fprintf(stderr,
+              "avd: privsep: the spawner did not produce a hardened worker "
+              "at startup (status %d, reason %u, detail %d%s%s)\n",
+              (int)st, (unsigned)si.reason, si.detail, si.why[0] ? ", " : "",
+              si.why);
+      ps_client_stop(&privsep_cl);
+      return -1;
+    }
+    ps_client_release(&privsep_cl, &probe);
+  }
   privsep_enabled = true;
   printf("avd: privilege separation on: scans run in workers as uid %u gid "
          "%u (spawner pid %d)\n",

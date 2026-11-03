@@ -614,6 +614,39 @@ else
         pass "no scan was done in the root process after the spawner was lost"
     fi
 
+    # A spawner that cannot lock itself down must stop avd at startup, before
+    # it reports privilege separation as on, not later when the channel closes.
+    # Natural failure injection, no test hook in the binary: start the harness
+    # with CAP_SETPCAP gone from the bounding set. The spawner needs it, and
+    # the lockdown's first step refuses to run without it. Needs setpriv.
+    echo "spawner lockdown failure at startup:"
+    if command -v setpriv >/dev/null 2>&1 &&
+       setpriv --bounding-set=-setpcap true 2>/dev/null; then
+        mkdir -p "$BUILD_DIR/work-lockfail"
+        setpriv --bounding-set=-setpcap env HARNESS_PRIVSEP=1 "$BUILD_DIR/harness" \
+            "$BUILD_DIR/work-lockfail" "$BUILD_DIR/clean-sample.txt" \
+            > "$BUILD_DIR/out-lockfail.txt" 2> "$BUILD_DIR/err-lockfail.txt"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            pass "avd stops when the spawner cannot lock itself down (exit $rc)"
+            echo "        avd said: $(grep -m1 'privsep' "$BUILD_DIR/err-lockfail.txt")"
+        else
+            fail "avd carried on with a spawner that could not lock itself down"
+        fi
+        if grep -q 'privilege separation on' "$BUILD_DIR/out-lockfail.txt"; then
+            fail "avd reported privilege separation as on before the spawner was locked down"
+        else
+            pass "avd never reported privilege separation as on"
+        fi
+        if grep -q '^CASE ' "$BUILD_DIR/out-lockfail.txt"; then
+            fail "scans ran with a spawner that was never locked down"
+        else
+            pass "no scan ran"
+        fi
+    else
+        echo "  SKIP: setpriv with --bounding-set is not available"
+    fi
+
     # The harness above calls privsep_start() directly, so it never reaches
     # avd's own AVD_PRIVSEP read or the hyprav-scan account check. Run the
     # real avd for those. Each case runs in a private mount namespace with a
