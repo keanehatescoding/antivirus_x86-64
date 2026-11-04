@@ -9,6 +9,12 @@
 # Needs virtme-ng (vng) and /dev/kvm. No root on the host:
 #   tests/run_fanotify_vng.sh
 #
+# With --privsep the same checks run with avd started under AVD_PRIVSEP=1
+# (scans in unprivileged workers, #103); the guest gets the hyprav-scan
+# user created for it. The flag is passed on the guest command line,
+# because the host environment does not reach the guest:
+#   tests/run_fanotify_vng.sh --privsep
+#
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,4 +25,4 @@ if ! command -v vng >/dev/null 2>&1; then
 fi
 
 exec vng --run --user root --cpus 2 -- \
-    "$REPO_ROOT/tests/test_fanotify_exec.sh"
+    "$REPO_ROOT/tests/test_fanotify_exec.sh" "$@"

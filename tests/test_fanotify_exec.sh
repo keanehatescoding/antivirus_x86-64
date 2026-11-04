@@ -23,13 +23,28 @@
 #     daemon policy after AVD_FANOTIFY_TIMEOUT_MS - allowed under
 #     fail-open, EPERM under fail-closed
 #
+# With --privsep (or AV_TEST_PRIVSEP=1) every avd start also gets
+# AVD_PRIVSEP=1, so the same checks run with scans done in unprivileged
+# worker processes (#103, docs/privilege-separation.md). The script then
+# creates the hyprav-scan user in the guest if it is missing (the guest is
+# throwaway; this is what packaging/hyprav.sysusers does on a real
+# install) and checks the spawner and worker processes from /proc.
+#
 # Usage, from the host (boots the running kernel in a throwaway
 # virtme-ng guest - see tests/run_fanotify_vng.sh):
-#   tests/run_fanotify_vng.sh
+#   tests/run_fanotify_vng.sh [--privsep]
 # or, inside a VM you are happy to break:
-#   sudo tests/test_fanotify_exec.sh
+#   sudo tests/test_fanotify_exec.sh [--privsep]
 #
 set -u
+
+PRIVSEP="${AV_TEST_PRIVSEP:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        --privsep) PRIVSEP=1 ;;
+        *) echo "unknown argument: $arg (only --privsep is accepted)"; exit 2 ;;
+    esac
+done
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod, fanotify marks). Re-run with sudo."
@@ -154,11 +169,13 @@ stop_avd() {
 # start_avd [ENV=VAL ...] - fresh socket each time; stdout line-buffered
 # so the log can be polled.
 start_avd() {
+    local extra=()
+    [ "$PRIVSEP" = 1 ] && extra=(AVD_PRIVSEP=1)
     rm -f "$TEST_SOCK_PATH"
     : > "$AVD_LOG"
     (
         cd "$REPO_ROOT" || exit 1
-        exec env "$@" stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" \
+        exec env ${extra[@]+"${extra[@]}"} "$@" stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" \
             corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
             corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >>"$AVD_LOG" 2>&1
     ) &
@@ -178,6 +195,73 @@ wait_log() {
         nap 0.25
     done
     return 1
+}
+
+# proc_field PID KEY - one /proc/PID/status field, leading blanks trimmed.
+proc_field() {
+    awk -v k="$2:" '$1 == k { $1 = ""; sub(/^ +/, ""); print; exit }' \
+        "/proc/$1/status" 2>/dev/null
+}
+
+# Pids whose parent is $1, read from /proc (no pgrep needed in the guest).
+children_of() {
+    awk -v p="$1" '$1 == "PPid:" && $2 == p { split(FILENAME, a, "/"); print a[3] }' \
+        /proc/[0-9]*/status 2>/dev/null
+}
+
+# With privilege separation on, check from /proc what the design promises:
+# the spawner is root but cut to four capabilities (CAP_KILL, CAP_SETGID,
+# CAP_SETUID, CAP_SETPCAP = bits 5-8 = 0x1e0) under NO_NEW_PRIVS and a
+# seccomp filter, and every worker is the hyprav-scan user with an empty
+# capability set, NO_NEW_PRIVS and a seccomp filter. avd runs the same
+# check on each worker it hands work to; this is the independent view.
+# Call it with avd running and after some scans have happened.
+check_privsep() {
+    local spid uid gid w workers=0 bad=0
+
+    if grep -qF "privilege separation on" "$AVD_LOG"; then
+        pass "avd reports privilege separation on"
+    else
+        fail "avd did not report privilege separation on"; cat "$AVD_LOG"
+        return
+    fi
+    spid="$(sed -n 's/.*(spawner pid \([0-9][0-9]*\)).*/\1/p' "$AVD_LOG" | head -1)"
+    if [ -z "$spid" ] || [ ! -d "/proc/$spid" ]; then
+        fail "spawner pid '$spid' from the log is not a live process"
+        return
+    fi
+    uid="$(id -u hyprav-scan)"; gid="$(id -g hyprav-scan)"
+
+    if [ "$(proc_field "$spid" Uid)" = "0 0 0 0" ] && \
+       [ "$(proc_field "$spid" CapBnd)" = "00000000000001e0" ] && \
+       [ "$(proc_field "$spid" NoNewPrivs)" = "1" ] && \
+       [ "$(proc_field "$spid" Seccomp)" = "2" ]; then
+        pass "spawner is root cut to four capabilities, NO_NEW_PRIVS, seccomp"
+    else
+        fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)'"
+    fi
+
+    for w in $(children_of "$spid"); do
+        workers=$((workers + 1))
+        if [ "$(proc_field "$w" Uid)" = "$uid $uid $uid $uid" ] && \
+           [ "$(proc_field "$w" Gid)" = "$gid $gid $gid $gid" ] && \
+           [ "$(proc_field "$w" CapBnd)" = "0000000000000000" ] && \
+           [ "$(proc_field "$w" CapEff)" = "0000000000000000" ] && \
+           [ "$(proc_field "$w" NoNewPrivs)" = "1" ] && \
+           [ "$(proc_field "$w" Seccomp)" = "2" ]; then
+            :
+        else
+            bad=$((bad + 1))
+            echo "    worker $w: Uid='$(proc_field "$w" Uid)' CapBnd='$(proc_field "$w" CapBnd)' CapEff='$(proc_field "$w" CapEff)' NoNewPrivs='$(proc_field "$w" NoNewPrivs)' Seccomp='$(proc_field "$w" Seccomp)'"
+        fi
+    done
+    if [ "$workers" -eq 0 ]; then
+        fail "no worker process under the spawner after scans ran"
+    elif [ "$bad" -eq 0 ]; then
+        pass "all $workers worker(s) are hyprav-scan with no capabilities, NO_NEW_PRIVS, seccomp"
+    else
+        fail "$bad of $workers worker(s) not fully hardened"
+    fi
 }
 
 # A runnable ELF whose hash nothing has seen: /bin/true padded with a
@@ -244,6 +328,20 @@ if insmod "$AV_DIR/av.ko" 2>"$TEST_TMP_DIR/insmod.log"; then
 else
     fail "insmod failed: $(cat "$TEST_TMP_DIR/insmod.log")"
     exit 1
+fi
+
+if [ "$PRIVSEP" = 1 ]; then
+    section "privilege separation: worker user"
+    if getent passwd hyprav-scan >/dev/null; then
+        pass "hyprav-scan already exists"
+    elif command -v useradd >/dev/null 2>&1 && \
+         useradd --system --user-group --no-create-home \
+                 --shell /usr/sbin/nologin hyprav-scan 2>"$TEST_TMP_DIR/useradd.log"; then
+        pass "hyprav-scan created in the guest"
+    else
+        fail "cannot create hyprav-scan: $(cat "$TEST_TMP_DIR/useradd.log" 2>/dev/null)"
+        exit 1
+    fi
 fi
 
 mkdir -p "$TEST_RULES_DIR" "$TEST_QUARANTINE_DIR" "$FIX" "$HOT" "$HOLD"
@@ -372,6 +470,11 @@ if [ -n "$DENIED" ] && [ "$DENIED" -ge 3 ]; then
     pass "STATUS fan_denied counts the refusals ($DENIED)"
 else
     fail "STATUS fan_denied = '$DENIED', expected >= 3"
+fi
+
+if [ "$PRIVSEP" = 1 ]; then
+    section "privilege separation: processes"
+    check_privsep
 fi
 
 section "signature added at runtime overrides a cached clean verdict"
