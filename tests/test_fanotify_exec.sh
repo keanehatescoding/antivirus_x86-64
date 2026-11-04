@@ -233,12 +233,14 @@ check_privsep() {
     uid="$(id -u hyprav-scan)"; gid="$(id -g hyprav-scan)"
 
     if [ "$(proc_field "$spid" Uid)" = "0 0 0 0" ] && \
+       [ "$(proc_field "$spid" CapEff)" = "00000000000001e0" ] && \
+       [ "$(proc_field "$spid" CapPrm)" = "00000000000001e0" ] && \
        [ "$(proc_field "$spid" CapBnd)" = "00000000000001e0" ] && \
        [ "$(proc_field "$spid" NoNewPrivs)" = "1" ] && \
        [ "$(proc_field "$spid" Seccomp)" = "2" ]; then
         pass "spawner is root cut to four capabilities, NO_NEW_PRIVS, seccomp"
     else
-        fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)'"
+        fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapEff='$(proc_field "$spid" CapEff)' CapPrm='$(proc_field "$spid" CapPrm)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)'"
     fi
 
     for w in $(children_of "$spid"); do

@@ -856,9 +856,9 @@ cannot lock itself down stops avd at startup.
   (contract 1), and a full queue is still answered immediately by policy
   with the listener never blocking (contracts 3 and 4)
 - seccomp kill is observed if a worker attempts `open()` (test hook)
-- `tests/test_perform_scan.sh` and the end-to-end fanotify test pass with
-  `AVD_PRIVSEP=1` (the first does; the second has a `--privsep` mode that has
-  not yet been run, see "Open items"). The QEMU boot job is not part of this:
+- `tests/test_perform_scan.sh` passes with `AVD_PRIVSEP=1`. The end-to-end
+  fanotify test has a `--privsep` mode that has not yet been run (see "Open
+  items"). The QEMU boot job is not part of this:
   it loads only `av.ko` from a static init and never starts avd
 
 ## Open questions
