@@ -23,9 +23,10 @@
  * reader thread, the request table and the lock that the main process needs
  * around this channel belong to the avd.c wiring, not here.
  *
- * Not wired into avd yet. Also not here yet: the spawner's own capability
- * drop and seccomp superset filter (doc, "Seccomp filters stack"), and the
- * parent-side /proc check of a READY worker.
+ * The spawner locks itself down once its own setup is done (Stage 1f, see
+ * privsep_lockdown.h): capabilities cut to the four it needs, NO_NEW_PRIVS, and
+ * a seccomp filter that is a superset of the worker allowlist (doc, "Seccomp
+ * filters stack"). Production builds always do this; there is no switch.
  */
 
 #ifndef AV_PRIVSEP_SPAWNER_H
@@ -45,6 +46,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "privsep_lockdown.h"
 #include "privsep_worker.h"
 
 #ifndef POLLRDHUP /* only visible with _GNU_SOURCE, which a header cannot set */
@@ -353,13 +355,25 @@ struct ps_spawner_cfg {
   ps_scan_fn scan;             /* what a worker runs; inherited by fork */
   void *scan_ctx;
   int startup_timeout_ms;      /* bound on spawn -> ready report */
+  pid_t main_pid;              /* the process that forked the spawner; filled in
+                                * by ps_spawner_start(), whatever the caller put
+                                * here */
 };
+
+/* What ps_spawner_run() returns, and so the spawner's exit status: 0 is an
+ * orderly shutdown, 1 any other failure, and PS_SPAWNER_RC_LOCKDOWN_BASE plus
+ * the step number when ps_spawner_lockdown() failed (so avd's log and the tests
+ * can say which). */
+#define PS_SPAWNER_RC_LOCKDOWN_BASE 16
 
 #ifdef PS_SPAWNER_TEST_HOOKS
 /* Test builds only: replaces ps_worker_harden() in the forked child so the
  * spawner's own logic can be exercised without root. Absent from production
  * builds, so there is no switch to flip. */
 static int (*ps_spawner_test_harden)(const struct ps_harden_cfg *);
+/* Test builds only: skips the spawner's own lockdown, which needs root. The
+ * stubbed-hardening tests set it; the real-kernel tests do not. */
+static int ps_spawner_test_no_lockdown;
 /* Test builds only: makes the Nth fork (1-based) fail with EAGAIN. */
 static unsigned ps_spawner_test_fail_fork;
 static unsigned ps_spawner_test_forks;
@@ -703,8 +717,9 @@ static inline void ps_spawner_shutdown(struct ps_spawner *s) {
 
 /* The spawner's main loop, on `ctl` (its end of the bootstrap channel).
  * Returns 0 when main closes the channel (orderly: kills every worker first),
- * 1 on an unrecoverable error, including being unable to reply to main. The
- * caller exits with the result.
+ * 1 on an unrecoverable error, including being unable to reply to main, and
+ * PS_SPAWNER_RC_LOCKDOWN_BASE + step if it could not lock itself down (it then
+ * serves nothing). The caller exits with the result.
  *
  * One poll() covers the control channel, the SIGCHLD signalfd and the sockets
  * of every pending spawn, so a slow-starting worker never blocks anything. */
@@ -741,6 +756,22 @@ static inline int ps_spawner_run(const struct ps_spawner_cfg *cfg, int ctl) {
   sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
   if (sfd < 0)
     return 1;
+
+  /* The signalfd4 above is a call the filter does not allow, so the lockdown
+   * comes last. A failure ends the spawner: avd
+   * sees the channel close and refuses to run rather than serve from a
+   * spawner that kept root's full power. */
+#ifdef PS_SPAWNER_TEST_HOOKS
+  if (!ps_spawner_test_no_lockdown)
+#endif
+  {
+    int step = ps_spawner_lockdown(cfg->main_pid);
+
+    if (step != 0) {
+      close(sfd);
+      return PS_SPAWNER_RC_LOCKDOWN_BASE + step;
+    }
+  }
 
   for (;;) {
     int64_t now = ps_now_ms();
@@ -848,7 +879,9 @@ static inline int ps_spawner_start(const struct ps_spawner_cfg *cfg,
   int sv[2];
   pid_t main_pid = getpid();
   pid_t pid;
+  struct ps_spawner_cfg c = *cfg;
 
+  c.main_pid = main_pid; /* the lockdown re-checks the parent against this */
   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
     return -1;
   pid = fork();
@@ -867,7 +900,7 @@ static inline int ps_spawner_start(const struct ps_spawner_cfg *cfg,
       _exit(1);
     if (ps_close_all_but(sv[1], STDERR_FILENO) < 0)
       _exit(1);
-    _exit(ps_spawner_run(cfg, sv[1]) == 0 ? 0 : 1);
+    _exit(ps_spawner_run(&c, sv[1]));
   }
   close(sv[1]);
   *ctl_fd = sv[0];

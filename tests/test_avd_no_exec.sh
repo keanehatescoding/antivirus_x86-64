@@ -50,6 +50,14 @@ ALLOW_LIBS='^libmagic\.so'
 FORK_ALLOW_SRC='^privsep_spawner\.h$'
 SYMS_NO_FORK='execl|execle|execlp|execv|execve|execvp|execvpe|fexecve|execveat|vfork|_Fork|clone3?|system|popen|posix_spawnp?|wordexp'
 
+# The spawner's seccomp filter has to NAME the clone syscall to allow exactly
+# fork()'s flags and nothing else (#103, privsep_lockdown.h); it is an
+# allowance in a filter, not a call. Only the plain clone number is exempt, and
+# only in that file: execve/execveat/fork/vfork/clone3 numbers stay banned
+# there, and clone stays banned everywhere else. Same scope as the fork
+# allowance above, and the source scan only.
+CLONE_NR_ALLOW_SRC='^privsep_lockdown\.h$'
+
 PASS=0
 FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -133,8 +141,18 @@ fi
 # syscall() argument, so a call split across lines or a number passed
 # through a variable is caught too.
 NRS='(SYS|__NR)_(execve|execveat|fork|vfork|clone|clone3)'
-hits="$(grep -nE "(^|[^[:alnum:]_])$NRS([^[:alnum:]_]|$)" "$AVD_DIR"/*.c "$AVD_DIR"/*.h |
-        grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+NRS_NO_CLONE='(SYS|__NR)_(execve|execveat|fork|vfork|clone3)'
+hits=""
+for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
+    nrs="$NRS"
+    if basename "$f" | grep -Eq "$CLONE_NR_ALLOW_SRC"; then
+        nrs="$NRS_NO_CLONE"
+    fi
+    found="$(grep -nHE "(^|[^[:alnum:]_])$nrs([^[:alnum:]_]|$)" "$f" |
+             grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+    [ -n "$found" ] && hits+="$found"$'\n'
+done
+hits="${hits%$'\n'}"
 if [ -z "$hits" ]; then
     pass "no exec/fork/clone syscall number in userspace/avd sources"
 else

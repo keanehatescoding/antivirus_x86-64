@@ -78,6 +78,12 @@ echo "### test_privsep_spawner.sh (spawner, control channel and reaping, #103) #
 "$REPO_ROOT/tests/test_privsep_spawner.sh" || FAIL=1
 
 echo
+echo "### test_privsep_lockdown.sh (the spawner's own lockdown and seccomp filter, #103) ###"
+# Same root handling again: the filter itself is tested unprivileged, the
+# capability drop and the real spawner's /proc state need root and print SKIP.
+"$REPO_ROOT/tests/test_privsep_lockdown.sh" || FAIL=1
+
+echo
 echo "### test_privsep_client.sh (main-process dispatch client, #103) ###"
 "$REPO_ROOT/tests/test_privsep_client.sh" || FAIL=1
 

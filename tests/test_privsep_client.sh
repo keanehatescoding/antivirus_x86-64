@@ -305,6 +305,7 @@ static bool start_client(bool verify_proc) {
     int ctl;
 
     ps_spawner_test_harden = stub_harden;
+    ps_spawner_test_no_lockdown = 1; /* needs root; test_privsep_lockdown.sh covers it */
     log_clear();
     if (ps_spawner_start(&cfg, &ctl, &SP) != 0) return false;
     ps_client_attach(&CL, ctl, SP, cfg.harden.uid, cfg.harden.gid, verify_proc);

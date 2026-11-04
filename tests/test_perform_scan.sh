@@ -369,6 +369,23 @@ int main(int argc, char **argv) {
     if (sf)
       fclose(sf);
   }
+  /* And the spawner that made it (Stage 1f): still root, but cut to four
+   * capabilities, with NoNewPrivs and its own seccomp filter. */
+  if (privsep_enabled) {
+    char sp[64], line[256];
+    FILE *sf;
+
+    snprintf(sp, sizeof(sp), "/proc/%d/status", (int)privsep_cl.spawner_pid);
+    sf = fopen(sp, "r");
+    while (sf && fgets(line, sizeof(line), sf))
+      if (!strncmp(line, "Uid:", 4) || !strncmp(line, "CapEff:", 7) ||
+          !strncmp(line, "CapPrm:", 7) || !strncmp(line, "CapBnd:", 7) ||
+          !strncmp(line, "CapAmb:", 7) || !strncmp(line, "NoNewPrivs:", 11) ||
+          !strncmp(line, "Seccomp:", 8))
+        printf("SPAWNER %s", line);
+    if (sf)
+      fclose(sf);
+  }
   privsep_stop();
   return 0;
 }
@@ -539,6 +556,19 @@ else
     else
         fail "the worker was not confined as expected ($(grep '^WORKER' "$OUT" | tr '\n\t' '; '))"
     fi
+    # The spawner keeps exactly CAP_KILL, CAP_SETGID, CAP_SETUID and
+    # CAP_SETPCAP (bits 5-8 = 0x1e0), in every set that matters.
+    if grep -qP '^SPAWNER Uid:\t0\t0\t0\t0$' "$OUT" &&
+       grep -qP '^SPAWNER CapEff:\t0+1e0$' "$OUT" &&
+       grep -qP '^SPAWNER CapPrm:\t0+1e0$' "$OUT" &&
+       grep -qP '^SPAWNER CapBnd:\t0+1e0$' "$OUT" &&
+       grep -qP '^SPAWNER CapAmb:\t0+$' "$OUT" &&
+       grep -qP '^SPAWNER NoNewPrivs:\t1$' "$OUT" &&
+       grep -qP '^SPAWNER Seccomp:\t2$' "$OUT"; then
+        pass "the spawner kept only SETUID, SETGID, SETPCAP and KILL, with NoNewPrivs and a seccomp filter"
+    else
+        fail "the spawner was not locked down as expected ($(grep '^SPAWNER' "$OUT" | tr '\n\t' '; '))"
+    fi
     if grep -qE 'privsep: .*(failed|no worker)' "$BUILD_DIR/err-privsep.txt"; then
         fail "a worker failed during the run"
         grep -E 'privsep:' "$BUILD_DIR/err-privsep.txt" | head -5
@@ -582,6 +612,50 @@ else
         fail "scans carried on after the spawner was lost"
     else
         pass "no scan was done in the root process after the spawner was lost"
+    fi
+
+    # A spawner that cannot lock itself down must stop avd at startup, before
+    # it reports privilege separation as on, not later when the channel closes.
+    # Natural failure injection, no test hook in the binary: start the harness
+    # with CAP_SETPCAP gone from the bounding set. The spawner needs it, and
+    # the lockdown's first step refuses to run without it. Needs setpriv.
+    echo "spawner lockdown failure at startup:"
+    if command -v setpriv >/dev/null 2>&1 &&
+       setpriv --bounding-set=-setpcap true 2>/dev/null; then
+        mkdir -p "$BUILD_DIR/work-lockfail"
+        setpriv --bounding-set=-setpcap env HARNESS_PRIVSEP=1 "$BUILD_DIR/harness" \
+            "$BUILD_DIR/work-lockfail" "$BUILD_DIR/clean-sample.txt" \
+            > "$BUILD_DIR/out-lockfail.txt" 2> "$BUILD_DIR/err-lockfail.txt"
+        rc=$?
+        # A non-zero exit alone proves nothing: the harness also exits non-zero
+        # when its own setup fails (a missing sample, rules or corpora that do
+        # not load), before privsep_start() ever runs. Require privsep's own
+        # diagnostic, and only the one a lockdown refusal produces: the spawner
+        # exits, so the channel closes and avd logs that the spawner is lost.
+        # "the spawner did not produce a hardened worker" is NOT accepted: a
+        # spawner that skipped its lockdown also gets that, when its first worker
+        # fails hardening without CAP_SETPCAP (checked by skipping the lockdown).
+        # avd does not log why the spawner died yet (docs, "Open items"), so
+        # this is the best discriminator there is, not a proof of the cause.
+        diag="$(grep -m1 'avd: privsep: privsep spawner lost' "$BUILD_DIR/err-lockfail.txt")"
+        if [ "$rc" -ne 0 ] && [ -n "$diag" ]; then
+            pass "avd stops when the spawner cannot lock itself down (exit $rc)"
+            echo "        avd said: $diag"
+            if grep -q 'privilege separation on' "$BUILD_DIR/out-lockfail.txt"; then
+                fail "avd reported privilege separation as on before the spawner was locked down"
+            else
+                pass "avd never reported privilege separation as on"
+            fi
+            if grep -q '^CASE ' "$BUILD_DIR/out-lockfail.txt"; then
+                fail "scans ran with a spawner that was never locked down"
+            else
+                pass "no scan ran"
+            fi
+        else
+            fail "avd did not stop for a failed spawner lockdown (exit $rc, no privsep diagnostic): $(head -3 "$BUILD_DIR/err-lockfail.txt" | tr '\n' ' ')"
+        fi
+    else
+        echo "  SKIP: setpriv with --bounding-set is not available"
     fi
 
     # The harness above calls privsep_start() directly, so it never reaches
