@@ -263,8 +263,10 @@ static inline void ps_client_logf(struct ps_client *c, const char *fmt, ...) {
 
 /* A readable account of how the spawner ended, from its wait status. Exit
  * codes follow privsep_spawner.h: PS_SPAWNER_RC_LOCKDOWN_BASE + step is a
- * failed lockdown step, 1 any other failure. SIGSYS is called out because it
- * means the spawner's own seccomp filter lacks a call the libc issued. */
+ * failed lockdown step, 1 any other failure. SIGSYS is called out because the
+ * usual cause is the spawner's own seccomp filter lacking a call its libc
+ * issued; a wait status cannot tell that from a signal sent by another
+ * process, so the text names both. */
 static inline void ps_describe_spawner_status(int st, char *buf, size_t n) {
   if (WIFEXITED(st)) {
     int code = WEXITSTATUS(st);
@@ -276,8 +278,9 @@ static inline void ps_describe_spawner_status(int st, char *buf, size_t n) {
     else
       snprintf(buf, n, "exited with status %d", code);
   } else if (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) {
+    /* The wait status carries only the signal number, not who sent it. */
     snprintf(buf, n,
-             "killed by SIGSYS: it used a syscall outside its seccomp filter");
+             "killed by SIGSYS (its seccomp filter, or an external signal)");
   } else if (WIFSIGNALED(st)) {
     snprintf(buf, n, "killed by signal %d (%s)", WTERMSIG(st),
              strsignal(WTERMSIG(st)));

@@ -612,6 +612,8 @@ static void test_late_ready_and_hang(void) {
     CHECK(log_count("killed by signal 9") == 1,
           "and the log names the signal that killed the spawner");
     CHECK(CL.spawner_pid == 0, "the spawner is reaped and its pid cleared");
+    CHECK(waitpid(SP, NULL, WNOHANG) == -1 && errno == ECHILD,
+          "and no zombie spawner is left");
     ps_client_stop(&CL); /* must not signal or wait on a cleared pid */
     CHECK(log_count("spawner lost") == 1, "and it is logged once");
     (void)z;
@@ -622,14 +624,14 @@ static void test_spawner_status_text(void) {
 
     printf("== spawner status text ==\n");
     ps_describe_spawner_status((PS_SPAWNER_RC_LOCKDOWN_BASE + PS_L_SECCOMP) << 8, b, sizeof(b));
-    CHECK(strstr(b, "lockdown step") && strstr(b, "5"),
+    CHECK(strstr(b, "lockdown step 5 failed") != NULL,
           "a lockdown exit code names the failed step");
     ps_describe_spawner_status(1 << 8, b, sizeof(b));
     CHECK(strstr(b, "exited with status 1") && !strstr(b, "lockdown"),
           "exit 1 is a plain failure");
     ps_describe_spawner_status(SIGSYS, b, sizeof(b));
-    CHECK(strstr(b, "SIGSYS") && strstr(b, "seccomp"),
-          "SIGSYS is called out as a filter miss");
+    CHECK(strstr(b, "SIGSYS") && strstr(b, "seccomp") && strstr(b, "external"),
+          "SIGSYS is called out, naming both a seccomp kill and an outside sender");
     ps_describe_spawner_status(SIGKILL, b, sizeof(b));
     CHECK(strstr(b, "signal 9"), "another signal is named");
     ps_describe_spawner_status((PS_SPAWNER_RC_LOCKDOWN_BASE + PS_L_STEP_COUNT) << 8, b, sizeof(b));
@@ -863,6 +865,48 @@ static void test_fake_spawner(void) {
     ps_client_stop(&c);
 }
 
+/* The control channel closes while the spawner process keeps running: the
+ * reap must give up after its bound, report that it is still running, and
+ * leave the process and the client's pid alone. A blocking waitpid() would
+ * hang the reader here. */
+static void test_live_spawner_bounded_wait(void) {
+    int sv[2];
+    struct ps_client c;
+    pid_t child;
+    int64_t t0, took;
+
+    printf("\nreader thread: channel closed, spawner still running\n");
+    log_clear();
+    socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv);
+    child = fork();
+    if (child == 0) {
+        /* Hold neither end: an inherited copy of sv[1] would keep the channel
+         * open and the client would never see it close. */
+        close(sv[0]);
+        close(sv[1]);
+        for (;;) pause();
+    }
+    CHECK(child > 0, "a stand-in spawner process is running");
+    ps_client_attach(&c, sv[0], child, 65534, 65534, false);
+    c.log = log_hook;
+    c.on_dead = dead_hook;
+    ps_client_start(&c);
+
+    t0 = ps_now_ms();
+    close(sv[1]);
+    CHECK(log_wait("spawner lost", 5000), "the reader reports the channel closing");
+    took = ps_now_ms() - t0;
+    CHECK(took >= PS_SPAWNER_REAP_WAIT_MS - 100 && took < PS_SPAWNER_REAP_WAIT_MS + 2000,
+          "after waiting for the bound, not forever and not at once");
+    CHECK(log_count("still running") == 1, "and the log says the spawner is still running");
+    CHECK(atomic_load(&DEAD_CALLS) == 1, "and the death hook is called once");
+    CHECK(waitpid(child, NULL, WNOHANG) == 0, "the live spawner was neither reaped nor killed");
+    CHECK(c.spawner_pid == child, "and the client keeps its pid so stop() can kill it");
+    kill(child, SIGKILL); /* before stop(), which would otherwise wait out its own bound */
+    ps_client_stop(&c);
+    CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD, "stop() reaped it");
+}
+
 /* Replies that match no SPAWN do not prove the spawner is draining requests. */
 static void test_unmatched_replies_keep_hang_count(void) {
     int sv[2];
@@ -907,6 +951,7 @@ int main(void) {
     test_hostile_workers();
     test_late_ready_and_hang();
     test_spawner_status_text();
+    test_live_spawner_bounded_wait();
     test_orderly_stop();
     test_concurrent();
     test_fake_spawner();

@@ -904,8 +904,10 @@ When the control channel closes, avd reaps the spawner
 (`ps_client_reap_spawner()`, waiting up to 500 ms because the channel closes a
 moment before the process becomes reapable) and logs how it ended after the
 usual "privsep spawner lost" line: a lockdown step (`exited with status 16 +
-step: lockdown step N failed`), any other exit status, `SIGSYS` (the spawner's
-own seccomp filter lacks a call its libc issued), or another signal. A spawner
+step: lockdown step N failed`), any other exit status, `SIGSYS` (usually the
+spawner's own seccomp filter lacking a call its libc issued, but a wait status
+cannot tell that from a signal sent by another process, so the log says "its
+seccomp filter, or an external signal"), or another signal. A spawner
 declared hung is still running, so it is neither waited for nor reaped there;
 `ps_client_stop()` kills and reaps it. Once reaped, the client clears its pid so
 a later stop never signals a reused one. This is covered by the "Dead spawner
