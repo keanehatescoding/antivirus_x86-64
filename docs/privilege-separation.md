@@ -11,9 +11,10 @@ check, canonical failure on any anomaly). Stage 1e wires them into avd behind
 `AVD_PRIVSEP=1` (see "As wired into avd" under Rollout). Stage 1f locks the
 spawner itself down (`privsep_lockdown.h`: capabilities cut to four,
 `NO_NEW_PRIVS`, a seccomp superset filter; see "As implemented" under "The
-spawner"), and avd now logs why the spawner died (see "Open items"). Still to
-come: the real-QEMU run of the boot and fanotify tests with `AVD_PRIVSEP=1`.
-Stage 2 is design only.
+spawner"), and avd now logs why the spawner died (see "Open items").
+`tests/test_fanotify_exec.sh --privsep` runs the end-to-end fanotify suite with
+privilege separation on (see "End-to-end test with privilege separation on");
+it is a manual run, not a CI job. Stage 2 is design only.
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -855,8 +856,10 @@ cannot lock itself down stops avd at startup.
   (contract 1), and a full queue is still answered immediately by policy
   with the listener never blocking (contracts 3 and 4)
 - seccomp kill is observed if a worker attempts `open()` (test hook)
-- `tests/test_perform_scan.sh` and the existing QEMU boot and fanotify tests
-  pass with `AVD_PRIVSEP=1` (the first does; the QEMU run is still to do)
+- `tests/test_perform_scan.sh` passes with `AVD_PRIVSEP=1`. The end-to-end
+  fanotify test has a `--privsep` mode that has not yet been run (see "Open
+  items"). The QEMU boot job is not part of this:
+  it loads only `av.ko` from a static init and never starts avd
 
 ## Open questions
 
@@ -895,8 +898,32 @@ cannot lock itself down stops avd at startup.
 
 ## Open items
 
-- None for the Stage 1 slices built so far; the real-QEMU run with
-  `AVD_PRIVSEP=1` (see Status) and Stage 2 remain.
+- Run `tests/run_fanotify_vng.sh --privsep` (needs virtme-ng and `/dev/kvm`)
+  and fix whatever it finds. The mode is written and its helpers are checked
+  against real processes, but the suite itself has not been run with
+  `AVD_PRIVSEP=1` yet.
+- No CI job runs avd at all, with or without privilege separation: the QEMU
+  boot job has no avd, libyara or libnl in its static initramfs, and the
+  end-to-end scripts need root, a module build and (for fanotify) a VM. A job
+  that does would be the safety net Stage 2 wants; it is a separate piece of
+  work.
+- Stage 2.
+
+### End-to-end test with privilege separation on
+
+`tests/test_fanotify_exec.sh --privsep` (or `AV_TEST_PRIVSEP=1`; through the
+wrapper, `tests/run_fanotify_vng.sh --privsep`) adds `AVD_PRIVSEP=1` to every
+avd start in the suite, so the existing checks (enforcement comes up, EICAR
+and YARA matches refused before they run, runtime signatures, the watchdog)
+all run with scans done in workers. The watchdog's hold gate sits in the
+parent's scan threads, so it still pins them. It also creates the
+`hyprav-scan` user in the guest if missing (the guest is throwaway) and, once
+scans have run, checks `/proc` independently of avd's own check: the spawner
+is uid 0 with a capability bounding set of exactly `CAP_KILL`, `CAP_SETGID`,
+`CAP_SETUID` and `CAP_SETPCAP` (`0x1e0`), `NO_NEW_PRIVS` and a seccomp filter,
+and every worker is the `hyprav-scan` uid and gid with no capabilities,
+`NO_NEW_PRIVS` and a seccomp filter. The host environment does not reach a
+virtme-ng guest, which is why the wrapper passes the flag on the command line.
 
 ### Spawner death is logged with its cause
 
