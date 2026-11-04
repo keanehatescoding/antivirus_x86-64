@@ -630,9 +630,14 @@ else
         # A non-zero exit alone proves nothing: the harness also exits non-zero
         # when its own setup fails (a missing sample, rules or corpora that do
         # not load), before privsep_start() ever runs. Require privsep's own
-        # diagnostic, so this can only pass for the failure it is about.
-        diag="$(grep -m1 -E 'avd: privsep: (privsep spawner lost|the spawner did not produce)' \
-                "$BUILD_DIR/err-lockfail.txt")"
+        # diagnostic, and only the one a lockdown refusal produces: the spawner
+        # exits, so the channel closes and avd logs that the spawner is lost.
+        # "the spawner did not produce a hardened worker" is NOT accepted: a
+        # spawner that skipped its lockdown also gets that, when its first worker
+        # fails hardening without CAP_SETPCAP (checked by skipping the lockdown).
+        # avd does not log why the spawner died yet (docs, "Open items"), so
+        # this is the best discriminator there is, not a proof of the cause.
+        diag="$(grep -m1 'avd: privsep: privsep spawner lost' "$BUILD_DIR/err-lockfail.txt")"
         if [ "$rc" -ne 0 ] && [ -n "$diag" ]; then
             pass "avd stops when the spawner cannot lock itself down (exit $rc)"
             echo "        avd said: $diag"
