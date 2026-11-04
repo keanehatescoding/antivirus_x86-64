@@ -11,9 +11,9 @@ check, canonical failure on any anomaly). Stage 1e wires them into avd behind
 `AVD_PRIVSEP=1` (see "As wired into avd" under Rollout). Stage 1f locks the
 spawner itself down (`privsep_lockdown.h`: capabilities cut to four,
 `NO_NEW_PRIVS`, a seccomp superset filter; see "As implemented" under "The
-spawner"). Still to come: the real-QEMU run of the boot and fanotify tests with
-`AVD_PRIVSEP=1`, and logging why the spawner died (see "Open items"). Stage 2
-is design only.
+spawner"), and avd now logs why the spawner died (see "Open items"). Still to
+come: the real-QEMU run of the boot and fanotify tests with `AVD_PRIVSEP=1`.
+Stage 2 is design only.
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -895,13 +895,23 @@ cannot lock itself down stops avd at startup.
 
 ## Open items
 
-- When the spawner dies, avd only logs that it is gone ("privsep spawner lost:
-  read error on the control channel"), also at startup now that avd waits for a
-  probe worker. A spawner killed by its own seccomp filter (a libc that issues
-  a call this list lacks), one that failed a lockdown step, and any other death
-  all look the same. avd should reap it and log the wait status the way the
-  client already does for workers, with a short wait because the channel closes
-  a moment before the process becomes reapable.
+- None for the Stage 1 slices built so far; the real-QEMU run with
+  `AVD_PRIVSEP=1` (see Status) and Stage 2 remain.
+
+### Spawner death is logged with its cause
+
+When the control channel closes, avd reaps the spawner
+(`ps_client_reap_spawner()`, waiting up to 500 ms because the channel closes a
+moment before the process becomes reapable) and logs how it ended after the
+usual "privsep spawner lost" line: a lockdown step (`exited with status 16 +
+step: lockdown step N failed`), any other exit status, `SIGSYS` (the spawner's
+own seccomp filter lacks a call its libc issued), or another signal. A spawner
+declared hung is still running, so it is neither waited for nor reaped there;
+`ps_client_stop()` kills and reaps it. Once reaped, the client clears its pid so
+a later stop never signals a reused one. This is covered by the "Dead spawner
+nobody else reaps" and "spawner status text" cases in
+`tests/test_privsep_client.sh`, and `tests/test_perform_scan.sh` now requires
+the exact cause (`lockdown step 1 failed`) for its failed-lockdown case.
 
 ## Out of scope
 

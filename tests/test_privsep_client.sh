@@ -602,7 +602,38 @@ static void test_late_ready_and_hang(void) {
         (void)v; (void)why;
     }
     ps_client_stop(&CL);
+
+    /* Dead spawner nobody else reaps: the log must say how it died. */
+    NSCRIPT = 0;
+    start_client(false);
+    CHECK(ps_client_spawn(&CL, &w, 5000, &info) == PS_SPAWN_OK, "a worker before the spawner is killed");
+    kill(SP, SIGKILL);
+    CHECK(log_wait("spawner lost", 3000), "the reader notices the channel closing (unreaped spawner)");
+    CHECK(log_count("killed by signal 9") == 1,
+          "and the log names the signal that killed the spawner");
+    CHECK(CL.spawner_pid == 0, "the spawner is reaped and its pid cleared");
+    ps_client_stop(&CL); /* must not signal or wait on a cleared pid */
+    CHECK(log_count("spawner lost") == 1, "and it is logged once");
     (void)z;
+}
+
+static void test_spawner_status_text(void) {
+    char b[160];
+
+    printf("== spawner status text ==\n");
+    ps_describe_spawner_status((PS_SPAWNER_RC_LOCKDOWN_BASE + PS_L_SECCOMP) << 8, b, sizeof(b));
+    CHECK(strstr(b, "lockdown step") && strstr(b, "5"),
+          "a lockdown exit code names the failed step");
+    ps_describe_spawner_status(1 << 8, b, sizeof(b));
+    CHECK(strstr(b, "exited with status 1") && !strstr(b, "lockdown"),
+          "exit 1 is a plain failure");
+    ps_describe_spawner_status(SIGSYS, b, sizeof(b));
+    CHECK(strstr(b, "SIGSYS") && strstr(b, "seccomp"),
+          "SIGSYS is called out as a filter miss");
+    ps_describe_spawner_status(SIGKILL, b, sizeof(b));
+    CHECK(strstr(b, "signal 9"), "another signal is named");
+    ps_describe_spawner_status((PS_SPAWNER_RC_LOCKDOWN_BASE + PS_L_STEP_COUNT) << 8, b, sizeof(b));
+    CHECK(!strstr(b, "lockdown"), "a code past the last step is not decoded as a step");
 }
 
 static void test_orderly_stop(void) {
@@ -875,6 +906,7 @@ int main(void) {
     test_spawn_failures();
     test_hostile_workers();
     test_late_ready_and_hang();
+    test_spawner_status_text();
     test_orderly_stop();
     test_concurrent();
     test_fake_spawner();

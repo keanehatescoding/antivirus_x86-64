@@ -635,9 +635,9 @@ else
         # "the spawner did not produce a hardened worker" is NOT accepted: a
         # spawner that skipped its lockdown also gets that, when its first worker
         # fails hardening without CAP_SETPCAP (checked by skipping the lockdown).
-        # avd does not log why the spawner died yet (docs, "Open items"), so
-        # this is the best discriminator there is, not a proof of the cause.
-        diag="$(grep -m1 'avd: privsep: privsep spawner lost' "$BUILD_DIR/err-lockfail.txt")"
+        # avd now reaps the spawner and logs its wait status, so require the
+        # cause as well: the first lockdown step (the bounding set) failed.
+        diag="$(grep -m1 'avd: privsep: privsep spawner lost.*lockdown step 1 failed' "$BUILD_DIR/err-lockfail.txt")"
         if [ "$rc" -ne 0 ] && [ -n "$diag" ]; then
             pass "avd stops when the spawner cannot lock itself down (exit $rc)"
             echo "        avd said: $diag"

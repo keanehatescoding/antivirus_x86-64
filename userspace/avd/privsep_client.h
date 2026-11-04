@@ -53,6 +53,10 @@
  * own (docs: "Failure handling"). */
 #define PS_CLIENT_HANG_LIMIT 3
 
+/* How long to wait for a spawner whose channel has closed to become reapable
+ * before logging that it is still running. */
+#define PS_SPAWNER_REAP_WAIT_MS 500
+
 /* ------------------------------------------------------------------------
  * Checking a worker the way the design asks
  * ------------------------------------------------------------------------ */
@@ -257,11 +261,80 @@ static inline void ps_client_logf(struct ps_client *c, const char *fmt, ...) {
   c->log(c->log_ctx, buf);
 }
 
+/* A readable account of how the spawner ended, from its wait status. Exit
+ * codes follow privsep_spawner.h: PS_SPAWNER_RC_LOCKDOWN_BASE + step is a
+ * failed lockdown step, 1 any other failure. SIGSYS is called out because it
+ * means the spawner's own seccomp filter lacks a call the libc issued. */
+static inline void ps_describe_spawner_status(int st, char *buf, size_t n) {
+  if (WIFEXITED(st)) {
+    int code = WEXITSTATUS(st);
+
+    if (code > PS_SPAWNER_RC_LOCKDOWN_BASE &&
+        code < PS_SPAWNER_RC_LOCKDOWN_BASE + PS_L_STEP_COUNT)
+      snprintf(buf, n, "exited with status %d: lockdown step %d failed", code,
+               code - PS_SPAWNER_RC_LOCKDOWN_BASE);
+    else
+      snprintf(buf, n, "exited with status %d", code);
+  } else if (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) {
+    snprintf(buf, n,
+             "killed by SIGSYS: it used a syscall outside its seccomp filter");
+  } else if (WIFSIGNALED(st)) {
+    snprintf(buf, n, "killed by signal %d (%s)", WTERMSIG(st),
+             strsignal(WTERMSIG(st)));
+  } else {
+    snprintf(buf, n, "wait status 0x%x", (unsigned)st);
+  }
+}
+
+/* Reap the spawner and say how it ended. The control channel closes a moment
+ * before the process becomes reapable, so wait up to `wait_ms`. Returns true
+ * and fills `buf` when it was reaped (or was already gone: ECHILD); false
+ * with `buf` saying it is still running. Only the caller that won the
+ * "first" notification may call this, so there is a single reaper. Clears
+ * spawner_pid once reaped so a later stop() never signals a reused pid. */
+static inline bool ps_client_reap_spawner(struct ps_client *c, int wait_ms,
+                                          char *buf, size_t n) {
+  int64_t end = ps_now_ms() + wait_ms;
+  pid_t pid = c->spawner_pid;
+  int st = 0;
+
+  if (pid <= 0) {
+    snprintf(buf, n, "already reaped");
+    return false;
+  }
+  for (;;) {
+    pid_t r = waitpid(pid, &st, WNOHANG);
+
+    if (r == pid) {
+      ps_describe_spawner_status(st, buf, n);
+      break;
+    }
+    if (r < 0 && errno == ECHILD) {
+      snprintf(buf, n, "already reaped elsewhere, status unknown");
+      break;
+    }
+    if (r < 0 && errno != EINTR) {
+      snprintf(buf, n, "waitpid failed: %s", strerror(errno));
+      return false;
+    }
+    if (ps_now_ms() >= end) {
+      snprintf(buf, n, "still running");
+      return false;
+    }
+    usleep(5 * 1000);
+  }
+  pthread_mutex_lock(&c->lock);
+  c->spawner_pid = 0;
+  pthread_mutex_unlock(&c->lock);
+  return true;
+}
+
 /* Tell the owner the spawner is gone, once. Never holds a lock while the
  * callback runs. With `need_hung` the decision is made under the lock from
  * the current miss count, so a reply the reader has just matched (which
  * resets the count) cancels it instead of a stale decision killing the
- * client for good. */
+ * client for good. When the channel closed (not a hang) the spawner is
+ * reaped first so the log says how it died. */
 static inline void ps_client_declare_dead(struct ps_client *c, const char *why,
                                           bool need_hung) {
   bool first = false;
@@ -279,7 +352,16 @@ static inline void ps_client_declare_dead(struct ps_client *c, const char *why,
   pthread_cond_broadcast(&c->cond);
   pthread_mutex_unlock(&c->lock);
   if (first) {
-    ps_client_logf(c, "privsep spawner lost: %s", why);
+    char how[160];
+
+    if (need_hung) {
+      /* A hung spawner is alive: do not wait for it, and do not reap it. */
+      ps_client_logf(c, "privsep spawner lost: %s", why);
+    } else {
+      (void)ps_client_reap_spawner(c, PS_SPAWNER_REAP_WAIT_MS, how,
+                                   sizeof(how));
+      ps_client_logf(c, "privsep spawner lost: %s; spawner %s", why, how);
+    }
     if (c->on_dead)
       c->on_dead(c->on_dead_ctx);
   }
