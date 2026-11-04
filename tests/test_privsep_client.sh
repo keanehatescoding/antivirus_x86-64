@@ -902,9 +902,11 @@ static void test_live_spawner_bounded_wait(void) {
     CHECK(atomic_load(&DEAD_CALLS) == 1, "and the death hook is called once");
     CHECK(waitpid(child, NULL, WNOHANG) == 0, "the live spawner was neither reaped nor killed");
     CHECK(c.spawner_pid == child, "and the client keeps its pid so stop() can kill it");
-    kill(child, SIGKILL); /* before stop(), which would otherwise wait out its own bound */
+    /* No kill here: stop() must itself wait out its bound (about 5 s) on the
+     * live spawner, kill it and reap it. */
     ps_client_stop(&c);
-    CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD, "stop() reaped it");
+    CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD,
+          "stop() killed and reaped the live spawner itself");
 }
 
 /* Replies that match no SPAWN do not prove the spawner is draining requests. */
