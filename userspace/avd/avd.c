@@ -114,6 +114,7 @@
 #include "control_parse.h"
 #include "fan_parse.h"
 #include "privsep_client.h"
+#include "privsep_parent.h"
 #include "privsep_proto.h"
 #include "sha256.h"
 #include "tlsh_shim.h"
@@ -5158,6 +5159,23 @@ int main(int argc, char **argv) {
       fprintf(stderr, "avd: privilege separation could not be started - "
                       "aborting\n");
       return 1;
+    }
+    /* The spawner has its capabilities now (it inherited them at fork), so
+     * the main process can give up everything it does not use. Fail closed:
+     * with privilege separation asked for, a parent that is still root with
+     * every capability is not what the operator asked for. */
+    {
+      int pstep = ps_parent_lockdown();
+
+      if (pstep != 0) {
+        fprintf(stderr,
+                "avd: parent lockdown step %d failed: %s - aborting "
+                "(step 1 also fails if the bounding set lacks CAP_NET_ADMIN, "
+                "CAP_SYS_ADMIN, CAP_DAC_READ_SEARCH, CAP_DAC_OVERRIDE, "
+                "CAP_FOWNER or CAP_CHOWN)\n",
+                pstep, strerror(errno));
+        return 1;
+      }
     }
   }
 

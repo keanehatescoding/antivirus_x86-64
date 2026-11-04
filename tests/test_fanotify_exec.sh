@@ -210,7 +210,7 @@ children_of() {
 }
 
 # With privilege separation on, check from /proc what the design promises:
-# the spawner is root but cut to four capabilities (CAP_KILL, CAP_SETGID,
+# the main process is root cut to six capabilities, and the spawner is root but cut to four capabilities (CAP_KILL, CAP_SETGID,
 # CAP_SETUID, CAP_SETPCAP = bits 5-8 = 0x1e0) under NO_NEW_PRIVS and a
 # seccomp filter, and every worker is the hyprav-scan user with an empty
 # capability set, NO_NEW_PRIVS and a seccomp filter. avd runs the same
@@ -241,6 +241,21 @@ check_privsep() {
         pass "spawner is root cut to four capabilities, NO_NEW_PRIVS, seccomp"
     else
         fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapEff='$(proc_field "$spid" CapEff)' CapPrm='$(proc_field "$spid" CapPrm)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)'"
+    fi
+
+    # The main process itself: still root, but cut to the six capabilities
+    # it uses (NET_ADMIN, SYS_ADMIN, DAC_READ_SEARCH, DAC_OVERRIDE, FOWNER,
+    # CHOWN = 0x20100f) under NO_NEW_PRIVS. No seccomp filter yet (Stage 2
+    # step 3), so Seccomp is deliberately not asserted.
+    if [ "$(proc_field "$AVD_PID" Uid)" = "0 0 0 0" ] && \
+       [ "$(proc_field "$AVD_PID" CapEff)" = "000000000020100f" ] && \
+       [ "$(proc_field "$AVD_PID" CapPrm)" = "000000000020100f" ] && \
+       [ "$(proc_field "$AVD_PID" CapBnd)" = "000000000020100f" ] && \
+       [ "$(proc_field "$AVD_PID" CapInh)" = "0000000000000000" ] && \
+       [ "$(proc_field "$AVD_PID" NoNewPrivs)" = "1" ]; then
+        pass "avd main process is root cut to six capabilities, NO_NEW_PRIVS"
+    else
+        fail "avd main process not locked down: Uid='$(proc_field "$AVD_PID" Uid)' CapEff='$(proc_field "$AVD_PID" CapEff)' CapPrm='$(proc_field "$AVD_PID" CapPrm)' CapBnd='$(proc_field "$AVD_PID" CapBnd)' CapInh='$(proc_field "$AVD_PID" CapInh)' NoNewPrivs='$(proc_field "$AVD_PID" NoNewPrivs)'"
     fi
 
     for w in $(children_of "$spid"); do

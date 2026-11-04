@@ -40,6 +40,17 @@ ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib
 # `systemctl edit avd.service` adding Environment=AVD_FANOTIFY=1 - see
 # docs/fanotify-enforcement.md for the timeout and policy knobs.
 
+# Privilege separation (AVD_PRIVSEP=1, #103) makes the main process drop
+# every capability it does not use once the spawner exists (see
+# docs/privilege-separation.md, "Stage 2"). This unit deliberately does not
+# yet add CapabilityBoundingSet=, NoNewPrivileges= or SystemCallFilter=: they
+# apply to every start, with or without privilege separation, and the
+# capability list has not been confirmed by a run. When they are added, the
+# bounding set has to be the union of the main process's and the spawner's
+# (CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER
+# CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL), or the spawner's own
+# lockdown fails.
+
 Restart=on-failure
 RestartSec=5
 

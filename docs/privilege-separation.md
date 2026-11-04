@@ -14,7 +14,10 @@ spawner itself down (`privsep_lockdown.h`: capabilities cut to four,
 spawner"), and avd now logs why the spawner died (see "Open items").
 `tests/test_fanotify_exec.sh --privsep` runs the end-to-end fanotify suite with
 privilege separation on (see "End-to-end test with privilege separation on");
-it is a manual run, not a CI job. Stage 2 is design only.
+it is a manual run, not a CI job. Stage 2 step 2 (the main process drops
+capabilities once the spawner exists, `privsep_parent.h`) is built and tested;
+the parent's seccomp filter (step 3) and the unit's `CapabilityBoundingSet=`
+are not (see "Stage 2").
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -664,30 +667,95 @@ review and not a fix to this slice.
 ### Stage 2: shrink the parent
 
 After init the parent still needs real power, so this stage is smaller than
-the issue suggests. Candidates to confirm empirically, not assume:
+the issue suggests. Three steps, one PR each:
 
-- keeps: `CAP_NET_ADMIN` (verdicts), `CAP_SYS_ADMIN` (fanotify permission
-  events), and whichever of `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`,
-  `CAP_FOWNER`, `CAP_CHOWN` the open/quarantine paths actually hit. Not
-  `CAP_KILL`: avd calls `kill()` nowhere (the kernel module does the
-  killing when a verdict arrives), and it never signals workers itself
-- drops, once the spawner exists: `CAP_SETUID`, `CAP_SETGID` and
-  `CAP_SETPCAP`. They live only in the spawner, which also holds `CAP_KILL`
-  for signalling workers
-- gains: `NO_NEW_PRIVS`, a bounding set limited to the list above, and a
-  seccomp filter that excludes `execve`, `ptrace`, module loading and so on
+1. A way to run avd end to end with privilege separation on (built, see "End-to-end
+   test with privilege separation on").
+2. The capability drop, below (built, with `AVD_PRIVSEP=1` only).
+3. The parent's seccomp filter, log-only first to collect the real syscall
+   list, then enforcing (not built).
 
-This can also be done in `packaging/avd.service` with
-`CapabilityBoundingSet=`, `NoNewPrivileges=yes` and `SystemCallFilter=`
-without adding filesystem sandboxing, which the unit comment rightly avoids.
-One catch: those settings apply to the whole unit including the spawner, so
-the unit's bounding set has to include `CAP_SETUID`, `CAP_SETGID`,
-`CAP_SETPCAP` and `CAP_KILL`, and its syscall filter has to be a superset of
-the spawner's and the worker's (see "Seccomp filters stack"). The
-main process then drops those capabilities itself after it has forked the
-spawner. The unit comment is also worth rewording: avd cannot be confined to
-a restricted filesystem view, but it can still be confined in capabilities
-and syscalls.
+#### Step 2 as built: `privsep_parent.h`
+
+With `AVD_PRIVSEP=1`, right after `privsep_start()` succeeds (the spawner has
+inherited its capabilities by then) and before the netlink socket exists, the
+main process calls `ps_parent_lockdown()`:
+
+1. bounding set cut to `PS_PARENT_CAPS` and read back (this is the step that
+   needs `CAP_SETPCAP`, so nothing may drop that earlier)
+2. effective and permitted set to `PS_PARENT_CAPS`, inheritable and ambient
+   empty, read back
+3. `NO_NEW_PRIVS` set and read back
+
+The first failing step is fatal: avd prints `parent lockdown step N failed`
+and exits instead of running as an unreduced root. The process stays uid 0.
+
+`PS_PARENT_CAPS` is `0x20100f`:
+
+| capability | why the main process still needs it |
+|---|---|
+| `CAP_NET_ADMIN` | both genl ops are `GENL_ADMIN_PERM` (verdicts, daemon policy) |
+| `CAP_SYS_ADMIN` | `fanotify_init(FAN_CLASS_CONTENT)` and the filesystem marks; the module's trust-list writes |
+| `CAP_DAC_READ_SEARCH` | `linkat(fd, "", ..., AT_EMPTY_PATH)` into quarantine |
+| `CAP_DAC_OVERRIDE` | reading a quarantined (mode 0000) file back on restore |
+| `CAP_FOWNER` | `chmod`/`fchmod`/`unlink` on a file the daemon does not own |
+| `CAP_CHOWN` | `fchown` back to the original owner on restore |
+
+Everything else goes, notably `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`,
+`CAP_KILL`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_SYS_RAWIO` and
+`CAP_MKNOD`. Two things that look like they need a capability do not:
+`ps_client_stop()` still `SIGKILL`s the spawner, which works because both run
+as uid 0 (a signal needs a matching uid or `CAP_KILL`), and the client reads
+`/proc/<worker>/status`, which is world-readable.
+
+The audit behind the table is a reading of every `chown`, `chmod`, `unlink`,
+`rename`, `linkat`, `bind`, `setsockopt`, `fanotify_*`, `/proc` and `exec`
+call in `avd.c`, not a traced run. It is deliberately conservative, and the
+design doc's own rule applies: it is a candidate list until a real run
+confirms it. `avd.c` itself calls none of `execve`, `fork`, `setuid`, `kill`,
+`mount`, `ptrace` or `setrlimit` (the spawner's `fork()` and the
+`SIGKILL` in `ps_client_stop()` live in the headers; the fork happens before
+the drop).
+
+Not done in this step, on purpose:
+
+- **No `packaging/avd.service` change.** `CapabilityBoundingSet=` in the unit
+  applies to every avd start, privilege separation on or not, and the audit
+  has not been confirmed by a run, so turning it on for everyone would risk
+  breaking the default install. When it is added it must be the union of the
+  two sets, `0x2011ef` (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_DAC_READ_SEARCH`,
+  `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_CHOWN` for the parent, plus
+  `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`, `CAP_KILL` for the spawner): the
+  spawner's own lockdown fails if its bounding set lacks any of its four, and
+  the parent drops those four itself afterwards.
+- **No seccomp filter on the parent** (step 3), so `Seccomp` in the parent's
+  `/proc/<pid>/status` is still 0.
+- **Without `AVD_PRIVSEP=1` nothing changes**: avd is root with every
+  capability, as before.
+
+`tests/test_privsep_parent.sh` (root; SKIP without it) compiles the production
+header with ASan+UBSan and checks, in forked children, the state read back from
+`/proc`, that a root process of the same uid can still be `SIGKILL`ed (what
+`ps_client_stop()` does to the spawner), that the kept capabilities still work (`chown`, `chmod` and `open` on
+another uid's mode-0000 file, `linkat(AT_EMPTY_PATH)`), that `setuid`, `setgid`
+and `PR_CAPBSET_DROP` now fail and a dropped capability cannot be regained,
+that a bounding set missing `CAP_CHOWN` fails step 1, and a failure injected at
+each step. `tests/test_fanotify_exec.sh --privsep` also reads the live parent's
+`CapEff`, `CapPrm`, `CapBnd`, `CapInh` and `NoNewPrivs` from `/proc`.
+
+#### Step 3 and the unit: still to do
+
+- The parent's seccomp filter, excluding `execve`, `ptrace`, module loading and
+  so on. The allowlist has to come from a traced run (log-only first), not from
+  reading the code.
+- `NoNewPrivileges=yes`, `CapabilityBoundingSet=` and `SystemCallFilter=` in
+  `packaging/avd.service`, without filesystem sandboxing, which the unit
+  comment rightly avoids. Those settings apply to the whole unit including
+  the spawner, so the unit's bounding set has to be the union above and its
+  syscall filter a superset of the spawner's and the worker's (see "Seccomp
+  filters stack"). The unit comment is also worth rewording: avd cannot be
+  confined to a restricted filesystem view, but it can still be confined in
+  capabilities and syscalls.
 
 ## Rollout
 
@@ -907,7 +975,9 @@ cannot lock itself down stops avd at startup.
   end-to-end scripts need root, a module build and (for fanotify) a VM. A job
   that does would be the safety net Stage 2 wants; it is a separate piece of
   work.
-- Stage 2.
+- Stage 2 step 3 (the parent's seccomp filter, log-only first) and the unit's
+  `CapabilityBoundingSet=`; see "Stage 2". Step 2's capability list is from a
+  reading of avd.c and needs one real `--privsep` run to confirm it.
 
 ### End-to-end test with privilege separation on
 
@@ -921,8 +991,9 @@ parent's scan threads, so it still pins them. It also creates the
 scans have run, checks `/proc` independently of avd's own check: the spawner
 is uid 0 with a capability bounding set of exactly `CAP_KILL`, `CAP_SETGID`,
 `CAP_SETUID` and `CAP_SETPCAP` (`0x1e0`), `NO_NEW_PRIVS` and a seccomp filter,
-and every worker is the `hyprav-scan` uid and gid with no capabilities,
-`NO_NEW_PRIVS` and a seccomp filter. The host environment does not reach a
+and the main process is uid 0 with exactly the six parent capabilities
+(`0x20100f`) and `NO_NEW_PRIVS`, and every worker is the `hyprav-scan` uid and
+gid with no capabilities, `NO_NEW_PRIVS` and a seccomp filter. The host environment does not reach a
 virtme-ng guest, which is why the wrapper passes the flag on the command line.
 
 ### Spawner death is logged with its cause
