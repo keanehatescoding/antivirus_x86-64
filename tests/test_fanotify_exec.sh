@@ -67,6 +67,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091 # sourced at runtime; lint it on its own
 . "$REPO_ROOT/tests/avd_guard.sh"
 avd_guard || exit 1
+# shellcheck disable=SC1091 # sourced at runtime; lint it on its own
+. "$REPO_ROOT/tests/avd_unit_caps.sh"
+avd_unit_wrap "$REPO_ROOT/packaging/avd.service" || exit 1
 AV_DIR="$REPO_ROOT/av"
 AVD_DIR="$REPO_ROOT/userspace/avd"
 AVCTL="$REPO_ROOT/userspace/avctl/avctl"
@@ -167,7 +170,8 @@ stop_avd() {
 }
 
 # start_avd [ENV=VAL ...] - fresh socket each time; stdout line-buffered
-# so the log can be polled.
+# so the log can be polled; under the shipped unit's CapabilityBoundingSet=
+# and NoNewPrivileges= (tests/avd_unit_caps.sh), as systemd would start it.
 start_avd() {
     local extra=()
     [ "$PRIVSEP" = 1 ] && extra=(AVD_PRIVSEP=1)
@@ -175,7 +179,8 @@ start_avd() {
     : > "$AVD_LOG"
     (
         cd "$REPO_ROOT" || exit 1
-        exec env ${extra[@]+"${extra[@]}"} "$@" stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" \
+        exec env ${extra[@]+"${extra[@]}"} "$@" "${AVD_UNIT_WRAP[@]}" stdbuf -oL \
+            "$AVD_DIR/avd" "$TEST_RULES_DIR" \
             corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
             corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >>"$AVD_LOG" 2>&1
     ) &

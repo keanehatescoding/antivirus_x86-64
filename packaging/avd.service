@@ -18,8 +18,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 
-# Deliberately root, deliberately unsandboxed (no ProtectSystem=,
-# ProtectHome=, DynamicUser=, etc.): avd's whole job is reading
+# Deliberately root, and deliberately without filesystem sandboxing (no
+# ProtectSystem=, ProtectHome=, DynamicUser=, etc.): avd's whole job is reading
 # arbitrary files anywhere on the system (whatever a process just
 # exec'd could be anywhere) and rename()/chmod()'ing malicious ones
 # into quarantine - a privileged, system-wide daemon by nature, not
@@ -40,16 +40,22 @@ ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib
 # `systemctl edit avd.service` adding Environment=AVD_FANOTIFY=1 - see
 # docs/fanotify-enforcement.md for the timeout and policy knobs.
 
-# Privilege separation (AVD_PRIVSEP=1, #103) makes the main process drop
-# every capability it does not use once the spawner exists (see
-# docs/privilege-separation.md, "Stage 2"). This unit deliberately does not
-# yet add CapabilityBoundingSet=, NoNewPrivileges= or SystemCallFilter=: they
-# apply to every start, with or without privilege separation, and the
-# capability list has not been confirmed by a run. When they are added, the
-# bounding set has to be the union of the main process's and the spawner's
-# (CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER
-# CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL), or the spawner's own
-# lockdown fails.
+# Confined in capabilities rather than in what it can see. The bounding
+# set is the union of what the main process uses (CAP_NET_ADMIN for the
+# genl ops, CAP_SYS_ADMIN for fanotify, CAP_DAC_READ_SEARCH,
+# CAP_DAC_OVERRIDE, CAP_FOWNER and CAP_CHOWN for scanning, quarantine and
+# restore) and what the privilege-separation spawner needs (CAP_SETUID,
+# CAP_SETGID, CAP_SETPCAP, CAP_KILL). It applies with or without
+# AVD_PRIVSEP=1; with it, both processes then cut their own sets further
+# (see docs/privilege-separation.md, "Stage 2"). The spawner's lockdown
+# fails if any of its four is missing here, so keep the union. avd never
+# exec()s anything, so NoNewPrivileges= costs nothing.
+# tests/avd_unit_caps.sh reads both settings back out of this file to run
+# the end-to-end tests under them; keep each on one line.
+# SystemCallFilter= is not set yet: it has to be a superset of the
+# spawner's and the worker's filters and come from a traced run.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL
+NoNewPrivileges=yes
 
 Restart=on-failure
 RestartSec=5
