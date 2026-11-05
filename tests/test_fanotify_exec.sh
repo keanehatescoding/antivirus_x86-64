@@ -263,6 +263,12 @@ check_privsep() {
            [ "$(proc_field "$AVD_PID/task/$t" NoNewPrivs)" = "1" ]; then
             :
         else
+            # A detached handler thread can exit between the check above and
+            # the reads, which then come back empty: not a failure.
+            if [ ! -d "/proc/$AVD_PID/task/$t" ]; then
+                threads=$((threads - 1))
+                continue
+            fi
             tbad=$((tbad + 1))
             echo "    avd thread $t ($(cat "/proc/$AVD_PID/task/$t/comm" 2>/dev/null)): Uid='$(proc_field "$AVD_PID/task/$t" Uid)' CapEff='$(proc_field "$AVD_PID/task/$t" CapEff)' CapBnd='$(proc_field "$AVD_PID/task/$t" CapBnd)' NoNewPrivs='$(proc_field "$AVD_PID/task/$t" NoNewPrivs)'"
         fi

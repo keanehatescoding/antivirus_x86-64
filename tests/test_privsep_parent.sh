@@ -275,8 +275,24 @@ static int c_inj1(void) { return inject(PS_P_BOUNDING_SET); }
 static int c_inj2(void) { return inject(PS_P_CAPABILITIES); }
 static int c_inj3(void) { return inject(PS_P_NO_NEW_PRIVS); }
 
+/* Root is not enough: in a container with a trimmed capability set the
+ * lockdown cannot run at all (it needs CAP_SETPCAP to shrink the bounding set
+ * and every kept capability to be present to keep it), and that is the
+ * environment's limit, not a failure of the code. Every check that calls
+ * ps_parent_lockdown() is skipped then, the failure-injection ones included,
+ * because they run the real earlier steps before the injected one. */
+static int parent_caps_available(void) {
+    uint64_t eff, prm, bnd;
+
+    return !status_hex("CapEff", &eff) && !status_hex("CapPrm", &prm) &&
+           !status_hex("CapBnd", &bnd) && (eff & (1ULL << CAP_SETPCAP)) &&
+           (prm & PS_PARENT_CAPS) == PS_PARENT_CAPS &&
+           (bnd & PS_PARENT_CAPS) == PS_PARENT_CAPS;
+}
+
 int main(int argc, char **argv) {
     int root = geteuid() == 0;
+    int caps = root && parent_caps_available();
     struct { const char *label; int (*fn)(void); } t[] = {
         {"state read back from /proc: caps, bounding set, inheritable, ambient, NO_NEW_PRIVS, still uid 0", c_state},
         {"still able to chown, chmod, read a mode-0000 file and linkat(AT_EMPTY_PATH) on another uid's file", c_keeps},
@@ -298,8 +314,8 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
         int r;
 
-        if (!root) {
-            printf("  SKIP: %s (needs root)\n", t[i].label);
+        if (!caps) {
+            printf("  SKIP: %s (needs root with CAP_SETPCAP and the six parent capabilities)\n", t[i].label);
             SKIP++;
             continue;
         }
