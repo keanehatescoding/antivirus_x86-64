@@ -203,6 +203,12 @@ proc_field() {
         "/proc/$1/status" 2>/dev/null
 }
 
+# snap_field TEXT KEY - like proc_field, but from a status snapshot already
+# read into TEXT, so several fields come from one consistent read.
+snap_field() {
+    printf '%s\n' "$1" | awk -v k="$2:" '$1 == k { $1 = ""; sub(/^ +/, ""); print; exit }'
+}
+
 # Pids whose parent is $1, read from /proc (no pgrep needed in the guest).
 children_of() {
     awk -v p="$1" '$1 == "PPid:" && $2 == p { split(FILENAME, a, "/"); print a[3] }' \
@@ -250,27 +256,29 @@ check_privsep() {
     # (the privsep reader) would keep full root and /proc/<pid>/status alone
     # would not show it. No seccomp filter yet (Stage 2 step 3), so Seccomp is
     # deliberately not asserted.
-    local t threads=0 tbad=0
+    local t st threads=0 tbad=0
     for t in /proc/"$AVD_PID"/task/[0-9]*; do
         t="${t##*/}"
-        [ -d "/proc/$AVD_PID/task/$t" ] || continue # a thread that exited
+        # One read per thread, so every field is judged from the same
+        # snapshot. A detached handler thread can exit at any point; only a
+        # thread whose status could not be read at all, and which is gone,
+        # is skipped. Any value that WAS read is checked, even if the thread
+        # has exited since.
+        st="$(cat "/proc/$AVD_PID/task/$t/status" 2>/dev/null)"
+        if [ -z "$st" ] && [ ! -d "/proc/$AVD_PID/task/$t" ]; then
+            continue
+        fi
         threads=$((threads + 1))
-        if [ "$(proc_field "$AVD_PID/task/$t" Uid)" = "0 0 0 0" ] && \
-           [ "$(proc_field "$AVD_PID/task/$t" CapEff)" = "000000000020100f" ] && \
-           [ "$(proc_field "$AVD_PID/task/$t" CapPrm)" = "000000000020100f" ] && \
-           [ "$(proc_field "$AVD_PID/task/$t" CapBnd)" = "000000000020100f" ] && \
-           [ "$(proc_field "$AVD_PID/task/$t" CapInh)" = "0000000000000000" ] && \
-           [ "$(proc_field "$AVD_PID/task/$t" NoNewPrivs)" = "1" ]; then
+        if [ "$(snap_field "$st" Uid)" = "0 0 0 0" ] && \
+           [ "$(snap_field "$st" CapEff)" = "000000000020100f" ] && \
+           [ "$(snap_field "$st" CapPrm)" = "000000000020100f" ] && \
+           [ "$(snap_field "$st" CapBnd)" = "000000000020100f" ] && \
+           [ "$(snap_field "$st" CapInh)" = "0000000000000000" ] && \
+           [ "$(snap_field "$st" NoNewPrivs)" = "1" ]; then
             :
         else
-            # A detached handler thread can exit between the check above and
-            # the reads, which then come back empty: not a failure.
-            if [ ! -d "/proc/$AVD_PID/task/$t" ]; then
-                threads=$((threads - 1))
-                continue
-            fi
             tbad=$((tbad + 1))
-            echo "    avd thread $t ($(cat "/proc/$AVD_PID/task/$t/comm" 2>/dev/null)): Uid='$(proc_field "$AVD_PID/task/$t" Uid)' CapEff='$(proc_field "$AVD_PID/task/$t" CapEff)' CapBnd='$(proc_field "$AVD_PID/task/$t" CapBnd)' NoNewPrivs='$(proc_field "$AVD_PID/task/$t" NoNewPrivs)'"
+            echo "    avd thread $t ($(snap_field "$st" Name)): Uid='$(snap_field "$st" Uid)' CapEff='$(snap_field "$st" CapEff)' CapPrm='$(snap_field "$st" CapPrm)' CapBnd='$(snap_field "$st" CapBnd)' CapInh='$(snap_field "$st" CapInh)' NoNewPrivs='$(snap_field "$st" NoNewPrivs)'"
         fi
     done
     if [ "$threads" -lt 2 ]; then
