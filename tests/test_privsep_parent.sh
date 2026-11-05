@@ -32,6 +32,8 @@ cat > "$BUILD_DIR/t.c" <<'EOF'
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -169,6 +171,52 @@ static int c_loses(void) {
     return 0;
 }
 
+/* ---- capabilities are per THREAD: only threads created after the call
+ * inherit the reduced set. This is why avd locks down inside privsep_start()
+ * before the reader thread exists. ---- */
+static volatile int th_go, th_ready;
+static volatile uint64_t th_eff[2];
+
+static uint64_t thread_eff(void) {
+    uint64_t v = 0;
+    char line[256];
+    FILE *f = fopen("/proc/thread-self/status", "re");
+
+    if (!f) return ~0ULL;
+    while (fgets(line, sizeof(line), f))
+        if (!strncmp(line, "CapEff:", 7)) { v = strtoull(line + 7, NULL, 16); break; }
+    fclose(f);
+    return v;
+}
+
+static void *th_main(void *arg) {
+    int idx = (int)(long)arg;
+
+    th_ready++;
+    while (!th_go)
+        usleep(1000);
+    th_eff[idx] = thread_eff();
+    return NULL;
+}
+
+static int c_threads(void) {
+    pthread_t before, after;
+
+    if (pthread_create(&before, NULL, th_main, (void *)0) != 0) return 90;
+    while (th_ready < 1)
+        usleep(1000);
+    if (ps_parent_lockdown() != 0) return 1;
+    if (pthread_create(&after, NULL, th_main, (void *)1) != 0) return 91;
+    while (th_ready < 2)
+        usleep(1000);
+    th_go = 1;
+    pthread_join(before, NULL);
+    pthread_join(after, NULL);
+    if (th_eff[1] != PS_PARENT_CAPS) return 2;  /* created after: reduced */
+    if (th_eff[0] == PS_PARENT_CAPS) return 3;  /* created before: NOT reduced */
+    return 0;
+}
+
 /* ---- ps_client_stop() SIGKILLs the spawner: root to root needs no CAP_KILL ---- */
 static int c_kills_spawner(void) {
     pid_t g = fork();
@@ -205,9 +253,10 @@ static int c_bnd_short(void) {
 /* ---- failure injected at each step, and nothing after it ran ---- */
 static int inject(int step) {
     uint64_t bnd = 0;
-    long nnp = -1;
+    long nnp = -1, base = -1;
     int r;
 
+    status_int("NoNewPrivs", &base); /* the launcher may already have set it */
     ps_test_parent_fail_step = step;
     errno = 0;
     r = ps_parent_lockdown();
@@ -218,8 +267,8 @@ static int inject(int step) {
     /* step 1 failing means nothing was dropped; step 3 failing means the
      * capabilities were already cut but NO_NEW_PRIVS was not set */
     if (step == PS_P_BOUNDING_SET && bnd == PS_PARENT_CAPS) return 3;
-    if (step == PS_P_NO_NEW_PRIVS && (bnd != PS_PARENT_CAPS || nnp != 0)) return 4;
-    if (step != PS_P_NO_NEW_PRIVS && nnp != 0) return 5;
+    if (step == PS_P_NO_NEW_PRIVS && (bnd != PS_PARENT_CAPS || nnp != base)) return 4;
+    if (step != PS_P_NO_NEW_PRIVS && nnp != base) return 5;
     return 0;
 }
 static int c_inj1(void) { return inject(PS_P_BOUNDING_SET); }
@@ -233,6 +282,7 @@ int main(int argc, char **argv) {
         {"still able to chown, chmod, read a mode-0000 file and linkat(AT_EMPTY_PATH) on another uid's file", c_keeps},
         {"no longer able to setuid, setgid, drop bounding caps, or regain CAP_SETUID", c_loses},
         {"can still SIGKILL a root process of its own uid (the spawner) without CAP_KILL", c_kills_spawner},
+        {"capabilities are per thread: a thread created before the call keeps them, one created after is reduced", c_threads},
         {"calling it twice succeeds", c_twice},
         {"a bounding set missing CAP_CHOWN fails step 1 with EPERM", c_bnd_short},
         {"failure at step 1 leaves the bounding set untouched", c_inj1},
@@ -266,6 +316,6 @@ EOF
 
 echo "### privsep_parent.h (ASan+UBSan) ###"
 gcc -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
-    -I"$SRC_DIR" -o "$BUILD_DIR/t" "$BUILD_DIR/t.c" || { echo "FAIL: build"; exit 1; }
+    -I"$SRC_DIR" -o "$BUILD_DIR/t" "$BUILD_DIR/t.c" -lpthread || { echo "FAIL: build"; exit 1; }
 mkdir -p "$BUILD_DIR/work"
 "$BUILD_DIR/t" "$BUILD_DIR/work"

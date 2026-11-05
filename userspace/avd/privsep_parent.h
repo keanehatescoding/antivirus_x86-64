@@ -32,8 +32,14 @@
  *
  * MUST be called after the spawner was forked: the spawner inherits its
  * capabilities from the process that forks it, and the bounding set only ever
- * shrinks. Needs CAP_SETPCAP effective for step 1, so it also must run before
- * anything drops that. A bounding set that lacks one of PS_PARENT_CAPS (a
+ * shrinks. It MUST also be called before the process creates any other
+ * thread: capabilities, the bounding set and NO_NEW_PRIVS belong to a THREAD
+ * (capset() and the prctl()s act on the caller only), so a thread that already
+ * exists keeps whatever it had, and one created afterwards inherits the
+ * caller's reduced set. avd calls it in privsep_start(), between forking the
+ * spawner and starting the client's reader thread; the test checks both
+ * orderings. Needs CAP_SETPCAP effective for step 1, so it also must run
+ * before anything drops that. A bounding set that lacks one of PS_PARENT_CAPS (a
  * systemd unit with a too-small CapabilityBoundingSet=) fails step 1.
  *
  * Header-only and dependency-free like the others; compiled standalone by

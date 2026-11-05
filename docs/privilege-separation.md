@@ -677,9 +677,14 @@ the issue suggests. Three steps, one PR each:
 
 #### Step 2 as built: `privsep_parent.h`
 
-With `AVD_PRIVSEP=1`, right after `privsep_start()` succeeds (the spawner has
-inherited its capabilities by then) and before the netlink socket exists, the
-main process calls `ps_parent_lockdown()`:
+With `AVD_PRIVSEP=1`, inside `privsep_start()`, after the spawner is forked (it
+has inherited its capabilities by then) and before the client's reader thread
+is created, the main process calls `ps_parent_lockdown()`. The order matters
+because capabilities, the bounding set and `NO_NEW_PRIVS` are per thread, not
+per process: a thread that exists before the call keeps full root for its whole
+life, and every thread created afterwards (the reader, the scan threads, the
+fanotify listener, the control threads) inherits the reduced set. The tests
+check every thread, not just the main one. The steps:
 
 1. bounding set cut to `PS_PARENT_CAPS` and read back (this is the step that
    needs `CAP_SETPCAP`, so nothing may drop that earlier)
@@ -735,13 +740,15 @@ Not done in this step, on purpose:
 
 `tests/test_privsep_parent.sh` (root; SKIP without it) compiles the production
 header with ASan+UBSan and checks, in forked children, the state read back from
-`/proc`, that a root process of the same uid can still be `SIGKILL`ed (what
+`/proc`, that capabilities really are per thread (a thread created before the
+call keeps them, one created after is reduced), that a root process of the same uid can still be `SIGKILL`ed (what
 `ps_client_stop()` does to the spawner), that the kept capabilities still work (`chown`, `chmod` and `open` on
 another uid's mode-0000 file, `linkat(AT_EMPTY_PATH)`), that `setuid`, `setgid`
 and `PR_CAPBSET_DROP` now fail and a dropped capability cannot be regained,
 that a bounding set missing `CAP_CHOWN` fails step 1, and a failure injected at
-each step. `tests/test_fanotify_exec.sh --privsep` also reads the live parent's
-`CapEff`, `CapPrm`, `CapBnd`, `CapInh` and `NoNewPrivs` from `/proc`.
+each step. `tests/test_fanotify_exec.sh --privsep` also reads `CapEff`, `CapPrm`, `CapBnd`,
+`CapInh` and `NoNewPrivs` of every thread of the live avd process from
+`/proc/<pid>/task/<tid>/status`.
 
 #### Step 3 and the unit: still to do
 
@@ -991,8 +998,8 @@ parent's scan threads, so it still pins them. It also creates the
 scans have run, checks `/proc` independently of avd's own check: the spawner
 is uid 0 with a capability bounding set of exactly `CAP_KILL`, `CAP_SETGID`,
 `CAP_SETUID` and `CAP_SETPCAP` (`0x1e0`), `NO_NEW_PRIVS` and a seccomp filter,
-and the main process is uid 0 with exactly the six parent capabilities
-(`0x20100f`) and `NO_NEW_PRIVS`, and every worker is the `hyprav-scan` uid and
+and every thread of the main process is uid 0 with exactly the six parent
+capabilities (`0x20100f`) and `NO_NEW_PRIVS`, and every worker is the `hyprav-scan` uid and
 gid with no capabilities, `NO_NEW_PRIVS` and a seccomp filter. The host environment does not reach a
 virtme-ng guest, which is why the wrapper passes the flag on the command line.
 

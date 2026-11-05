@@ -243,19 +243,34 @@ check_privsep() {
         fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapEff='$(proc_field "$spid" CapEff)' CapPrm='$(proc_field "$spid" CapPrm)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)'"
     fi
 
-    # The main process itself: still root, but cut to the six capabilities
-    # it uses (NET_ADMIN, SYS_ADMIN, DAC_READ_SEARCH, DAC_OVERRIDE, FOWNER,
-    # CHOWN = 0x20100f) under NO_NEW_PRIVS. No seccomp filter yet (Stage 2
-    # step 3), so Seccomp is deliberately not asserted.
-    if [ "$(proc_field "$AVD_PID" Uid)" = "0 0 0 0" ] && \
-       [ "$(proc_field "$AVD_PID" CapEff)" = "000000000020100f" ] && \
-       [ "$(proc_field "$AVD_PID" CapPrm)" = "000000000020100f" ] && \
-       [ "$(proc_field "$AVD_PID" CapBnd)" = "000000000020100f" ] && \
-       [ "$(proc_field "$AVD_PID" CapInh)" = "0000000000000000" ] && \
-       [ "$(proc_field "$AVD_PID" NoNewPrivs)" = "1" ]; then
-        pass "avd main process is root cut to six capabilities, NO_NEW_PRIVS"
+    # The main process: still root, but cut to the six capabilities it uses
+    # (NET_ADMIN, SYS_ADMIN, DAC_READ_SEARCH, DAC_OVERRIDE, FOWNER, CHOWN =
+    # 0x20100f) under NO_NEW_PRIVS. Capabilities belong to a thread, not the
+    # process, so EVERY thread is checked: a thread created before the drop
+    # (the privsep reader) would keep full root and /proc/<pid>/status alone
+    # would not show it. No seccomp filter yet (Stage 2 step 3), so Seccomp is
+    # deliberately not asserted.
+    local t threads=0 tbad=0
+    for t in $(ls "/proc/$AVD_PID/task" 2>/dev/null); do
+        threads=$((threads + 1))
+        if [ "$(proc_field "$AVD_PID/task/$t" Uid)" = "0 0 0 0" ] && \
+           [ "$(proc_field "$AVD_PID/task/$t" CapEff)" = "000000000020100f" ] && \
+           [ "$(proc_field "$AVD_PID/task/$t" CapPrm)" = "000000000020100f" ] && \
+           [ "$(proc_field "$AVD_PID/task/$t" CapBnd)" = "000000000020100f" ] && \
+           [ "$(proc_field "$AVD_PID/task/$t" CapInh)" = "0000000000000000" ] && \
+           [ "$(proc_field "$AVD_PID/task/$t" NoNewPrivs)" = "1" ]; then
+            :
+        else
+            tbad=$((tbad + 1))
+            echo "    avd thread $t ($(cat "/proc/$AVD_PID/task/$t/comm" 2>/dev/null)): Uid='$(proc_field "$AVD_PID/task/$t" Uid)' CapEff='$(proc_field "$AVD_PID/task/$t" CapEff)' CapBnd='$(proc_field "$AVD_PID/task/$t" CapBnd)' NoNewPrivs='$(proc_field "$AVD_PID/task/$t" NoNewPrivs)'"
+        fi
+    done
+    if [ "$threads" -lt 2 ]; then
+        fail "expected several avd threads (reader, scanners), found $threads"
+    elif [ "$tbad" -eq 0 ]; then
+        pass "all $threads avd threads are root cut to six capabilities, NO_NEW_PRIVS"
     else
-        fail "avd main process not locked down: Uid='$(proc_field "$AVD_PID" Uid)' CapEff='$(proc_field "$AVD_PID" CapEff)' CapPrm='$(proc_field "$AVD_PID" CapPrm)' CapBnd='$(proc_field "$AVD_PID" CapBnd)' CapInh='$(proc_field "$AVD_PID" CapInh)' NoNewPrivs='$(proc_field "$AVD_PID" NoNewPrivs)'"
+        fail "$tbad of $threads avd threads not locked down"
     fi
 
     for w in $(children_of "$spid"); do
