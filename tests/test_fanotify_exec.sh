@@ -203,6 +203,12 @@ proc_field() {
         "/proc/$1/status" 2>/dev/null
 }
 
+# snap_field TEXT KEY - like proc_field, but from a status snapshot already
+# read into TEXT, so several fields come from one consistent read.
+snap_field() {
+    printf '%s\n' "$1" | awk -v k="$2:" '$1 == k { $1 = ""; sub(/^ +/, ""); print; exit }'
+}
+
 # Pids whose parent is $1, read from /proc (no pgrep needed in the guest).
 children_of() {
     awk -v p="$1" '$1 == "PPid:" && $2 == p { split(FILENAME, a, "/"); print a[3] }' \
@@ -210,7 +216,7 @@ children_of() {
 }
 
 # With privilege separation on, check from /proc what the design promises:
-# the spawner is root but cut to four capabilities (CAP_KILL, CAP_SETGID,
+# the main process is root cut to six capabilities, and the spawner is root but cut to four capabilities (CAP_KILL, CAP_SETGID,
 # CAP_SETUID, CAP_SETPCAP = bits 5-8 = 0x1e0) under NO_NEW_PRIVS and a
 # seccomp filter, and every worker is the hyprav-scan user with an empty
 # capability set, NO_NEW_PRIVS and a seccomp filter. avd runs the same
@@ -241,6 +247,46 @@ check_privsep() {
         pass "spawner is root cut to four capabilities, NO_NEW_PRIVS, seccomp"
     else
         fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapEff='$(proc_field "$spid" CapEff)' CapPrm='$(proc_field "$spid" CapPrm)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)'"
+    fi
+
+    # The main process: still root, but cut to the six capabilities it uses
+    # (NET_ADMIN, SYS_ADMIN, DAC_READ_SEARCH, DAC_OVERRIDE, FOWNER, CHOWN =
+    # 0x20100f) under NO_NEW_PRIVS. Capabilities belong to a thread, not the
+    # process, so EVERY thread is checked: a thread created before the drop
+    # (the privsep reader) would keep full root and /proc/<pid>/status alone
+    # would not show it. No seccomp filter yet (Stage 2 step 3), so Seccomp is
+    # deliberately not asserted.
+    local t st threads=0 tbad=0
+    for t in /proc/"$AVD_PID"/task/[0-9]*; do
+        t="${t##*/}"
+        # One read per thread, so every field is judged from the same
+        # snapshot. A detached handler thread can exit at any point; only a
+        # thread whose status could not be read at all, and which is gone,
+        # is skipped. Any value that WAS read is checked, even if the thread
+        # has exited since.
+        st="$(cat "/proc/$AVD_PID/task/$t/status" 2>/dev/null)"
+        if [ -z "$st" ] && [ ! -d "/proc/$AVD_PID/task/$t" ]; then
+            continue
+        fi
+        threads=$((threads + 1))
+        if [ "$(snap_field "$st" Uid)" = "0 0 0 0" ] && \
+           [ "$(snap_field "$st" CapEff)" = "000000000020100f" ] && \
+           [ "$(snap_field "$st" CapPrm)" = "000000000020100f" ] && \
+           [ "$(snap_field "$st" CapBnd)" = "000000000020100f" ] && \
+           [ "$(snap_field "$st" CapInh)" = "0000000000000000" ] && \
+           [ "$(snap_field "$st" NoNewPrivs)" = "1" ]; then
+            :
+        else
+            tbad=$((tbad + 1))
+            echo "    avd thread $t ($(snap_field "$st" Name)): Uid='$(snap_field "$st" Uid)' CapEff='$(snap_field "$st" CapEff)' CapPrm='$(snap_field "$st" CapPrm)' CapBnd='$(snap_field "$st" CapBnd)' CapInh='$(snap_field "$st" CapInh)' NoNewPrivs='$(snap_field "$st" NoNewPrivs)'"
+        fi
+    done
+    if [ "$threads" -lt 2 ]; then
+        fail "expected several avd threads (reader, scanners), found $threads"
+    elif [ "$tbad" -eq 0 ]; then
+        pass "all $threads avd threads are root cut to six capabilities, NO_NEW_PRIVS"
+    else
+        fail "$tbad of $threads avd threads not locked down"
     fi
 
     for w in $(children_of "$spid"); do

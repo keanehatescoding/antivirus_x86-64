@@ -84,6 +84,11 @@ echo "### test_privsep_lockdown.sh (the spawner's own lockdown and seccomp filte
 "$REPO_ROOT/tests/test_privsep_lockdown.sh" || FAIL=1
 
 echo
+echo "### test_privsep_parent.sh (the main process dropping capabilities after the spawner, #103) ###"
+# Needs root for the capability drop; prints SKIP, never PASS, without it.
+"$REPO_ROOT/tests/test_privsep_parent.sh" || FAIL=1
+
+echo
 echo "### test_privsep_client.sh (main-process dispatch client, #103) ###"
 "$REPO_ROOT/tests/test_privsep_client.sh" || FAIL=1
 

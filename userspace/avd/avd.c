@@ -114,6 +114,7 @@
 #include "control_parse.h"
 #include "fan_parse.h"
 #include "privsep_client.h"
+#include "privsep_parent.h"
 #include "privsep_proto.h"
 #include "sha256.h"
 #include "tlsh_shim.h"
@@ -2446,6 +2447,30 @@ static int privsep_start(uid_t uid, gid_t gid) {
     return -1;
   privsep_cl.log = privsep_log;
   privsep_cl.on_dead = privsep_on_dead;
+
+  /* The spawner has its capabilities now (it inherited them at fork), so the
+   * main process can give up everything it does not use. This has to happen
+   * BEFORE ps_client_start() creates the reader thread: capabilities, the
+   * bounding set and NO_NEW_PRIVS belong to a thread, not to the process, and
+   * a thread created earlier keeps the full root set for as long as it lives.
+   * Every thread created after this inherits the reduced set from this one.
+   * Fail closed: with privilege separation asked for, a parent that is still
+   * root with every capability is not what the operator asked for. */
+  {
+    int pstep = ps_parent_lockdown();
+
+    if (pstep != 0) {
+      fprintf(stderr,
+              "avd: privsep: parent lockdown step %d failed: %s (step 1 also "
+              "fails if the bounding set lacks CAP_NET_ADMIN, CAP_SYS_ADMIN, "
+              "CAP_DAC_READ_SEARCH, CAP_DAC_OVERRIDE, CAP_FOWNER or "
+              "CAP_CHOWN)\n",
+              pstep, strerror(errno));
+      ps_client_stop(&privsep_cl);
+      return -1;
+    }
+  }
+
   if (ps_client_start(&privsep_cl) != 0) {
     fprintf(stderr, "avd: privsep: could not start the reader thread\n");
     ps_client_stop(&privsep_cl);
