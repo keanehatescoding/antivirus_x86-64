@@ -39,6 +39,10 @@
 set -u
 
 PRIVSEP="${AV_TEST_PRIVSEP:-0}"
+# AV_TEST_PRIVSEP_SECCOMP=log runs avd's main-process filter in log mode.
+PRIVSEP_SECCOMP="${AV_TEST_PRIVSEP_SECCOMP:-}"
+SECCOMP_WANT=enforcing
+[ "$PRIVSEP_SECCOMP" = log ] && SECCOMP_WANT="log only, AVD_PRIVSEP_SECCOMP=log"
 for arg in "$@"; do
     case "$arg" in
         --privsep) PRIVSEP=1 ;;
@@ -174,7 +178,7 @@ stop_avd() {
 # and NoNewPrivileges= (tests/avd_unit_caps.sh), as systemd would start it.
 start_avd() {
     local extra=()
-    [ "$PRIVSEP" = 1 ] && extra=(AVD_PRIVSEP=1)
+    [ "$PRIVSEP" = 1 ] && extra=(AVD_PRIVSEP=1 ${PRIVSEP_SECCOMP:+AVD_PRIVSEP_SECCOMP=$PRIVSEP_SECCOMP})
     rm -f "$TEST_SOCK_PATH"
     : > "$AVD_LOG"
     (
@@ -236,6 +240,11 @@ check_privsep() {
         fail "avd did not report privilege separation on"; cat "$AVD_LOG"
         return
     fi
+    if grep -qF "avd: privsep: seccomp filter on in the main process ($SECCOMP_WANT)" "$AVD_LOG"; then
+        pass "avd reports its seccomp filter on ($SECCOMP_WANT)"
+    else
+        fail "avd did not report its seccomp filter on ($SECCOMP_WANT)"; cat "$AVD_LOG"
+    fi
     spid="$(sed -n 's/.*(spawner pid \([0-9][0-9]*\)).*/\1/p' "$AVD_LOG" | head -1)"
     if [ -z "$spid" ] || [ ! -d "/proc/$spid" ]; then
         fail "spawner pid '$spid' from the log is not a live process"
@@ -259,8 +268,8 @@ check_privsep() {
     # 0x20100f) under NO_NEW_PRIVS. Capabilities belong to a thread, not the
     # process, so EVERY thread is checked: a thread created before the drop
     # (the privsep reader) would keep full root and /proc/<pid>/status alone
-    # would not show it. No seccomp filter yet (Stage 2 step 3), so Seccomp is
-    # deliberately not asserted.
+    # would not show it. Every thread also carries the main process's seccomp
+    # filter (Stage 2 step 3, installed with TSYNC), so Seccomp is 2 on each.
     local t st threads=0 tbad=0
     for t in /proc/"$AVD_PID"/task/[0-9]*; do
         t="${t##*/}"
@@ -279,17 +288,18 @@ check_privsep() {
            [ "$(snap_field "$st" CapPrm)" = "000000000020100f" ] && \
            [ "$(snap_field "$st" CapBnd)" = "000000000020100f" ] && \
            [ "$(snap_field "$st" CapInh)" = "0000000000000000" ] && \
-           [ "$(snap_field "$st" NoNewPrivs)" = "1" ]; then
+           [ "$(snap_field "$st" NoNewPrivs)" = "1" ] && \
+           [ "$(snap_field "$st" Seccomp)" = "2" ]; then
             :
         else
             tbad=$((tbad + 1))
-            echo "    avd thread $t ($(snap_field "$st" Name)): Uid='$(snap_field "$st" Uid)' CapEff='$(snap_field "$st" CapEff)' CapPrm='$(snap_field "$st" CapPrm)' CapBnd='$(snap_field "$st" CapBnd)' CapInh='$(snap_field "$st" CapInh)' NoNewPrivs='$(snap_field "$st" NoNewPrivs)'"
+            echo "    avd thread $t ($(snap_field "$st" Name)): Uid='$(snap_field "$st" Uid)' CapEff='$(snap_field "$st" CapEff)' CapPrm='$(snap_field "$st" CapPrm)' CapBnd='$(snap_field "$st" CapBnd)' CapInh='$(snap_field "$st" CapInh)' NoNewPrivs='$(snap_field "$st" NoNewPrivs)' Seccomp='$(snap_field "$st" Seccomp)'"
         fi
     done
     if [ "$threads" -lt 2 ]; then
         fail "expected several avd threads (reader, scanners), found $threads"
     elif [ "$tbad" -eq 0 ]; then
-        pass "all $threads avd threads are root cut to six capabilities, NO_NEW_PRIVS"
+        pass "all $threads avd threads are root cut to six capabilities, NO_NEW_PRIVS, seccomp"
     else
         fail "$tbad of $threads avd threads not locked down"
     fi

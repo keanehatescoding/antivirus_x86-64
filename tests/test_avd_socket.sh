@@ -35,6 +35,10 @@
 set -u
 
 PRIVSEP="${AV_TEST_PRIVSEP:-0}"
+# AV_TEST_PRIVSEP_SECCOMP=log runs avd's main-process filter in log mode.
+PRIVSEP_SECCOMP="${AV_TEST_PRIVSEP_SECCOMP:-}"
+SECCOMP_WANT=enforcing
+[ "$PRIVSEP_SECCOMP" = log ] && SECCOMP_WANT="log only, AVD_PRIVSEP_SECCOMP=log"
 for arg in "$@"; do
     case "$arg" in
         --privsep) PRIVSEP=1 ;;
@@ -45,7 +49,7 @@ done
 # explicitly in privsep mode and left unset otherwise, so the default
 # run keeps testing the default configuration.
 AVD_ENV=()
-[ "$PRIVSEP" = 1 ] && AVD_ENV=(AVD_PRIVSEP=1)
+[ "$PRIVSEP" = 1 ] && AVD_ENV=(AVD_PRIVSEP=1 ${PRIVSEP_SECCOMP:+AVD_PRIVSEP_SECCOMP=$PRIVSEP_SECCOMP})
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod/rmmod, and to exercise avd's"
@@ -200,6 +204,25 @@ if [ "$PRIVSEP" = 1 ]; then
         fail "avd did not report privilege separation on"
         cat "$AVD_LOG"
         exit 1
+    fi
+    if grep -qF "avd: privsep: seccomp filter on in the main process ($SECCOMP_WANT)" "$AVD_LOG"; then
+        pass "avd reports its seccomp filter on ($SECCOMP_WANT)"
+    else
+        fail "avd did not report its seccomp filter on ($SECCOMP_WANT)"
+        cat "$AVD_LOG"
+    fi
+    # Installed with TSYNC, so every thread carries it, not just the main one.
+    SC_BAD=0; SC_N=0
+    for t in /proc/"$AVD_PID"/task/[0-9]*; do
+        v="$(sed -n 's/^Seccomp:[[:space:]]*//p' "$t/status" 2>/dev/null)"
+        [ -z "$v" ] && [ ! -d "$t" ] && continue
+        SC_N=$((SC_N + 1))
+        [ "$v" = 2 ] || { SC_BAD=$((SC_BAD + 1)); echo "    thread ${t##*/}: Seccomp='$v'"; }
+    done
+    if [ "$SC_N" -ge 2 ] && [ "$SC_BAD" -eq 0 ]; then
+        pass "all $SC_N avd threads are under a seccomp filter"
+    else
+        fail "$SC_BAD of $SC_N avd threads without a seccomp filter"
     fi
 fi
 # Proves the unit's restrictions reached avd. With privilege separation
@@ -594,8 +617,17 @@ fi
 section "unload"
 if kill "$AVD_PID" 2>/dev/null; then
     wait "$AVD_PID" 2>/dev/null
+    AVD_RC=$?
     AVD_PID=""
-    pass "avd stopped"
+    # 0 from main(), so the whole shutdown path ran - with privilege
+    # separation that includes the wake-up connect() and the spawner kill
+    # under the seccomp filter, where a stray syscall would be SIGSYS (159).
+    if [ "$AVD_RC" -eq 0 ]; then
+        pass "avd stopped (exit status 0)"
+    else
+        fail "avd stopped with exit status $AVD_RC"
+        tail -20 "$AVD_LOG"
+    fi
 else
     fail "could not stop avd"
 fi
