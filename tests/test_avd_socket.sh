@@ -19,9 +19,33 @@
 # RUN THIS ONLY IN YOUR VM, ideally from a fresh snapshot - it loads a
 # kernel module, same caveat as test_detection.sh.
 #
-# Usage: sudo tests/test_avd_socket.sh
+# With --privsep (or AV_TEST_PRIVSEP=1) every avd start also gets
+# AVD_PRIVSEP=1 (#103, docs/privilege-separation.md): scans run in
+# unprivileged workers and the main process runs with its capabilities
+# cut to the six in privsep_parent.h. The script then creates the
+# hyprav-scan user if it is missing and adds a quarantine/restore round
+# trip on a file owned by another uid, which is what needs the parent's
+# CAP_FOWNER, CAP_DAC_OVERRIDE and CAP_CHOWN. The round trip also runs
+# without --privsep, as a baseline.
+#
+# Usage: sudo tests/test_avd_socket.sh [--privsep]
+#   or, in a throwaway virtme-ng guest (no root on the host):
+#   vng --run --user root -- tests/test_avd_socket.sh [--privsep]
 #
 set -u
+
+PRIVSEP="${AV_TEST_PRIVSEP:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        --privsep) PRIVSEP=1 ;;
+        *) echo "unknown argument: $arg (only --privsep is accepted)"; exit 2 ;;
+    esac
+done
+# Environment for every avd start below. AVD_PRIVSEP=1 is passed
+# explicitly in privsep mode and left unset otherwise, so the default
+# run keeps testing the default configuration.
+AVD_ENV=()
+[ "$PRIVSEP" = 1 ] && AVD_ENV=(AVD_PRIVSEP=1)
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod/rmmod, and to exercise avd's"
@@ -128,13 +152,27 @@ else
 fi
 sleep 1
 
+if [ "$PRIVSEP" = 1 ]; then
+    section "privilege separation: worker user"
+    if getent passwd hyprav-scan >/dev/null; then
+        pass "hyprav-scan already exists"
+    elif command -v useradd >/dev/null 2>&1 && \
+         useradd --system --user-group --no-create-home \
+                 --shell /usr/sbin/nologin hyprav-scan 2>"$AVCTL_LOG"; then
+        pass "hyprav-scan created"
+    else
+        fail "cannot create hyprav-scan: $(cat "$AVCTL_LOG" 2>/dev/null)"
+        exit 1
+    fi
+fi
+
 section "start avd (throwaway quarantine dir + control socket)"
 mkdir -p "$TEST_QUARANTINE_DIR"
 cp "$REPO_ROOT"/rules/*.yar "$TEST_RULES_DIR"/
 cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 (
     cd "$REPO_ROOT" || exit 1
-    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -149,6 +187,15 @@ else
     fail "avd did not create the control socket in time - see $AVD_LOG"
     cat "$AVD_LOG"
     exit 1
+fi
+if [ "$PRIVSEP" = 1 ]; then
+    if grep -qF "privilege separation on" "$AVD_LOG"; then
+        pass "avd reports privilege separation on"
+    else
+        fail "avd did not report privilege separation on"
+        cat "$AVD_LOG"
+        exit 1
+    fi
 fi
 
 export AVD_SOCK_PATH="$TEST_SOCK_PATH"
@@ -306,7 +353,7 @@ TEST_HOLD_DIR="$TEST_TMP_DIR/scan_hold"
 mkdir -p "$TEST_HOLD_DIR"
 (
     cd "$REPO_ROOT" || exit 1
-    exec env AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" stdbuf -oL \
         "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
@@ -397,7 +444,7 @@ done
 rm -f "$TEST_SOCK_PATH"
 (
     cd "$REPO_ROOT" || exit 1
-    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -468,6 +515,63 @@ else
     pass "quarantine list no longer shows the deleted entry"
 fi
 rm -f "$TEST_FILE"
+
+section "quarantine and restore a file owned by another uid"
+# The EICAR round trip above uses a root-owned file. A real detection is
+# usually someone else's file, and restoring one is where the main
+# process needs CAP_FOWNER (chmod/unlink of a file it does not own),
+# CAP_DAC_OVERRIDE (opening the mode-0000 quarantined file) and
+# CAP_CHOWN (giving it back to its owner). restore only logs a failed
+# fchown and still answers OK, so check owner and mode from stat, and
+# check the log for the fchown failure line too. The log check is the
+# one that catches a missing CAP_CHOWN here: quarantine links the
+# original inode, so it is still owned by nobody and the stat check
+# passes even when the fchown back to that owner fails with EPERM.
+if FOREIGN_UID="$(id -u nobody 2>/dev/null)" && FOREIGN_GID="$(id -g nobody 2>/dev/null)" && \
+   [ "$FOREIGN_UID" != 0 ]; then
+    FOREIGN_FILE="$TEST_TMP_DIR/foreign.bin"
+    # shellcheck disable=SC2016
+    printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > "$FOREIGN_FILE"
+    chown "$FOREIGN_UID:$FOREIGN_GID" "$FOREIGN_FILE"
+    chmod 0640 "$FOREIGN_FILE"
+    SCAN_OUT="$("$AVCTL" scan "$FOREIGN_FILE" 2>"$AVCTL_LOG")"
+    if echo "$SCAN_OUT" | grep -q '^MALICIOUS:' && [ ! -e "$FOREIGN_FILE" ]; then
+        pass "file owned by uid $FOREIGN_UID convicted and quarantined"
+    else
+        fail "expected MALICIOUS and the file gone, got: $SCAN_OUT ($(cat "$AVCTL_LOG"))"
+    fi
+    QID="$("$AVCTL" quarantine list 2>/dev/null | tail -n +2 | \
+           awk -v f="$FOREIGN_FILE" '$0 ~ f {print $1}' | head -1)"
+    if [ -n "$QID" ] && "$AVCTL" quarantine restore "$QID" >"$AVCTL_LOG" 2>&1; then
+        pass "restore command succeeded"
+    else
+        fail "restore failed: $(cat "$AVCTL_LOG" 2>/dev/null) (id=$QID)"
+    fi
+    GOT="$(stat -c '%u:%g %a' "$FOREIGN_FILE" 2>/dev/null)"
+    if [ "$GOT" = "$FOREIGN_UID:$FOREIGN_GID 640" ]; then
+        pass "restored with its owner and mode ($GOT)"
+    else
+        fail "restored as '$GOT', expected '$FOREIGN_UID:$FOREIGN_GID 640'"
+    fi
+    if grep -q 'quarantine restore: fchown' "$AVD_LOG"; then
+        fail "avd logged a failed fchown on restore: $(grep 'quarantine restore: fchown' "$AVD_LOG")"
+    else
+        pass "no fchown failure logged"
+    fi
+    # Delete path for the same file: quarantine again, then delete.
+    "$AVCTL" scan "$FOREIGN_FILE" >/dev/null 2>&1
+    QID="$("$AVCTL" quarantine list 2>/dev/null | tail -n +2 | \
+           awk -v f="$FOREIGN_FILE" '$0 ~ f {print $1}' | head -1)"
+    if [ ! -e "$FOREIGN_FILE" ] && [ -n "$QID" ] && \
+       "$AVCTL" quarantine delete "$QID" >"$AVCTL_LOG" 2>&1; then
+        pass "re-quarantined and deleted"
+    else
+        fail "re-quarantine or delete failed: $(cat "$AVCTL_LOG" 2>/dev/null) (id=$QID)"
+    fi
+    rm -f "$FOREIGN_FILE"
+else
+    fail "\"nobody\" user/group unresolvable - cannot test a foreign-owned file"
+fi
 
 section "unload"
 if kill "$AVD_PID" 2>/dev/null; then

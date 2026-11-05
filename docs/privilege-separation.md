@@ -14,7 +14,9 @@ spawner itself down (`privsep_lockdown.h`: capabilities cut to four,
 spawner"), and avd now logs why the spawner died (see "Open items").
 `tests/test_fanotify_exec.sh --privsep` runs the end-to-end fanotify suite with
 privilege separation on (see "End-to-end test with privilege separation on");
-it is a manual run, not a CI job. Stage 2 step 2 (the main process drops
+it is a manual run, not a CI job, and it passes, as does
+`tests/test_avd_socket.sh --privsep` (scan, quarantine, restore and delete over
+the control socket). Stage 2 step 2 (the main process drops
 capabilities once the spawner exists, `privsep_parent.h`) is built and tested;
 the parent's seccomp filter (step 3) and the unit's `CapabilityBoundingSet=`
 are not (see "Stage 2").
@@ -717,7 +719,15 @@ The audit behind the table is a reading of every `chown`, `chmod`, `unlink`,
 `rename`, `linkat`, `bind`, `setsockopt`, `fanotify_*`, `/proc` and `exec`
 call in `avd.c`, not a traced run. It is deliberately conservative, and the
 design doc's own rule applies: it is a candidate list until a real run
-confirms it. `avd.c` itself calls none of `execve`, `fork`, `setuid`, `kill`,
+confirms it. Two runs now have, in a virtme-ng guest on 7.3.1: the fanotify
+suite with `--privsep` (33 checks) and `tests/test_avd_socket.sh --privsep`,
+which quarantines and restores a file owned by `nobody` with mode 0640 and
+checks that it comes back with that owner and mode, without the logged
+`fchown` failure that a missing `CAP_CHOWN` produces (verified by removing
+`CAP_CHOWN` from the set: that run fails). That covers the quarantine and
+restore uses of `CAP_FOWNER`, `CAP_DAC_OVERRIDE` and `CAP_CHOWN`, and the
+genl, fanotify and `/proc/kernel_av_signatures` uses of the other three.
+`avd.c` itself calls none of `execve`, `fork`, `setuid`, `kill`,
 `mount`, `ptrace` or `setrlimit` (the spawner's `fork()` and the
 `SIGKILL` in `ps_client_stop()` live in the headers; the fork happens before
 the drop).
@@ -725,9 +735,9 @@ the drop).
 Not done in this step, on purpose:
 
 - **No `packaging/avd.service` change.** `CapabilityBoundingSet=` in the unit
-  applies to every avd start, privilege separation on or not, and the audit
-  has not been confirmed by a run, so turning it on for everyone would risk
-  breaking the default install. When it is added it must be the union of the
+  applies to every avd start, privilege separation on or not, so it is a
+  change to the default install and gets its own PR now that the list has
+  been confirmed by a run (see above). When it is added it must be the union of the
   two sets, `0x2011ef` (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_DAC_READ_SEARCH`,
   `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_CHOWN` for the parent, plus
   `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`, `CAP_KILL` for the spawner): the
@@ -931,9 +941,10 @@ cannot lock itself down stops avd at startup.
   (contract 1), and a full queue is still answered immediately by policy
   with the listener never blocking (contracts 3 and 4)
 - seccomp kill is observed if a worker attempts `open()` (test hook)
-- `tests/test_perform_scan.sh` passes with `AVD_PRIVSEP=1`. The end-to-end
-  fanotify test has a `--privsep` mode that has not yet been run (see "Open
-  items"). The QEMU boot job is not part of this:
+- `tests/test_perform_scan.sh` passes with `AVD_PRIVSEP=1`, and so do
+  `tests/run_fanotify_vng.sh --privsep` and `tests/test_avd_socket.sh
+  --privsep` (both run by hand in a virtme-ng guest). The QEMU boot job is
+  not part of this:
   it loads only `av.ko` from a static init and never starts avd
 
 ## Open questions
@@ -973,18 +984,14 @@ cannot lock itself down stops avd at startup.
 
 ## Open items
 
-- Run `tests/run_fanotify_vng.sh --privsep` (needs virtme-ng and `/dev/kvm`)
-  and fix whatever it finds. The mode is written and its helpers are checked
-  against real processes, but the suite itself has not been run with
-  `AVD_PRIVSEP=1` yet.
 - No CI job runs avd at all, with or without privilege separation: the QEMU
   boot job has no avd, libyara or libnl in its static initramfs, and the
   end-to-end scripts need root, a module build and (for fanotify) a VM. A job
   that does would be the safety net Stage 2 wants; it is a separate piece of
   work.
 - Stage 2 step 3 (the parent's seccomp filter, log-only first) and the unit's
-  `CapabilityBoundingSet=`; see "Stage 2". Step 2's capability list is from a
-  reading of avd.c and needs one real `--privsep` run to confirm it.
+  `CapabilityBoundingSet=`; see "Stage 2". Step 2's capability list is
+  confirmed by the two `--privsep` runs (see "Step 2 as built").
 
 ### End-to-end test with privilege separation on
 
