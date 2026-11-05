@@ -1378,8 +1378,8 @@ static bool field_is(pid_t pid, const char *key, const char *want) {
 
 static void test_real_spawn(void) {
     struct ps_spawner_cfg cfg = base_cfg();
-    int ctl, r, w, z;
-    pid_t sp, wp;
+    int ctl = -1, r, w, z;
+    pid_t sp = -1, wp;
     struct ps_verdict v;
     char uid[64];
 
@@ -1434,8 +1434,8 @@ static void test_real_failures(void) {
         return;
     }
     for (int k = 1; k < PS_H_STEP_COUNT; k++) {
-        int ctl, i;
-        pid_t sp;
+        int ctl = -1, i;
+        pid_t sp = -1;
 
         ps_test_fail_step = k; /* inherited by the spawner and its workers */
         reset_queues();
@@ -1455,8 +1455,8 @@ static void test_real_failures(void) {
 
 static void test_real_orphan(void) {
     struct ps_spawner_cfg cfg = base_cfg();
-    int ctl, r;
-    pid_t sp, wp;
+    int ctl = -1, r;
+    pid_t sp = -1, wp;
     int st = 0;
 
     printf("\nreal workers when the spawner dies (root):\n");
@@ -1497,8 +1497,8 @@ static void test_real_orphan(void) {
 
 static void test_real_churn(void) {
     struct ps_spawner_cfg cfg = base_cfg();
-    int ctl, base, z;
-    pid_t sp;
+    int ctl = -1, base, z;
+    pid_t sp = -1;
     bool ok = true;
 
     printf("\nreal workers: churn (root):\n");
