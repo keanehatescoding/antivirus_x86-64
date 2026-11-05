@@ -257,10 +257,11 @@ check_privsep() {
        [ "$(proc_field "$spid" CapPrm)" = "00000000000001e0" ] && \
        [ "$(proc_field "$spid" CapBnd)" = "00000000000001e0" ] && \
        [ "$(proc_field "$spid" NoNewPrivs)" = "1" ] && \
-       [ "$(proc_field "$spid" Seccomp)" = "2" ]; then
-        pass "spawner is root cut to four capabilities, NO_NEW_PRIVS, seccomp"
+       [ "$(proc_field "$spid" Seccomp)" = "2" ] && \
+       [ "$(proc_field "$spid" Seccomp_filters)" = "2" ]; then
+        pass "spawner is root cut to four capabilities, NO_NEW_PRIVS, seccomp (unit's + its own)"
     else
-        fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapEff='$(proc_field "$spid" CapEff)' CapPrm='$(proc_field "$spid" CapPrm)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)'"
+        fail "spawner not locked down: Uid='$(proc_field "$spid" Uid)' CapEff='$(proc_field "$spid" CapEff)' CapPrm='$(proc_field "$spid" CapPrm)' CapBnd='$(proc_field "$spid" CapBnd)' NoNewPrivs='$(proc_field "$spid" NoNewPrivs)' Seccomp='$(proc_field "$spid" Seccomp)' Seccomp_filters='$(proc_field "$spid" Seccomp_filters)'"
     fi
 
     # The main process: still root, but cut to the six capabilities it uses
@@ -269,7 +270,8 @@ check_privsep() {
     # process, so EVERY thread is checked: a thread created before the drop
     # (the privsep reader) would keep full root and /proc/<pid>/status alone
     # would not show it. Every thread also carries the main process's seccomp
-    # filter (Stage 2 step 3, installed with TSYNC), so Seccomp is 2 on each.
+    # filter (Stage 2 step 3, installed with TSYNC), so Seccomp is 2 on each,
+    # with two filters stacked: the unit's SystemCallFilter= and its own.
     local t st threads=0 tbad=0
     for t in /proc/"$AVD_PID"/task/[0-9]*; do
         t="${t##*/}"
@@ -289,11 +291,12 @@ check_privsep() {
            [ "$(snap_field "$st" CapBnd)" = "000000000020100f" ] && \
            [ "$(snap_field "$st" CapInh)" = "0000000000000000" ] && \
            [ "$(snap_field "$st" NoNewPrivs)" = "1" ] && \
-           [ "$(snap_field "$st" Seccomp)" = "2" ]; then
+           [ "$(snap_field "$st" Seccomp)" = "2" ] && \
+           [ "$(snap_field "$st" Seccomp_filters)" = "2" ]; then
             :
         else
             tbad=$((tbad + 1))
-            echo "    avd thread $t ($(snap_field "$st" Name)): Uid='$(snap_field "$st" Uid)' CapEff='$(snap_field "$st" CapEff)' CapPrm='$(snap_field "$st" CapPrm)' CapBnd='$(snap_field "$st" CapBnd)' CapInh='$(snap_field "$st" CapInh)' NoNewPrivs='$(snap_field "$st" NoNewPrivs)' Seccomp='$(snap_field "$st" Seccomp)'"
+            echo "    avd thread $t ($(snap_field "$st" Name)): Uid='$(snap_field "$st" Uid)' CapEff='$(snap_field "$st" CapEff)' CapPrm='$(snap_field "$st" CapPrm)' CapBnd='$(snap_field "$st" CapBnd)' CapInh='$(snap_field "$st" CapInh)' NoNewPrivs='$(snap_field "$st" NoNewPrivs)' Seccomp='$(snap_field "$st" Seccomp)' Seccomp_filters='$(snap_field "$st" Seccomp_filters)'"
         fi
     done
     if [ "$threads" -lt 2 ]; then
@@ -311,17 +314,18 @@ check_privsep() {
            [ "$(proc_field "$w" CapBnd)" = "0000000000000000" ] && \
            [ "$(proc_field "$w" CapEff)" = "0000000000000000" ] && \
            [ "$(proc_field "$w" NoNewPrivs)" = "1" ] && \
-           [ "$(proc_field "$w" Seccomp)" = "2" ]; then
+           [ "$(proc_field "$w" Seccomp)" = "2" ] && \
+           [ "$(proc_field "$w" Seccomp_filters)" = "3" ]; then
             :
         else
             bad=$((bad + 1))
-            echo "    worker $w: Uid='$(proc_field "$w" Uid)' CapBnd='$(proc_field "$w" CapBnd)' CapEff='$(proc_field "$w" CapEff)' NoNewPrivs='$(proc_field "$w" NoNewPrivs)' Seccomp='$(proc_field "$w" Seccomp)'"
+            echo "    worker $w: Uid='$(proc_field "$w" Uid)' CapBnd='$(proc_field "$w" CapBnd)' CapEff='$(proc_field "$w" CapEff)' NoNewPrivs='$(proc_field "$w" NoNewPrivs)' Seccomp='$(proc_field "$w" Seccomp)' Seccomp_filters='$(proc_field "$w" Seccomp_filters)'"
         fi
     done
     if [ "$workers" -eq 0 ]; then
         fail "no worker process under the spawner after scans ran"
     elif [ "$bad" -eq 0 ]; then
-        pass "all $workers worker(s) are hyprav-scan with no capabilities, NO_NEW_PRIVS, seccomp"
+        pass "all $workers worker(s) are hyprav-scan with no capabilities, NO_NEW_PRIVS, seccomp (unit's, spawner's, worker's)"
     else
         fail "$bad of $workers worker(s) not fully hardened"
     fi
@@ -365,7 +369,7 @@ cleanup() {
         umount "${MOUNTED[$i]}" 2>/dev/null
     done
     rmmod av 2>/dev/null && echo "  module unloaded"
-    rm -rf "$TEST_TMP_DIR"
+    rm -rf "$TEST_TMP_DIR" "$AVD_UNIT_BUILD_DIR"
 }
 trap cleanup EXIT
 
@@ -538,6 +542,15 @@ fi
 if [ "$PRIVSEP" = 1 ]; then
     section "privilege separation: processes"
     check_privsep
+else
+    # Without privilege separation the unit's SystemCallFilter= is avd's only
+    # filter; after the scans above every thread is still alive under it.
+    section "unit SystemCallFilter="
+    if avd_unit_seccomp_threads "$AVD_PID" 1 && [ "$AVD_UNIT_THREADS" -ge 2 ]; then
+        pass "all $AVD_UNIT_THREADS avd threads are under the unit's filter alone ($AVD_UNIT_SYSCALLS syscalls)"
+    else
+        fail "avd threads not under exactly the unit's seccomp filter ($AVD_UNIT_THREADS threads)"
+    fi
 fi
 
 section "signature added at runtime overrides a cached clean verdict"
