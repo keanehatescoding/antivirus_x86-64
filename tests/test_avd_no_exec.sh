@@ -44,9 +44,10 @@ ALLOW_LIBS='^libmagic\.so'
 # the children to inherit the compiled rules copy-on-write, which an exec
 # would throw away (docs/privilege-separation.md, "The spawner"). Every
 # exec/spawn/system/popen/vfork/clone call stays banned in these files too.
-# Keyed on the file's basename. This allowlist covers the source scan only:
-# the import checks above still require avd itself to import no fork symbol,
-# so the slice that links the spawner into avd must revisit them deliberately.
+# Keyed on the file's basename. Since the spawner is linked into avd
+# (Stage 1e), avd itself imports fork, so its own import check below allows
+# fork and nothing else (SYMS_NO_FORK); this source scan is what keeps the
+# fork() call confined to the spawner.
 FORK_ALLOW_SRC='^privsep_spawner\.h$'
 SYMS_NO_FORK='execl|execle|execlp|execv|execve|execvp|execvpe|fexecve|execveat|vfork|_Fork|clone3?|system|popen|posix_spawnp?|wordexp'
 
@@ -73,15 +74,19 @@ if ! make -C "$AVD_DIR" >/dev/null 2>&1; then
     exit 1
 fi
 
+# imports BINARY [PATTERN] - the dynamic imports of BINARY matching PATTERN
+# (default: $SYMS, the full exec/fork/spawn family).
 imports() {
     nm -D --undefined-only "$1" 2>/dev/null | awk '{print $NF}' |
-        sed 's/@.*//' | grep -Ex "$SYMS" | sort -u | tr '\n' ' '
+        sed 's/@.*//' | grep -Ex "${2:-$SYMS}" | sort -u | tr '\n' ' '
 }
 
 echo "=== avd's own imports ==="
-found="$(imports "$AVD")"
+# fork is allowed (the privsep spawner, see FORK_ALLOW_SRC); every other
+# exec/spawn-family symbol is not.
+found="$(imports "$AVD" "$SYMS_NO_FORK")"
 if [ -z "$found" ]; then
-    pass "avd imports no exec/fork/spawn-family symbol"
+    pass "avd imports no exec/spawn-family symbol (fork only, for the privsep spawner)"
 else
     fail "avd imports: $found"
 fi
