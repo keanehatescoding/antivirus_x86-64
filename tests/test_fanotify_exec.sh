@@ -251,7 +251,9 @@ check_privsep() {
     # would not show it. No seccomp filter yet (Stage 2 step 3), so Seccomp is
     # deliberately not asserted.
     local t threads=0 tbad=0
-    for t in $(ls "/proc/$AVD_PID/task" 2>/dev/null); do
+    for t in /proc/"$AVD_PID"/task/[0-9]*; do
+        t="${t##*/}"
+        [ -d "/proc/$AVD_PID/task/$t" ] || continue # a thread that exited
         threads=$((threads + 1))
         if [ "$(proc_field "$AVD_PID/task/$t" Uid)" = "0 0 0 0" ] && \
            [ "$(proc_field "$AVD_PID/task/$t" CapEff)" = "000000000020100f" ] && \
