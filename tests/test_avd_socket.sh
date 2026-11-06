@@ -43,7 +43,11 @@ for arg in "$@"; do
 done
 # Environment for every avd start below. AVD_PRIVSEP=1 is passed
 # explicitly in privsep mode and left unset otherwise, so the default
-# run keeps testing the default configuration.
+# run keeps testing the default configuration. Unset any inherited
+# value first: `env` passes the caller's environment through, so an
+# exported AVD_PRIVSEP=1 would otherwise turn the baseline run into a
+# privsep run (or make avd exit when hyprav-scan does not exist).
+unset AVD_PRIVSEP
 AVD_ENV=()
 [ "$PRIVSEP" = 1 ] && AVD_ENV=(AVD_PRIVSEP=1)
 
