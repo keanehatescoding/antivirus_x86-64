@@ -527,10 +527,12 @@ section "quarantine and restore a file owned by another uid"
 # CAP_DAC_OVERRIDE (opening the mode-0000 quarantined file) and
 # CAP_CHOWN (giving it back to its owner). restore only logs a failed
 # fchown and still answers OK, so check owner and mode from stat, and
-# check the log for the fchown failure line too. The log check is the
-# one that catches a missing CAP_CHOWN here: quarantine links the
-# original inode, so it is still owned by nobody and the stat check
-# passes even when the fchown back to that owner fails with EPERM.
+# check the log for the fchown failure line too. Quarantine normally
+# links the original inode, so the quarantined file is still owned by
+# nobody; it is chowned to root before restore so that the stat check
+# only passes if restore actually gives it back (a failed or skipped
+# fchown would leave it root-owned). On the copy fallback the
+# quarantined file is root-owned already and the chown changes nothing.
 if FOREIGN_UID="$(id -u nobody 2>/dev/null)" && FOREIGN_GID="$(id -g nobody 2>/dev/null)" && \
    [ "$FOREIGN_UID" != 0 ]; then
     FOREIGN_FILE="$TEST_TMP_DIR/foreign.bin"
@@ -546,6 +548,9 @@ if FOREIGN_UID="$(id -u nobody 2>/dev/null)" && FOREIGN_GID="$(id -g nobody 2>/d
     fi
     QID="$("$AVCTL" quarantine list 2>/dev/null | tail -n +2 | \
            awk -v f="$FOREIGN_FILE" '$0 ~ f {print $1}' | head -1)"
+    if [ -n "$QID" ] && ! chown 0:0 "$TEST_QUARANTINE_DIR/$QID.quarantined"; then
+        fail "could not chown quarantined file $TEST_QUARANTINE_DIR/$QID.quarantined to root"
+    fi
     if [ -n "$QID" ] && "$AVCTL" quarantine restore "$QID" >"$AVCTL_LOG" 2>&1; then
         pass "restore command succeeded"
     else
