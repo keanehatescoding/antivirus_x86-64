@@ -183,12 +183,23 @@ it gets there.
   path later, and if the file was replaced in between (a package
   upgrade, a rename over it) the verdict is for a different file than
   the one running. A `CLEAN` there says nothing about the process. To
-  scan what a process is actually running, have a client that holds
-  `CAP_SYS_PTRACE` (ordinary root) copy `/proc/<pid>/exe` into a
+  scan the image a process is running, copy `/proc/<pid>/exe` into a
   root-only temporary directory and `SCAN` the copy. Reading the link
-  reads the running inode, even if its file was deleted. A `MALICIOUS`
-  verdict then quarantines the copy, not the original executable,
-  and does nothing to the process.
+  reads the running inode, even if its file was deleted. The client
+  needs `CAP_SYS_PTRACE` in the target's user namespace. A root shell
+  normally has it, but root under a reduced bounding set or in a
+  container may not, and the copy then fails the same way. What this
+  does and doesn't tell you:
+  - The verdict is for a snapshot. If the process `exec()`s something
+    else afterwards, the verdict says nothing about the new image.
+  - It covers the executable image only. For a script, `/proc/<pid>/exe`
+    is the interpreter (`python3`, `bash`), so a `CLEAN` says nothing
+    about the script, its modules or anything loaded at run time.
+  - A `MALICIOUS` verdict quarantines the copy, not the original
+    executable, and does nothing to the process. The reply doesn't say
+    whether quarantine succeeded. If it failed (see `avd`'s log), the
+    copy is still in the temporary directory, so remove that directory
+    afterwards whatever the verdict.
 - **`SCAN` shares the kernel-triggered scan queue.** A control-socket
   `SCAN` command enqueues an on-demand task on the same bounded worker
   pool `AV_C_SCAN_REQUEST` uses (size/queue depth runtime-tunable via
