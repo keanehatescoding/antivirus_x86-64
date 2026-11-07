@@ -169,7 +169,8 @@ static const int ps_allow_parent[] = {
     /* descriptors and files */
     SYS_read, SYS_write, SYS_readv, SYS_writev, SYS_pread64, SYS_lseek,
     SYS_close, SYS_dup, SYS_fcntl, SYS_fstat, SYS_newfstatat, SYS_statx,
-    SYS_getdents64, SYS_readlink, SYS_readlinkat, SYS_open, SYS_openat,
+    /* glibc before 2.33 sends stat()/lstat() here, not to newfstatat */
+    SYS_stat, SYS_lstat, SYS_getdents64, SYS_readlink, SYS_readlinkat, SYS_open, SYS_openat,
     SYS_mkdir, SYS_mkdirat, SYS_chmod, SYS_fchmod, SYS_fchmodat, SYS_fchown,
     SYS_linkat, SYS_rename, SYS_renameat, SYS_renameat2, SYS_unlink,
     SYS_unlinkat, SYS_fsync, SYS_fdatasync,

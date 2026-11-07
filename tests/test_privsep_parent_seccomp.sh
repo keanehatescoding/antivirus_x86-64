@@ -133,12 +133,14 @@ static uint32_t run(int nr, uint64_t a0, uint64_t a1, uint64_t a2) {
  * argument constraint, deliberately not derived from the header's table:
  * strace of avd's own threads across the socket and fanotify suites, plus the
  * neighbours glibc may pick instead (readv/writev, *at forms, ppoll, statx,
- * accept4, the time and id getters), plus brk/mremap/rseq/sched_yield. */
+ * accept4, the time and id getters, and stat/lstat, which glibc before 2.33
+ * uses), plus brk/mremap/rseq/sched_yield. */
 static bool want_plain(int nr) {
     switch (nr) {
     case SYS_read: case SYS_write: case SYS_readv: case SYS_writev:
     case SYS_pread64: case SYS_lseek: case SYS_close: case SYS_dup:
     case SYS_fcntl: case SYS_fstat: case SYS_newfstatat: case SYS_statx:
+    case SYS_stat: case SYS_lstat:
     case SYS_getdents64: case SYS_readlink: case SYS_readlinkat:
     case SYS_open: case SYS_openat: case SYS_mkdir: case SYS_mkdirat:
     case SYS_chmod: case SYS_fchmod: case SYS_fchmodat: case SYS_fchown:
@@ -428,10 +430,17 @@ static int install(bool log_only) {
 
 #define INSTALL(lo) do { int r_ = install(lo); if (r_) return r_; } while (0)
 
+/* Exit code for "this check cannot run here"; main() reports it as SKIP. */
+#define T_SKIP 77
+
 static int c_needs_nnp(void) {
     struct ps_parent_filter f = {getpid(), 0, -1, -1, false};
+    int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
 
-    if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0) return 1;
+    if (nnp < 0) return 1;
+    /* Inherited (setpriv --no-new-privs, a sandbox, NoNewPrivileges=): it
+     * cannot be cleared, so there is no way to install without it. */
+    if (nnp == 1) return T_SKIP;
     errno = 0;
     if (ps_seccomp_install_parent(&f) != -1 || errno != EPERM) return 2;
     return 0;
@@ -700,6 +709,10 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
         int r = in_child(t[i].fn);
 
+        if (r == T_SKIP && t[i].want != T_SKIP) {
+            printf("  SKIP: %s (NO_NEW_PRIVS is already set)\n", t[i].label);
+            continue;
+        }
         if (r != t[i].want) printf("    (child returned %d, wanted %d)\n", r, t[i].want);
         CHECK(r == t[i].want, t[i].label);
     }

@@ -804,8 +804,9 @@ threads, not the spawner's or the workers', during the socket and fanotify
 suites with `--privsep`, counted after the main loop starts. Some
 neighbours glibc may pick instead were added: `readv`/`writev`, the `*at`
 forms, `ppoll`, `statx`, `accept4`, the time and id getters, `brk`,
-`mremap`, `rseq` and `sched_yield`. The rest of the filter checks
-arguments:
+`mremap`, `rseq` and `sched_yield`, and `stat`/`lstat`, which glibc before
+2.33 uses for `stat()` and `lstat()` (avd calls `lstat()` in quarantine and
+restore). The rest of the filter checks arguments:
 
 | Call | Allowed |
 | --- | --- |
