@@ -390,7 +390,10 @@ static bool reap_within(pid_t pid, int *st, int ms) {
 
 static int stop_spawner(int ctl, pid_t sp) {
     int st = 0;
-    close(ctl);
+    if (ctl >= 0) close(ctl);
+    /* No spawner (its start failed): sp is -1, and both waitpid(-1) and,
+     * as root, kill(-1, SIGKILL) would reach far beyond it. */
+    if (sp <= 0) return st;
     if (!reap_within(sp, &st, 5000)) {
         printf("    (spawner %d did not exit after its channel closed; killing)\n", (int)sp);
         kill(sp, SIGKILL);
@@ -1378,10 +1381,11 @@ static bool field_is(pid_t pid, const char *key, const char *want) {
 
 static void test_real_spawn(void) {
     struct ps_spawner_cfg cfg = base_cfg();
-    int ctl, r, w, z;
-    pid_t sp, wp;
+    int ctl = -1, r, w, z;
+    pid_t sp = -1, wp;
     struct ps_verdict v;
     char uid[64];
+    bool started;
 
     printf("\nreal workers under the real kernel (root):\n");
     if (!can_spawn_hardened()) {
@@ -1389,7 +1393,9 @@ static void test_real_spawn(void) {
         return;
     }
     ps_test_fail_step = 0;
-    CHECK(ps_spawner_start(&cfg, &ctl, &sp) == 0, "the spawner starts");
+    started = ps_spawner_start(&cfg, &ctl, &sp) == 0;
+    CHECK(started, "the spawner starts");
+    if (!started) return; /* sp is -1: nothing to stop, and kill(-1) as root is fatal */
     send_spawn(ctl, 1);
     r = wait_reply(ctl, 1, 10000);
     CHECK(r >= 0 && REPLY[r].type == PS_MSG_READY, "a hardened worker reports ready");
@@ -1434,8 +1440,8 @@ static void test_real_failures(void) {
         return;
     }
     for (int k = 1; k < PS_H_STEP_COUNT; k++) {
-        int ctl, i;
-        pid_t sp;
+        int ctl = -1, i;
+        pid_t sp = -1;
 
         ps_test_fail_step = k; /* inherited by the spawner and its workers */
         reset_queues();
@@ -1455,8 +1461,8 @@ static void test_real_failures(void) {
 
 static void test_real_orphan(void) {
     struct ps_spawner_cfg cfg = base_cfg();
-    int ctl, r;
-    pid_t sp, wp;
+    int ctl = -1, r;
+    pid_t sp = -1, wp;
     int st = 0;
 
     printf("\nreal workers when the spawner dies (root):\n");
@@ -1466,7 +1472,11 @@ static void test_real_orphan(void) {
     }
     ps_test_fail_step = 0;
     reset_queues();
-    ps_spawner_start(&cfg, &ctl, &sp);
+    if (ps_spawner_start(&cfg, &ctl, &sp) != 0) {
+        /* sp is -1: the cleanup below would kill(-1, SIGKILL) as root */
+        CHECK(false, "the spawner starts");
+        return;
+    }
     send_spawn(ctl, 1);
     r = wait_reply(ctl, 1, 10000);
     if (r < 0 || REPLY[r].type != PS_MSG_READY) {
@@ -1497,8 +1507,8 @@ static void test_real_orphan(void) {
 
 static void test_real_churn(void) {
     struct ps_spawner_cfg cfg = base_cfg();
-    int ctl, base, z;
-    pid_t sp;
+    int ctl = -1, base, z;
+    pid_t sp = -1;
     bool ok = true;
 
     printf("\nreal workers: churn (root):\n");
@@ -1508,7 +1518,10 @@ static void test_real_churn(void) {
     }
     ps_test_fail_step = 0;
     reset_queues();
-    ps_spawner_start(&cfg, &ctl, &sp);
+    if (ps_spawner_start(&cfg, &ctl, &sp) != 0) {
+        CHECK(false, "the spawner starts");
+        return;
+    }
     send_spawn(ctl, 299); /* baseline once the spawner is in its loop */
     if (wait_reply(ctl, 299, 10000) >= 0) close(take_fd(find_reply(299)));
     base = fds_of(sp);
