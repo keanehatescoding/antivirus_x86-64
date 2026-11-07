@@ -44,9 +44,10 @@ ALLOW_LIBS='^libmagic\.so'
 # the children to inherit the compiled rules copy-on-write, which an exec
 # would throw away (docs/privilege-separation.md, "The spawner"). Every
 # exec/spawn/system/popen/vfork/clone call stays banned in these files too.
-# Keyed on the file's basename. This allowlist covers the source scan only:
-# the import checks above still require avd itself to import no fork symbol,
-# so the slice that links the spawner into avd must revisit them deliberately.
+# Keyed on the file's basename. Since the spawner is linked into avd
+# (Stage 1e), avd itself imports fork, so its own import check below allows
+# fork and nothing else (SYMS_NO_FORK); this source scan is what keeps the
+# fork() call confined to the spawner.
 FORK_ALLOW_SRC='^privsep_spawner\.h$'
 SYMS_NO_FORK='execl|execle|execlp|execv|execve|execvp|execvpe|fexecve|execveat|vfork|_Fork|clone3?|system|popen|posix_spawnp?|wordexp'
 
@@ -73,15 +74,19 @@ if ! make -C "$AVD_DIR" >/dev/null 2>&1; then
     exit 1
 fi
 
+# imports BINARY [PATTERN] - the dynamic imports of BINARY matching PATTERN
+# (default: $SYMS, the full exec/fork/spawn family).
 imports() {
     nm -D --undefined-only "$1" 2>/dev/null | awk '{print $NF}' |
-        sed 's/@.*//' | grep -Ex "$SYMS" | sort -u | tr '\n' ' '
+        sed 's/@.*//' | grep -Ex "${2:-$SYMS}" | sort -u | tr '\n' ' '
 }
 
 echo "=== avd's own imports ==="
-found="$(imports "$AVD")"
+# fork is allowed (the privsep spawner, see FORK_ALLOW_SRC); every other
+# exec/spawn-family symbol is not.
+found="$(imports "$AVD" "$SYMS_NO_FORK")"
 if [ -z "$found" ]; then
-    pass "avd imports no exec/fork/spawn-family symbol"
+    pass "avd imports no exec/spawn-family symbol (fork only, for the privsep spawner)"
 else
     fail "avd imports: $found"
 fi
@@ -112,19 +117,54 @@ else
 fi
 
 echo "=== sources ==="
-# Call sites only: the name must start at a word boundary and be
-# followed by an opening parenthesis; lines that start as comments are
-# then dropped crudely. Not grep -w: that also demands a non-word
-# character after the match, which ends in "(", so it would miss
-# execve(path, ...) and system(cmd) and only catch fork().
+# Any use of the name as an identifier, not only a call: "#define SPAWN
+# fork" followed by SPAWN() never spells "fork(", and neither does a
+# function pointer, and avd's import check above already allows fork, so
+# this scan is what confines it to the spawner. Both scans read the
+# sources through strip_comments, so they see code only.
+
+# strip_comments FILE - FILE with comments and the contents of string and
+# character literals removed, one output line per input line so grep -n
+# still points at the source. A small lexer, not a line-at-a-time regex:
+# block comments are tracked across lines (a continuation line of a /* */
+# comment is not code), and a literal is consumed before any comment
+# marker inside it, so the "//" in printf("https://...") does not hide a
+# call later on the same line.
+strip_comments() {
+    awk '
+    {
+        s = $0; n = length(s); out = ""; i = 1
+        while (i <= n) {
+            c = substr(s, i, 1); c2 = substr(s, i, 2)
+            if (in_block) {
+                if (c2 == "*/") { in_block = 0; out = out " "; i += 2 } else i++
+                continue
+            }
+            if (c2 == "/*") { in_block = 1; i += 2; continue }
+            if (c2 == "//") break
+            if (c == "\"" || c == "\047") {
+                q = c; out = out q q; i++
+                while (i <= n) {
+                    d = substr(s, i, 1)
+                    if (d == "\\") { i += 2; continue }
+                    i++
+                    if (d == q) break
+                }
+                continue
+            }
+            out = out c; i++
+        }
+        print out
+    }' "$1"
+}
 hits=""
 for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
     syms="$SYMS"
     if basename "$f" | grep -Eq "$FORK_ALLOW_SRC"; then
         syms="$SYMS_NO_FORK"
     fi
-    found="$(grep -nHE "(^|[^[:alnum:]_])($syms)[[:space:]]*\(" "$f" |
-             grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+    found="$(strip_comments "$f" | grep -nE "(^|[^[:alnum:]_])($syms)([^[:alnum:]_]|$)" |
+             sed "s#^#$f:#" || true)"
     [ -n "$found" ] && hits+="$found"$'\n'
 done
 hits="${hits%$'\n'}"
@@ -148,8 +188,8 @@ for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
     if basename "$f" | grep -Eq "$CLONE_NR_ALLOW_SRC"; then
         nrs="$NRS_NO_CLONE"
     fi
-    found="$(grep -nHE "(^|[^[:alnum:]_])$nrs([^[:alnum:]_]|$)" "$f" |
-             grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+    found="$(strip_comments "$f" | grep -nE "(^|[^[:alnum:]_])$nrs([^[:alnum:]_]|$)" |
+             sed "s#^#$f:#" || true)"
     [ -n "$found" ] && hits+="$found"$'\n'
 done
 hits="${hits%$'\n'}"
