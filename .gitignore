@@ -47,3 +47,6 @@ tests/fuzz/crash-*
 tests/fuzz/leak-*
 tests/fuzz/timeout-*
 tests/fuzz/oom-*
+
+# Local agent instructions
+/AGENTS.md
