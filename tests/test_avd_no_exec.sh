@@ -117,19 +117,24 @@ else
 fi
 
 echo "=== sources ==="
-# Call sites only: the name must start at a word boundary and be
-# followed by an opening parenthesis; lines that start as comments are
-# then dropped crudely. Not grep -w: that also demands a non-word
-# character after the match, which ends in "(", so it would miss
-# execve(path, ...) and system(cmd) and only catch fork().
+# Any use of the name as an identifier, not only a call: "#define SPAWN
+# fork" followed by SPAWN() never spells "fork(", and neither does a
+# function pointer, and avd's import check above already allows fork, so
+# this scan is what confines it to the spawner. Comments and string
+# literals are stripped first (crudely, one line at a time: a // or /* */
+# comment, an unclosed /* to end of line, "..."), then lines that start
+# as comment continuations are dropped.
+strip_comments() {
+    sed -E 's#//.*$##; s#/\*([^*]|\*+[^*/])*\*+/##g; s#/\*.*$##; s#"([^"\\]|\\.)*"#""#g' "$1"
+}
 hits=""
 for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
     syms="$SYMS"
     if basename "$f" | grep -Eq "$FORK_ALLOW_SRC"; then
         syms="$SYMS_NO_FORK"
     fi
-    found="$(grep -nHE "(^|[^[:alnum:]_])($syms)[[:space:]]*\(" "$f" |
-             grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+    found="$(strip_comments "$f" | grep -nE "(^|[^[:alnum:]_])($syms)([^[:alnum:]_]|$)" |
+             grep -vE '^[0-9]+:[[:space:]]*(\*|/\*|//)' | sed "s#^#$f:#" || true)"
     [ -n "$found" ] && hits+="$found"$'\n'
 done
 hits="${hits%$'\n'}"

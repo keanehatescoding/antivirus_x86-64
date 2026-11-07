@@ -372,6 +372,8 @@ static void test_status_helpers(void) {
         volatile size_t small_n = sizeof(small);
         ps_describe_status(SIGSYS, small, small_n);
         CHECK(strlen(small) < sizeof(small), "the description is bounded by the buffer");
+        /* An empty string passes the bound; the text must survive the cut. */
+        CHECK(strcmp(small, "killed by SIGSY") == 0, "the truncated description keeps its prefix");
     }
     {
         char why[160];
