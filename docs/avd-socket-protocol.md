@@ -169,6 +169,18 @@ it gets there.
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
+- **`SCAN /proc/<pid>/exe` fails for another user's process.** Opening
+  that link is a ptrace access check (`PTRACE_MODE_READ_FSCREDS`), and
+  across uids it needs `CAP_SYS_PTRACE`. `avd` holds neither under the
+  shipped unit (`packaging/avd.service` leaves it out of
+  `CapabilityBoundingSet=`) nor with `AVD_PRIVSEP=1` (the main process
+  drops it, see `docs/privilege-separation.md`), so the command answers
+  `ERR could not open path for scanning`. This is deliberate: ptrace
+  over every process is too much to give a long-running daemon for this
+  one case, and the kernel-triggered and fanotify scans never go through
+  `/proc`. `SCAN` already requires a root client, so resolve the link
+  there (`readlink /proc/<pid>/exe`) and `SCAN` the real path. A
+  binary that was deleted after it started can't be scanned this way.
 - **`SCAN` shares the kernel-triggered scan queue.** A control-socket
   `SCAN` command enqueues an on-demand task on the same bounded worker
   pool `AV_C_SCAN_REQUEST` uses (size/queue depth runtime-tunable via
