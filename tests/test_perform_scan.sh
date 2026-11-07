@@ -617,13 +617,17 @@ else
     # A spawner that cannot lock itself down must stop avd at startup, before
     # it reports privilege separation as on, not later when the channel closes.
     # Natural failure injection, no test hook in the binary: start the harness
-    # with CAP_SETPCAP gone from the bounding set. The spawner needs it, and
-    # the lockdown's first step refuses to run without it. Needs setpriv.
+    # with CAP_KILL gone from the bounding set. The spawner needs it, and its
+    # lockdown's first step refuses to run without it. Not CAP_SETPCAP: the
+    # main process's own lockdown (privsep_parent.h) needs that one too and
+    # runs first, so avd would stop there instead, before the spawner's
+    # lockdown is reached. The main process does not keep CAP_KILL, so its
+    # lockdown passes without it. Needs setpriv.
     echo "spawner lockdown failure at startup:"
     if command -v setpriv >/dev/null 2>&1 &&
-       setpriv --bounding-set=-setpcap true 2>/dev/null; then
+       setpriv --bounding-set=-kill true 2>/dev/null; then
         mkdir -p "$BUILD_DIR/work-lockfail"
-        setpriv --bounding-set=-setpcap env HARNESS_PRIVSEP=1 "$BUILD_DIR/harness" \
+        setpriv --bounding-set=-kill env HARNESS_PRIVSEP=1 "$BUILD_DIR/harness" \
             "$BUILD_DIR/work-lockfail" "$BUILD_DIR/clean-sample.txt" \
             > "$BUILD_DIR/out-lockfail.txt" 2> "$BUILD_DIR/err-lockfail.txt"
         rc=$?

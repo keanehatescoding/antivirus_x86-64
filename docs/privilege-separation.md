@@ -17,9 +17,11 @@ privilege separation on (see "End-to-end test with privilege separation on");
 it is a manual run, not a CI job, and it passes, as does
 `tests/test_avd_socket.sh --privsep` (scan, quarantine, restore and delete over
 the control socket). Stage 2 step 2 (the main process drops
-capabilities once the spawner exists, `privsep_parent.h`) is built and tested;
-the parent's seccomp filter (step 3) and the unit's `CapabilityBoundingSet=`
-are not (see "Stage 2").
+capabilities once the spawner exists, `privsep_parent.h`) is built and tested,
+and `packaging/avd.service` now sets `CapabilityBoundingSet=` (the union,
+`0x2011ef`) and `NoNewPrivileges=yes` for every start; the parent's seccomp
+filter (step 3) and the unit's `SystemCallFilter=` are not built (see
+"Stage 2").
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -734,19 +736,12 @@ the drop).
 
 Not done in this step, on purpose:
 
-- **No `packaging/avd.service` change.** `CapabilityBoundingSet=` in the unit
-  applies to every avd start, privilege separation on or not, so it is a
-  change to the default install and gets its own PR now that the list has
-  been confirmed by a run (see above). When it is added it must be the union of the
-  two sets, `0x2011ef` (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_DAC_READ_SEARCH`,
-  `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_CHOWN` for the parent, plus
-  `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`, `CAP_KILL` for the spawner): the
-  spawner's own lockdown fails if its bounding set lacks any of its four, and
-  the parent drops those four itself afterwards.
+- **No `packaging/avd.service` change in this step.** It came in a separate
+  PR, once the list had been confirmed by a run; see "The unit" below.
 - **No seccomp filter on the parent** (step 3), so `Seccomp` in the parent's
   `/proc/<pid>/status` is still 0.
-- **Without `AVD_PRIVSEP=1` nothing changes**: avd is root with every
-  capability, as before.
+- **Without `AVD_PRIVSEP=1` this step changes nothing**: avd keeps whatever
+  the unit's bounding set gives it (see "The unit" below).
 
 `tests/test_privsep_parent.sh` (root; SKIP without it) compiles the production
 header with ASan+UBSan and checks, in forked children, the state read back from
@@ -760,19 +755,37 @@ each step. `tests/test_fanotify_exec.sh --privsep` also reads `CapEff`, `CapPrm`
 `CapInh` and `NoNewPrivs` of every thread of the live avd process from
 `/proc/<pid>/task/<tid>/status`.
 
-#### Step 3 and the unit: still to do
+#### The unit: `CapabilityBoundingSet=` and `NoNewPrivileges=`
+
+`packaging/avd.service` sets, for every start, privilege separation on or not:
+
+- `CapabilityBoundingSet=` to the union of the two sets, `0x2011ef`: the
+  parent's six plus `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP` and `CAP_KILL`
+  for the spawner. The spawner's own lockdown fails if its bounding set lacks
+  any of its four, and with `AVD_PRIVSEP=1` the parent drops those four itself
+  afterwards. Without `AVD_PRIVSEP=1`, avd runs with these ten instead of all
+  of them.
+- `NoNewPrivileges=yes`. avd never `exec()`s, so this costs nothing.
+
+Still no filesystem sandboxing, which the unit comment explains. The
+end-to-end tests run avd outside systemd (virtme-ng has no systemd as init),
+so `tests/avd_unit_caps.sh` reads both settings out of the unit file and
+starts avd under `setpriv --bounding-set ... --no-new-privs`, which gives a
+root process the same capabilities systemd would. `tests/test_avd_socket.sh`
+and `tests/test_fanotify_exec.sh` start every avd that way and the socket
+test checks `CapBnd` and `NoNewPrivs` of the running daemon. All four runs
+pass in a virtme-ng guest (socket 28 and 30 checks, fanotify 28 and 33,
+without and with `--privsep`), and removing `CAP_SETPCAP` from the unit makes
+avd refuse to start with `AVD_PRIVSEP=1` (parent lockdown step 1).
+
+#### Step 3: still to do
 
 - The parent's seccomp filter, excluding `execve`, `ptrace`, module loading and
   so on. The allowlist has to come from a traced run (log-only first), not from
   reading the code.
-- `NoNewPrivileges=yes`, `CapabilityBoundingSet=` and `SystemCallFilter=` in
-  `packaging/avd.service`, without filesystem sandboxing, which the unit
-  comment rightly avoids. Those settings apply to the whole unit including
-  the spawner, so the unit's bounding set has to be the union above and its
-  syscall filter a superset of the spawner's and the worker's (see "Seccomp
-  filters stack"). The unit comment is also worth rewording: avd cannot be
-  confined to a restricted filesystem view, but it can still be confined in
-  capabilities and syscalls.
+- `SystemCallFilter=` in the unit. It applies to the whole unit including the
+  spawner and workers, so it has to be a superset of the spawner's and the
+  worker's filters (see "Seccomp filters stack").
 
 ## Rollout
 
@@ -888,8 +901,8 @@ reads a real spawner back from `/proc` (four capabilities in every set,
 both filters), injects a failure at each lockdown step, shows that a missing
 `CAP_SETPCAP` or a wrong parent pid is refused before anything serves, and
 kills avd to show the locked-down spawner dies with it. The suite also runs
-cleanly inside a bounding set already cut to the four capabilities (the
-packaged unit's future `CapabilityBoundingSet=`), where the first refusal
+cleanly inside a bounding set already cut to the four capabilities (a
+stricter set than the packaged unit's `CapabilityBoundingSet=`), where the first refusal
 moves from the bounding-set step to the capabilities step. `tests/test_perform_scan.sh`
 reads the spawner back from inside the real avd and checks that a spawner that
 cannot lock itself down stops avd at startup.
@@ -989,9 +1002,8 @@ cannot lock itself down stops avd at startup.
   end-to-end scripts need root, a module build and (for fanotify) a VM. A job
   that does would be the safety net Stage 2 wants; it is a separate piece of
   work.
-- Stage 2 step 3 (the parent's seccomp filter, log-only first) and the unit's
-  `CapabilityBoundingSet=`; see "Stage 2". Step 2's capability list is
-  confirmed by the two `--privsep` runs (see "Step 2 as built").
+- Stage 2 step 3: the parent's seccomp filter (log-only first) and the
+  unit's `SystemCallFilter=`; see "Stage 2".
 
 ### End-to-end test with privilege separation on
 

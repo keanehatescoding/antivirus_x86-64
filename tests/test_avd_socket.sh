@@ -62,6 +62,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091 # sourced at runtime; lint it on its own
 . "$REPO_ROOT/tests/avd_guard.sh"
 avd_guard || exit 1
+# Every avd below starts under the shipped unit's CapabilityBoundingSet=
+# and NoNewPrivileges=, the way systemd starts it.
+# shellcheck disable=SC1091 # sourced at runtime; lint it on its own
+. "$REPO_ROOT/tests/avd_unit_caps.sh"
+avd_unit_wrap "$REPO_ROOT/packaging/avd.service" || exit 1
 AV_DIR="$REPO_ROOT/av"
 AVD_DIR="$REPO_ROOT/userspace/avd"
 AVCTL_DIR="$REPO_ROOT/userspace/avctl"
@@ -176,7 +181,7 @@ cp "$REPO_ROOT"/rules/*.yar "$TEST_RULES_DIR"/
 cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 (
     cd "$REPO_ROOT" || exit 1
-    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} "${AVD_UNIT_WRAP[@]}" stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -200,6 +205,18 @@ if [ "$PRIVSEP" = 1 ]; then
         cat "$AVD_LOG"
         exit 1
     fi
+fi
+# Proves the unit's restrictions reached avd. With privilege separation
+# on, the main thread has since cut its bounding set to the six parent
+# capabilities (0x20100f, privsep_parent.h), a subset of the unit's.
+WANT_BND="$AVD_UNIT_CAPBND"
+[ "$PRIVSEP" = 1 ] && WANT_BND=000000000020100f
+GOT_BND="$(sed -n 's/^CapBnd:[[:space:]]*//p' "/proc/$AVD_PID/status" 2>/dev/null)"
+GOT_NNP="$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' "/proc/$AVD_PID/status" 2>/dev/null)"
+if [ "$GOT_BND" = "$WANT_BND" ] && [ "$GOT_NNP" = 1 ]; then
+    pass "avd runs under the unit's bounding set and NoNewPrivileges (CapBnd $GOT_BND)"
+else
+    fail "avd CapBnd='$GOT_BND' NoNewPrivs='$GOT_NNP', expected '$WANT_BND' and 1"
 fi
 
 export AVD_SOCK_PATH="$TEST_SOCK_PATH"
@@ -357,7 +374,8 @@ TEST_HOLD_DIR="$TEST_TMP_DIR/scan_hold"
 mkdir -p "$TEST_HOLD_DIR"
 (
     cd "$REPO_ROOT" || exit 1
-    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" stdbuf -oL \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" \
+        "${AVD_UNIT_WRAP[@]}" stdbuf -oL \
         "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
@@ -448,7 +466,7 @@ done
 rm -f "$TEST_SOCK_PATH"
 (
     cd "$REPO_ROOT" || exit 1
-    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} "${AVD_UNIT_WRAP[@]}" stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
