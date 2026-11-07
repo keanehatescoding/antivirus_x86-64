@@ -609,7 +609,17 @@ static int c_kill_spawner(void) {
 }
 
 static int c_kill_probe(void) { INSTALL(false); kill(spawner, 0); return 1; }
-static int c_kill_parent(void) { INSTALL(false); kill(getppid(), SIGKILL); return 1; }
+/* A throwaway target, made before the filter: getppid() is not allowed, so
+ * kill(getppid(), ...) died there and never reached kill(). Killing the real
+ * parent would also take the runner down if the kill() check regressed. */
+static int c_kill_parent(void) {
+    pid_t other = sleeper();
+
+    if (other < 0) return 1;
+    INSTALL(false);
+    kill(other, SIGKILL);
+    return 2;
+}
 
 /* abort() is tgkill(getpid(), gettid(), SIGABRT): SIGABRT, not SIGSYS. */
 static int c_abort(void) { INSTALL(false); abort(); }
