@@ -169,6 +169,15 @@ it gets there.
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
+- **A `CLEAN` from `SCAN` can be inconclusive.** Some checks can fail to
+  run: the rules aren't loaded, a YARA scan errors or times out, a
+  fuzzy or TLSH hash fails, or (with `AVD_PRIVSEP=1`) no worker is
+  available or the worker fails. avd then fails open and the scan is
+  marked inconclusive internally. That marker isn't sent: the reply row
+  says `CLEAN`, and `VERDICTS RECENT` records it as `CLEAN` too. The
+  only sign is avd's log, which names the check that didn't run (for
+  example `yr_rules_scan_fd(...) failed` or `result inconclusive`).
+  Before relying on a `CLEAN`, check the log for that path.
 - **`SCAN /proc/<pid>/exe` fails for another user's process.** Opening
   that link is a ptrace access check (`PTRACE_MODE_READ_FSCREDS`), and
   across uids it needs `CAP_SYS_PTRACE`, which `avd` doesn't have under
