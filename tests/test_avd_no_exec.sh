@@ -59,6 +59,12 @@ SYMS_NO_FORK='execl|execle|execlp|execv|execve|execvp|execvpe|fexecve|execveat|v
 # allowance above, and the source scan only.
 CLONE_NR_ALLOW_SRC='^privsep_lockdown\.h$'
 
+# The main process's filter (#103 Stage 2 step 3, privsep_parent.h) names
+# clone, to allow exactly pthread_create()'s flags, and clone3, to answer it
+# ENOSYS so glibc falls back to clone. Neither is a call. In that file alone
+# both numbers are exempt; execve/execveat/fork/vfork stay banned there.
+THREAD_NR_ALLOW_SRC='^privsep_parent\.h$'
+
 PASS=0
 FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -147,11 +153,14 @@ fi
 # through a variable is caught too.
 NRS='(SYS|__NR)_(execve|execveat|fork|vfork|clone|clone3)'
 NRS_NO_CLONE='(SYS|__NR)_(execve|execveat|fork|vfork|clone3)'
+NRS_NO_THREAD='(SYS|__NR)_(execve|execveat|fork|vfork)'
 hits=""
 for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
     nrs="$NRS"
     if basename "$f" | grep -Eq "$CLONE_NR_ALLOW_SRC"; then
         nrs="$NRS_NO_CLONE"
+    elif basename "$f" | grep -Eq "$THREAD_NR_ALLOW_SRC"; then
+        nrs="$NRS_NO_THREAD"
     fi
     found="$(grep -nHE "(^|[^[:alnum:]_])$nrs([^[:alnum:]_]|$)" "$f" |
              grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"

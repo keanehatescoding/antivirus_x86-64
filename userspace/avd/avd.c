@@ -2520,6 +2520,44 @@ static void privsep_stop(void) {
   ps_client_stop(&privsep_cl);
 }
 
+/* The main process's seccomp filter (#103, Stage 2 step 3; see
+ * privsep_parent.h). AVD_PRIVSEP_SECCOMP=log makes it log instead of kill. */
+static bool privsep_seccomp_log;
+/* Created before the filter is installed: the filter allows connect() on
+ * this descriptor only, for the shutdown wake-up of the control thread. */
+static int control_wake_fd = -1;
+
+/* Called once startup is complete, from the main thread, with every
+ * long-lived thread already running. Fails closed. */
+static int privsep_install_filter(bool control_started) {
+  struct ps_parent_filter f;
+
+  if (control_started) {
+    control_wake_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (control_wake_fd < 0) {
+      fprintf(stderr, "avd: privsep: could not create the control wake-up "
+                      "socket: %s\n",
+              strerror(errno));
+      return -1;
+    }
+  }
+  memset(&f, 0, sizeof(f));
+  f.self_pid = getpid();
+  f.spawner_pid = privsep_cl.spawner_pid;
+  f.wake_fd = control_wake_fd;
+  f.fan_fd = fan_fd;
+  f.log_only = privsep_seccomp_log;
+  if (ps_seccomp_install_parent(&f) != 0) {
+    fprintf(stderr, "avd: privsep: could not install the seccomp filter: %s\n",
+            strerror(errno));
+    return -1;
+  }
+  printf("avd: privsep: seccomp filter on in the main process (%s)\n",
+         privsep_seccomp_log ? "log only, AVD_PRIVSEP_SECCOMP=log"
+                             : "enforcing");
+  return 0;
+}
+
 /* Called by a scan thread as it exits. */
 static void privsep_release_thread_worker(void) {
   if (privsep_enabled && privsep_w_init)
@@ -4978,6 +5016,7 @@ static int parse_tunable_env(const char *env_name, int default_val,
 }
 
 int main(int argc, char **argv) {
+  int exit_status = 0;
   const char *rules_dir = DEFAULT_RULES_DIR;
   const char *corpus_file = DEFAULT_CORPUS_FILE;
   const char *tlsh_corpus_file = DEFAULT_TLSH_CORPUS_FILE;
@@ -5066,6 +5105,22 @@ int main(int argc, char **argv) {
     const char *ps_env = getenv("AVD_PRIVSEP");
 
     privsep_requested = ps_env && strcmp(ps_env, "1") == 0;
+  }
+  /* Unset or "kill": enforce. "log": log what the filter would have killed
+   * and let it through. Anything else is refused, so a typo cannot quietly
+   * leave the filter in a mode nobody asked for. */
+  {
+    const char *sc_env = getenv("AVD_PRIVSEP_SECCOMP");
+
+    if (sc_env && strcmp(sc_env, "log") == 0) {
+      privsep_seccomp_log = true;
+    } else if (sc_env && *sc_env && strcmp(sc_env, "kill") != 0) {
+      fprintf(stderr,
+              "avd: AVD_PRIVSEP_SECCOMP must be \"kill\" or \"log\", not "
+              "\"%s\" - aborting\n",
+              sc_env);
+      return 1;
+    }
   }
 
   printf("avd: quarantine directory: %s\n", quarantine_dir);
@@ -5365,6 +5420,18 @@ int main(int argc, char **argv) {
       }
     }
 
+    /* Last step of startup with privilege separation on: from here the main
+     * process only serves, so it gives up every syscall serving does not
+     * need (privsep_parent.h). If that fails avd stops, through the normal
+     * shutdown below, rather than serve without the filter it was asked to
+     * run under. */
+    if (privsep_enabled && privsep_install_filter(control_started) != 0) {
+      fprintf(stderr, "avd: privilege separation could not be completed - "
+                      "shutting down\n");
+      exit_status = 1;
+      atomic_store(&running, 0);
+    }
+
     /* Wait in poll(), not inside libnl: nl_recvmsgs_default() retries
      * an EINTR'd recvmsg() itself, so it is only entered once the
      * socket is readable. A termination signal both EINTRs the poll()
@@ -5447,8 +5514,12 @@ int main(int argc, char **argv) {
        * harmless), which is fine since this only happens once, at
        * shutdown. */
       {
-        int wake_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        /* Under the seccomp filter socket() is gone and connect() works only
+         * on the descriptor privsep_install_filter() made in advance. */
+        int wake_fd = control_wake_fd >= 0 ? control_wake_fd
+                                           : socket(AF_UNIX, SOCK_STREAM, 0);
 
+        control_wake_fd = -1;
         if (wake_fd >= 0) {
           struct sockaddr_un wake_addr;
 
@@ -5477,5 +5548,5 @@ int main(int argc, char **argv) {
   free(fan_cache);
   free(fan_sigs);
   free(fan_marked_devs);
-  return 0;
+  return exit_status;
 }
