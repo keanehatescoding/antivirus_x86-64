@@ -21,8 +21,10 @@ capabilities once the spawner exists, `privsep_parent.h`) is built and tested,
 and `packaging/avd.service` now sets `CapabilityBoundingSet=` (the union,
 `0x2011ef`) and `NoNewPrivileges=yes` for every start. Stage 2 step 3, the
 main process's own seccomp filter, is built and enforcing with `AVD_PRIVSEP=1`
-(`AVD_PRIVSEP_SECCOMP=log` for log-only); the unit's `SystemCallFilter=` is
-not built (see "Stage 2").
+(`AVD_PRIVSEP_SECCOMP=log` for log-only), and the unit now sets
+`SystemCallFilter=` and `SystemCallArchitectures=native` for every start,
+privilege separation on or not (see "The unit: `SystemCallFilter=`"). That
+completes Stage 2.
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -573,10 +575,11 @@ strictest result wins. Three consequences:
    `poll`, the credential, capability and rlimit calls, `prctl`). A narrow
    spawner filter would kill the workers it creates. The tight worker-only filter above is installed last, inside the
    worker, after hardening.
-2. A `SystemCallFilter=` in `packaging/avd.service` applies to the whole unit,
-   spawner and workers included, so it must be a superset of both as well.
-   The spawner also calls `signalfd4` before it locks itself down, so that
-   filter has to allow it too, though the spawner's own filter does not.
+2. The `SystemCallFilter=` in `packaging/avd.service` (built, see "The unit:
+   `SystemCallFilter=`") applies to the whole unit, main process, spawner and
+   workers included, so it is a superset of all three filters. The spawner
+   also calls `signalfd4` before it locks itself down, so the unit's filter
+   allows it too, though the spawner's own filter does not.
 3. The main process installs its own Stage 2 filter only after it has forked
    the spawner, so the spawner does not inherit it. It is in fact the last
    step of startup, once every thread exists, with
@@ -863,9 +866,46 @@ In a virtme-ng guest these all pass:
 
 The kernel logged no seccomp audit records during the log-mode runs.
 
-**Still to do:** `SystemCallFilter=` in the unit. It applies to the whole
-unit, spawner and workers included, so it has to be a superset of all three
-filters (see "Seccomp filters stack").
+#### The unit: `SystemCallFilter=`
+
+`packaging/avd.service` sets, for every start:
+
+```
+SystemCallArchitectures=native
+SystemCallFilter=@system-service fanotify_init fanotify_mark
+SystemCallFilter=~@aio @keyring @memlock @resources userfaultfd
+```
+
+Without `AVD_PRIVSEP=1` this is avd's only syscall filter. With it, it is the
+outermost of the stack: the main process carries it and its own filter (two),
+the spawner it and its own (two), a worker those two and the worker filter
+(three). The list comes from `strace -f` runs of the socket and fanotify
+suites, with and without `--privsep`: avd, the spawner and the workers make
+78 distinct calls between exec and exit, all in `@system-service` except
+`fanotify_init` and `fanotify_mark`. The `~` line takes out groups avd never
+uses (async I/O and io_uring, the kernel keyring, `mlock`, `setrlimit` and
+the other `@resources` calls; the spawner sets worker limits with `prlimit64`,
+which is in `@default`) and `userfaultfd`. None of the 78 is in those groups.
+On systemd 262 the filter allows 365 calls.
+
+No `SystemCallErrorNumber=`: a call outside the list kills avd with `SIGSYS`,
+as avd's own filters do, so a missing entry shows up as a crash and a restart
+(`Restart=on-failure`), not as a scan that quietly does less.
+
+The end-to-end tests have no systemd to install it, so `tests/avd_unit_caps.sh`
+reads the two `SystemCallFilter=` lines (it accepts only an allowlist first and
+`~` lines after it), expands the groups with `systemd-analyze syscall-filter`,
+subtracts, and builds `tests/avd_unit_seccomp.c` (libseccomp), which installs
+the result the way systemd does: kill on anything else or any other
+architecture, plus the calls systemd always allows (`execve`, `exit_group`,
+`rt_sigreturn`, the clock reads and sleeps). Every avd in both suites starts
+under `setpriv ... -- avd_unit_seccomp NAME... -- avd`. The suites check
+`Seccomp` 2 and the `Seccomp_filters` counts above on every avd thread, the
+spawner and each worker. All four runs pass in a virtme-ng guest (socket 29
+checks without `--privsep` and 32 with it, fanotify 29 and 34). Two limits:
+the emulation trusts the host's `systemd-analyze` to expand the groups as the
+systemd that runs the unit will, and it does not check that the real systemd
+runs the unit at all. That check is the first start of the installed unit.
 
 ## Rollout
 
@@ -1082,11 +1122,12 @@ cannot lock itself down stops avd at startup.
   end-to-end scripts need root, a module build and (for fanotify) a VM. A job
   that does would be the safety net Stage 2 wants; it is a separate piece of
   work.
-- The unit's `SystemCallFilter=`, the last piece of Stage 2; see "Step 3 as
-  built".
-- The parent's filter has been traced and tested on one distribution (glibc
-  2.44, Linux 7.3). Before it is enabled elsewhere, run once with
-  `AVD_PRIVSEP_SECCOMP=log` and check the audit log.
+- The parent's filter and the unit's `SystemCallFilter=` have been traced and
+  tested on one distribution (glibc 2.44, Linux 7.3, systemd 262). Before the
+  parent filter is enabled elsewhere, run once with `AVD_PRIVSEP_SECCOMP=log`
+  and check the audit log. The unit filter has no log mode; on a new distribution, a
+  gap shows as avd killed by `SIGSYS`, with the call in the audit log (or in
+  the core dump's signal info).
 
 ### End-to-end test with privilege separation on
 
