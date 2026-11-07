@@ -169,6 +169,26 @@ it gets there.
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
+- **`SCAN /proc/<pid>/exe` fails for another user's process.** Opening
+  that link is a ptrace access check (`PTRACE_MODE_READ_FSCREDS`), and
+  across uids it needs `CAP_SYS_PTRACE`, which `avd` doesn't have under
+  the shipped unit (`packaging/avd.service` leaves it out of
+  `CapabilityBoundingSet=`) or with `AVD_PRIVSEP=1` (the main process
+  drops it, see `docs/privilege-separation.md`), so the command answers
+  `ERR could not open path for scanning`. This is deliberate: ptrace
+  over every process is too much to give a long-running daemon for this
+  one case, and the kernel-triggered and fanotify scans never go through
+  `/proc`. Don't work around it by resolving the link
+  (`readlink /proc/<pid>/exe`) and scanning that path: avd opens the
+  path later, and if the file was replaced in between (a package
+  upgrade, a rename over it) the verdict is for a different file than
+  the one running. A `CLEAN` there says nothing about the process. To
+  scan what a process is actually running, have a client that holds
+  `CAP_SYS_PTRACE` (ordinary root) copy `/proc/<pid>/exe` into a
+  root-only temporary directory and `SCAN` the copy. Reading the link
+  reads the running inode, even if its file was deleted. A `MALICIOUS`
+  verdict then quarantines the copy, not the original executable,
+  and does nothing to the process.
 - **`SCAN` shares the kernel-triggered scan queue.** A control-socket
   `SCAN` command enqueues an on-demand task on the same bounded worker
   pool `AV_C_SCAN_REQUEST` uses (size/queue depth runtime-tunable via
