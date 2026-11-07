@@ -120,12 +120,42 @@ echo "=== sources ==="
 # Any use of the name as an identifier, not only a call: "#define SPAWN
 # fork" followed by SPAWN() never spells "fork(", and neither does a
 # function pointer, and avd's import check above already allows fork, so
-# this scan is what confines it to the spawner. Comments and string
-# literals are stripped first (crudely, one line at a time: a // or /* */
-# comment, an unclosed /* to end of line, "..."), then lines that start
-# as comment continuations are dropped.
+# this scan is what confines it to the spawner. Both scans read the
+# sources through strip_comments, so they see code only.
+
+# strip_comments FILE - FILE with comments and the contents of string and
+# character literals removed, one output line per input line so grep -n
+# still points at the source. A small lexer, not a line-at-a-time regex:
+# block comments are tracked across lines (a continuation line of a /* */
+# comment is not code), and a literal is consumed before any comment
+# marker inside it, so the "//" in printf("https://...") does not hide a
+# call later on the same line.
 strip_comments() {
-    sed -E 's#//.*$##; s#/\*([^*]|\*+[^*/])*\*+/##g; s#/\*.*$##; s#"([^"\\]|\\.)*"#""#g' "$1"
+    awk '
+    {
+        s = $0; n = length(s); out = ""; i = 1
+        while (i <= n) {
+            c = substr(s, i, 1); c2 = substr(s, i, 2)
+            if (in_block) {
+                if (c2 == "*/") { in_block = 0; out = out " "; i += 2 } else i++
+                continue
+            }
+            if (c2 == "/*") { in_block = 1; i += 2; continue }
+            if (c2 == "//") break
+            if (c == "\"" || c == "\047") {
+                q = c; out = out q q; i++
+                while (i <= n) {
+                    d = substr(s, i, 1)
+                    if (d == "\\") { i += 2; continue }
+                    i++
+                    if (d == q) break
+                }
+                continue
+            }
+            out = out c; i++
+        }
+        print out
+    }' "$1"
 }
 hits=""
 for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
@@ -134,7 +164,7 @@ for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
         syms="$SYMS_NO_FORK"
     fi
     found="$(strip_comments "$f" | grep -nE "(^|[^[:alnum:]_])($syms)([^[:alnum:]_]|$)" |
-             grep -vE '^[0-9]+:[[:space:]]*(\*|/\*|//)' | sed "s#^#$f:#" || true)"
+             sed "s#^#$f:#" || true)"
     [ -n "$found" ] && hits+="$found"$'\n'
 done
 hits="${hits%$'\n'}"
@@ -158,8 +188,8 @@ for f in "$AVD_DIR"/*.c "$AVD_DIR"/*.h; do
     if basename "$f" | grep -Eq "$CLONE_NR_ALLOW_SRC"; then
         nrs="$NRS_NO_CLONE"
     fi
-    found="$(grep -nHE "(^|[^[:alnum:]_])$nrs([^[:alnum:]_]|$)" "$f" |
-             grep -vE '^[^:]+:[0-9]+:[[:space:]]*(\*|/\*|//)' || true)"
+    found="$(strip_comments "$f" | grep -nE "(^|[^[:alnum:]_])$nrs([^[:alnum:]_]|$)" |
+             sed "s#^#$f:#" || true)"
     [ -n "$found" ] && hits+="$found"$'\n'
 done
 hits="${hits%$'\n'}"
