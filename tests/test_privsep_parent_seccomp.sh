@@ -394,11 +394,16 @@ static int in_child(int (*fn)(void)) {
 
 #define KILLED_SIGSYS (100 + SIGSYS)
 
-static pid_t sleeper(void) {
+/* gate >= 0: block reading it before PR_SET_PDEATHSIG, so a test can make the
+ * parent exit inside that window (c_sleeper_orphaned). */
+static pid_t sleeper_gated(int gate) {
     pid_t parent = getpid();
     pid_t p = fork();
 
     if (p == 0) {
+        char c;
+
+        if (gate >= 0) while (read(gate, &c, 1) < 0 && errno == EINTR) {}
         prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0); /* dies with the child */
         /* The parent may have died before the prctl(); a subreaper, not
          * PID 1, may have adopted us, so compare against the original. */
@@ -408,6 +413,8 @@ static pid_t sleeper(void) {
     }
     return p;
 }
+
+static pid_t sleeper(void) { return sleeper_gated(-1); }
 
 static int wake_fd = -1;
 static pid_t spawner = -1;
@@ -624,6 +631,71 @@ static int c_kill_parent(void) {
     return 2;
 }
 
+/* "PPid:\t<n>" from /proc/<pid>/status, or -1. */
+static pid_t ppid_of(pid_t pid) {
+    char path[64], buf[4096], *l;
+    int fd;
+    ssize_t n;
+
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    l = strstr(buf, "\nPPid:\t");
+    return l ? (pid_t)atoi(l + 7) : -1;
+}
+
+/* The window sleeper() guards: its parent exits before PR_SET_PDEATHSIG is
+ * set and a subreaper (this process), not PID 1, adopts it. It must see that
+ * and exit, not pause() forever holding the runner's stdout open. The wait is
+ * bounded and the sleeper is killed on any failure. */
+static int c_sleeper_orphaned(void) {
+    int gate[2], rep[2], st, rc = 0;
+    pid_t mid, s = -1;
+
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) return 1;
+    if (pipe2(gate, O_CLOEXEC) != 0 || pipe2(rep, O_CLOEXEC) != 0) return 2;
+    fflush(NULL);
+    mid = fork();
+    if (mid < 0) return 3;
+    if (mid == 0) {
+        close(gate[1]); /* only we hold the write end: closing it opens the gate */
+        close(rep[0]);
+        s = sleeper_gated(gate[0]);
+        _exit(s < 0 || write(rep[1], &s, sizeof(s)) != sizeof(s));
+    }
+    close(gate[0]);
+    close(rep[1]);
+    if (read(rep[0], &s, sizeof(s)) != sizeof(s)) s = -1;
+    close(rep[0]);
+    if (waitpid(mid, &st, 0) != mid || !WIFEXITED(st) || WEXITSTATUS(st) != 0 || s <= 0) {
+        rc = 4;
+        goto out;
+    }
+    /* the parent is gone and we, not PID 1, adopted the sleeper */
+    if (ppid_of(s) != getpid()) { rc = 5; goto out; }
+    close(gate[1]);
+    gate[1] = -1;
+    for (int i = 0; i < 500; i++) { /* 5 s */
+        pid_t w = waitpid(s, &st, WNOHANG);
+
+        if (w == s) {
+            s = -1;
+            return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 6;
+        }
+        if (w < 0) { s = -1; return 7; }
+        nanosleep(&(struct timespec){0, 10 * 1000 * 1000}, NULL);
+    }
+    rc = 8; /* still running: it missed that it was orphaned */
+out:
+    if (gate[1] >= 0) close(gate[1]);
+    if (s > 0) { kill(s, SIGKILL); waitpid(s, &st, 0); }
+    return rc;
+}
+
 /* abort() is tgkill(getpid(), gettid(), SIGABRT): SIGABRT, not SIGSYS. */
 static int c_abort(void) { INSTALL(false); abort(); }
 
@@ -701,6 +773,7 @@ int main(int argc, char **argv) {
         {"kill(spawner, SIGKILL) works", c_kill_spawner, 0},
         {"kill(spawner, 0) is killed with SIGSYS", c_kill_probe, KILLED_SIGSYS},
         {"kill() of another process is killed with SIGSYS", c_kill_parent, KILLED_SIGSYS},
+        {"a sleeper orphaned before PR_SET_PDEATHSIG and adopted by a subreaper exits", c_sleeper_orphaned, 0},
         {"abort() still raises SIGABRT (tgkill on itself)", c_abort, 100 + SIGABRT},
         {"log mode lets denied calls through, keeps the errno answers, and stacks under an enforcing filter", c_log_mode, KILLED_SIGSYS},
         {"files, time, randomness, malloc and stdio still work under the filter", c_ordinary, 0},
