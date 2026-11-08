@@ -395,14 +395,16 @@ static int in_child(int (*fn)(void)) {
 #define KILLED_SIGSYS (100 + SIGSYS)
 
 /* gate >= 0: block reading it before PR_SET_PDEATHSIG, so a test can make the
- * parent exit inside that window (c_sleeper_orphaned). */
-static pid_t sleeper_gated(int gate) {
+ * parent exit inside that window (c_sleeper_orphaned). drop >= 0 is closed in
+ * the sleeper first, so it holds no copy of a descriptor the test waits on. */
+static pid_t sleeper_gated(int gate, int drop) {
     pid_t parent = getpid();
     pid_t p = fork();
 
     if (p == 0) {
         char c;
 
+        if (drop >= 0) close(drop);
         if (gate >= 0) while (read(gate, &c, 1) < 0 && errno == EINTR) {}
         prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0); /* dies with the child */
         /* The parent may have died before the prctl(); a subreaper, not
@@ -414,7 +416,7 @@ static pid_t sleeper_gated(int gate) {
     return p;
 }
 
-static pid_t sleeper(void) { return sleeper_gated(-1); }
+static pid_t sleeper(void) { return sleeper_gated(-1, -1); }
 
 static int wake_fd = -1;
 static pid_t spawner = -1;
@@ -664,7 +666,9 @@ static int c_sleeper_orphaned(void) {
     if (mid == 0) {
         close(gate[1]); /* only we hold the write end: closing it opens the gate */
         close(rep[0]);
-        s = sleeper_gated(gate[0]);
+        /* the sleeper must not keep rep[1]: if we die before writing, our
+         * reader would never see EOF and would never open the gate */
+        s = sleeper_gated(gate[0], rep[1]);
         _exit(s < 0 || write(rep[1], &s, sizeof(s)) != sizeof(s));
     }
     close(gate[0]);
