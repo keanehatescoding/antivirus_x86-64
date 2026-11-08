@@ -395,11 +395,14 @@ static int in_child(int (*fn)(void)) {
 #define KILLED_SIGSYS (100 + SIGSYS)
 
 static pid_t sleeper(void) {
+    pid_t parent = getpid();
     pid_t p = fork();
 
     if (p == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0); /* dies with the child */
-        if (getppid() == 1) _exit(0);
+        /* The parent may have died before the prctl(); a subreaper, not
+         * PID 1, may have adopted us, so compare against the original. */
+        if (getppid() != parent) _exit(0);
         pause();
         _exit(0);
     }
