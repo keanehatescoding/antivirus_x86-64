@@ -209,6 +209,13 @@ if [ "$PRIVSEP" = 1 ]; then
         cat "$AVD_LOG"
         exit 1
     fi
+    # The control socket exists before the filter goes on (it is the last
+    # step of startup), so wait for the outcome rather than read it early.
+    for _ in $(seq 1 50); do
+        grep -qE "seccomp filter on in the main process|could not install the seccomp filter" "$AVD_LOG" && break
+        kill -0 "$AVD_PID" 2>/dev/null || break
+        sleep 0.2
+    done
     if grep -qF "avd: privsep: seccomp filter on in the main process ($SECCOMP_WANT)" "$AVD_LOG"; then
         pass "avd reports its seccomp filter on ($SECCOMP_WANT)"
     else
