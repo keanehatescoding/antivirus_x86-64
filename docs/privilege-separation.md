@@ -796,8 +796,14 @@ every existing thread gets the filter too. TSYNC needs `NO_NEW_PRIVS`, which
 the step 2 lockdown has already set. Because it goes on last, startup-only
 calls stay out of the allowlist: `socket`, `bind`, `listen`,
 `fanotify_init`, `capset`, `prctl`, `fork` and `getsockname` are all
-missing from it. If the install fails, avd shuts down through its normal path
-and exits 1. It does not serve unfiltered.
+missing from it. Until the install is done nothing is served: the scan
+workers take no task and the control thread accepts no connection (clients
+wait in the listen backlog), and fanotify execs seen meanwhile wait in the
+queue, under the listener's usual watchdog. If the install fails, avd shuts
+down through its normal path and exits 1. It does not serve unfiltered:
+queued work is answered without a scan (a held exec by the daemon policy, an
+on-demand `SCAN` with `ERR scan not run`), and waiting control clients see
+the socket close.
 
 **What it allows.** The list was taken from `strace -f` of avd's own
 threads, not the spawner's or the workers', during the socket and fanotify

@@ -405,6 +405,9 @@ struct scan_completion {
   pthread_mutex_t lock;
   pthread_cond_t done;
   bool completed;
+  /* Set with `completed` when the task was dropped unscanned (see
+   * serve_wait()); `result` is then unset. */
+  bool not_scanned;
   struct scan_result result;
 };
 
@@ -432,6 +435,42 @@ static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
 static bool shutting_down;
+
+/* Startup gate (#103). The scan workers take no task and the control thread
+ * accepts no connection until main() opens it, once startup is complete: with
+ * AVD_PRIVSEP=1, only after privsep_install_filter() has put the main
+ * process's seccomp filter on, so no request is served without it. If avd
+ * stops before getting there (the install failed, or startup was aborted),
+ * main() closes it instead: the control thread exits without accepting, and
+ * the workers answer whatever was queued meanwhile without scanning it (see
+ * scan_worker_main()). Fanotify misses queued while it is shut are still
+ * covered by the listener's watchdog. */
+static pthread_mutex_t serve_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t serve_cond = PTHREAD_COND_INITIALIZER;
+static int serve_state; /* 0 undecided, 1 serving, -1 never; serve_lock */
+
+/* Blocks until main() decides. True: serve. */
+static bool serve_wait(void) {
+  bool serve;
+
+  pthread_mutex_lock(&serve_lock);
+  while (serve_state == 0)
+    pthread_cond_wait(&serve_cond, &serve_lock);
+  serve = serve_state > 0;
+  pthread_mutex_unlock(&serve_lock);
+  return serve;
+}
+
+/* Only the first call counts, so the shutdown path can close the gate
+ * unconditionally: after a successful startup that is a no-op. */
+static void serve_decide(bool serve) {
+  pthread_mutex_lock(&serve_lock);
+  if (serve_state == 0) {
+    serve_state = serve ? 1 : -1;
+    pthread_cond_broadcast(&serve_cond);
+  }
+  pthread_mutex_unlock(&serve_lock);
+}
 
 static time_t start_time;
 
@@ -3116,6 +3155,34 @@ static void fan_run_task(struct fan_pending *p) {
   fan_unref(p);
 }
 
+/* Worker side of a miss queued while startup was still incomplete and avd
+ * then stopped instead of serving (see serve_wait()): answered by policy, as
+ * the watchdog would, without a scan. */
+static void fan_drop_task(struct fan_pending *p) {
+  bool fail_closed = fan_policy_fail_closed();
+  bool answer;
+  char path[PATH_MAX];
+
+  pthread_mutex_lock(&fan_pending_lock);
+  answer = !p->responded && fan_fd >= 0;
+  if (answer)
+    fan_respond(p->fd, !fail_closed);
+  p->responded = true;
+  pthread_mutex_unlock(&fan_pending_lock);
+
+  if (answer) {
+    fan_count(&fan_fallbacks);
+    fan_fd_path(p->fd, path, sizeof(path));
+    fprintf(stderr,
+            "avd: startup did not complete - exec of \"%s\" (pid %d) %s "
+            "by daemon policy (%s) without a scan\n",
+            path, (int)p->pid, fail_closed ? "DENIED" : "allowed",
+            fail_closed ? "fail-closed" : "fail-open");
+  }
+  close(p->fd);
+  fan_unref(p);
+}
+
 /* Listener side: answer every pending exec a worker has not answered
  * by its deadline, and drop answered ones from the list. With
  * `force_all`, everything still unanswered is answered now (shutdown).
@@ -3777,8 +3844,13 @@ static void test_scan_hold_gate(void) {
  * connection thread blocked in cmd_scan() rely on its on-demand task
  * always being executed and signaled, even across shutdown. */
 static void *scan_worker_main(void *arg) {
-  (void)arg;
+  /* False: avd stopped before startup completed, so every task is
+   * answered unscanned - see serve_wait(). Still drained, not abandoned,
+   * for the same reasons as above. */
+  bool serve;
 
+  (void)arg;
+  serve = serve_wait();
   for (;;) {
     struct scan_task *task;
 
@@ -3799,6 +3871,28 @@ static void *scan_worker_main(void *arg) {
     scan_in_flight++;
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
+
+    if (!serve) {
+      if (task->fan) {
+        fan_drop_task(task->fan);
+      } else if (task->on_demand) {
+        struct scan_completion *c = task->completion;
+
+        close(task->fd);
+        pthread_mutex_lock(&c->lock);
+        c->not_scanned = true;
+        c->completed = true;
+        pthread_cond_signal(&c->done);
+        pthread_mutex_unlock(&c->lock);
+      }
+      /* A kernel request is dropped: the kernel applies its daemon
+       * policy when no verdict comes, as for a full queue. */
+      pthread_mutex_lock(&queue_lock);
+      scan_in_flight--;
+      pthread_mutex_unlock(&queue_lock);
+      free(task);
+      continue;
+    }
 
     if (task->fan) {
       test_scan_hold_gate();
@@ -4441,7 +4535,8 @@ static void cmd_scan(int fd, const char *path) {
    * the old synchronous perform_scan() was (a scan takes as long as
    * it takes), and shutdown can't strand it - workers drain the
    * queue before exiting, so every enqueued task is executed and
-   * signaled even across SIGINT/SIGTERM. `completion` lives on this
+   * signaled even across SIGINT/SIGTERM (or, if avd stops before
+   * startup completes, signaled as not_scanned - see serve_wait()). `completion` lives on this
    * thread's stack, which is safe because this thread doesn't return
    * until `completed` is set (see struct scan_task's comment). */
   if (pthread_mutex_init(&completion.lock, NULL) != 0) {
@@ -4456,6 +4551,7 @@ static void cmd_scan(int fd, const char *path) {
     return;
   }
   completion.completed = false;
+  completion.not_scanned = false;
 
   if (!enqueue_ondemand_scan(sfd, path, &completion)) {
     pthread_cond_destroy(&completion.done);
@@ -4473,6 +4569,10 @@ static void cmd_scan(int fd, const char *path) {
   pthread_cond_destroy(&completion.done);
   pthread_mutex_destroy(&completion.lock);
 
+  if (completion.not_scanned) {
+    send_err(fd, "scan not run - avd is shutting down");
+    return;
+  }
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
   snprintf(row, sizeof(row), "%s\t%s\t%d\t%s\n",
@@ -4907,6 +5007,9 @@ static int start_control_socket(void) {
 static void *control_accept_main(void *arg) {
   (void)arg;
 
+  /* Connections made meanwhile wait in the listen backlog. */
+  if (!serve_wait())
+    return NULL;
   while (atomic_load(&running)) {
     struct control_conn_ctx *ctx;
     pthread_t tid;
@@ -5384,6 +5487,7 @@ int main(int argc, char **argv) {
         int unblock_err = errno;
         fprintf(stderr, "avd: failed to unblock SIGINT/SIGTERM in main: %s\n",
                 strerror(unblock_err));
+        serve_decide(false);
         pthread_mutex_lock(&queue_lock);
         shutting_down = true;
         pthread_cond_broadcast(&queue_not_empty);
@@ -5430,6 +5534,8 @@ int main(int argc, char **argv) {
                       "shutting down\n");
       exit_status = 1;
       atomic_store(&running, 0);
+    } else {
+      serve_decide(true);
     }
 
     /* Wait in poll(), not inside libnl: nl_recvmsgs_default() retries
@@ -5480,6 +5586,8 @@ int main(int argc, char **argv) {
     atomic_store(&running, 0);
 
     printf("avd: shutting down, draining %zu queued scan(s)...\n", queue_len);
+    /* No-op unless startup never completed: see serve_wait(). */
+    serve_decide(false);
     pthread_mutex_lock(&queue_lock);
     shutting_down = true;
     pthread_cond_broadcast(&queue_not_empty);
