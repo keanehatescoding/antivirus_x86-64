@@ -2580,7 +2580,9 @@ static int privsep_install_filter(bool control_started) {
   struct ps_parent_filter f;
 
   if (control_started) {
-    control_wake_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    /* Nonblocking: see the shutdown wake-up in main(). */
+    control_wake_fd =
+        socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (control_wake_fd < 0) {
       fprintf(stderr, "avd: privsep: could not create the control wake-up "
                       "socket: %s\n",
@@ -5532,7 +5534,11 @@ int main(int argc, char **argv) {
       exit_status = 1;
       atomic_store(&running, 0);
     } else {
-      serve_decide(true);
+      /* A termination signal may already have arrived: don't open the gate
+       * for an accept thread that would only exit (see serve_decide()). A
+       * signal landing after this check is covered by the nonblocking
+       * wake-up in the shutdown below. */
+      serve_decide(atomic_load(&running) != 0);
     }
 
     /* Wait in poll(), not inside libnl: nl_recvmsgs_default() retries
@@ -5620,7 +5626,15 @@ int main(int argc, char **argv) {
        * shutdown.
        *
        * Only if the gate opened, though: otherwise the accept thread never
-       * reaches accept() and exits by itself (see serve_decide()). */
+       * reaches accept() and exits by itself (see serve_decide()).
+       *
+       * The wake-up socket is nonblocking. A blocking connect() waits for
+       * room in the listen backlog, and the accept thread may already have
+       * left (it checks `running` between connections) while clients fill
+       * it, so nothing would ever make room. A full backlog fails with
+       * EAGAIN instead, and needs no wake-up: with connections pending the
+       * thread cannot be parked in accept(), so it has either left or will
+       * get one at once and then see `running == 0`. */
       if (!served) {
         if (control_wake_fd >= 0)
           close(control_wake_fd);
@@ -5628,8 +5642,10 @@ int main(int argc, char **argv) {
       } else {
         /* Under the seccomp filter socket() is gone and connect() works only
          * on the descriptor privsep_install_filter() made in advance. */
-        int wake_fd = control_wake_fd >= 0 ? control_wake_fd
-                                           : socket(AF_UNIX, SOCK_STREAM, 0);
+        int wake_fd =
+            control_wake_fd >= 0
+                ? control_wake_fd
+                : socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 
         control_wake_fd = -1;
         if (wake_fd >= 0) {
