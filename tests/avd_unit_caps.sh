@@ -104,7 +104,7 @@ _avd_unit_expand() {
 # SystemCallArchitectures=native. Also sets AVD_UNIT_SYSCALLS to the number of
 # names allowed.
 avd_unit_seccomp() {
-    local unit="$1" line first=1 allow="" deny="" names arch
+    local unit="$1" line first=1 allow="" deny="" names arch allowed denied
     local -a lines=()
 
     AVD_UNIT_SYSCALLS=0
@@ -138,9 +138,15 @@ avd_unit_seccomp() {
         echo "FAIL: systemd-analyze not found - needed to expand SystemCallFilter= groups"
         return 1
     fi
+    # Expand each list on its own first: a failure inside <(...) would not
+    # reach comm's exit status, and a half-expanded deny list (an unknown
+    # group stops the expansion there) would test a weaker filter than the
+    # unit's.
     # shellcheck disable=SC2086 # word splitting of the unit's lists is the point
-    names="$(comm -23 <(_avd_unit_expand $allow | sort -u) \
-                      <(_avd_unit_expand $deny | sort -u))" || return 1
+    allowed="$(_avd_unit_expand $allow)" || return 1
+    # shellcheck disable=SC2086
+    denied="$(_avd_unit_expand $deny)" || return 1
+    names="$(comm -23 <(sort -u <<<"$allowed") <(sort -u <<<"$denied"))" || return 1
     [ -n "$names" ] || { echo "FAIL: SystemCallFilter= in $unit expands to nothing"; return 1; }
     AVD_UNIT_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/avd_unit_seccomp.XXXXXX")" || return 1
     if ! gcc -O2 -Wall -Wextra -Werror -o "$AVD_UNIT_BUILD_DIR/avd_unit_seccomp" \
