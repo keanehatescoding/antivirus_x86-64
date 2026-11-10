@@ -174,10 +174,16 @@ it gets there.
   fuzzy or TLSH hash fails, or (with `AVD_PRIVSEP=1`) no worker is
   available or the worker fails. avd then fails open and the scan is
   marked inconclusive internally. That marker isn't sent: the reply row
-  says `CLEAN`, and `VERDICTS RECENT` records it as `CLEAN` too. The
-  only sign is avd's log, which names the check that didn't run (for
-  example `yr_rules_scan_fd(...) failed` or `result inconclusive`).
-  Before relying on a `CLEAN`, check the log for that path.
+  says `CLEAN`, and `VERDICTS RECENT` records it as `CLEAN` too. avd's
+  log shows some of these failures, not all of them. A line for the
+  path naming a failed check (for example `yr_rules_scan_fd(...) failed`
+  or `result inconclusive`) means that `CLEAN` is inconclusive. A
+  missing line doesn't mean the scan was conclusive: with
+  `AVD_PRIVSEP=1`, a check that fails inside the worker (a YARA error
+  or timeout, a fuzzy or TLSH hash failure) reaches avd only as the
+  internal marker and is never logged, and in either mode a scan with
+  no rules loaded logs nothing for the path. So the log can show that a
+  `CLEAN` is unreliable, but it can't show that a `CLEAN` is reliable.
 - **`SCAN /proc/<pid>/exe` fails for another user's process.** Opening
   that link is a ptrace access check (`PTRACE_MODE_READ_FSCREDS`), and
   across uids it needs `CAP_SYS_PTRACE`, which `avd` doesn't have under

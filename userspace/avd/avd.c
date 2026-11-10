@@ -462,14 +462,22 @@ static bool serve_wait(void) {
 }
 
 /* Only the first call counts, so the shutdown path can close the gate
- * unconditionally: after a successful startup that is a no-op. */
-static void serve_decide(bool serve) {
+ * unconditionally: after a successful startup that is a no-op. Returns whether
+ * the gate is open, i.e. whether the control thread may be parked in
+ * accept(). If not, it has returned or is about to without accepting, so the
+ * shutdown wake-up connection must be skipped: nothing would accept it, and
+ * with the listen backlog full a blocking connect() would never return. */
+static bool serve_decide(bool serve) {
+  bool open;
+
   pthread_mutex_lock(&serve_lock);
   if (serve_state == 0) {
     serve_state = serve ? 1 : -1;
     pthread_cond_broadcast(&serve_cond);
   }
+  open = serve_state > 0;
   pthread_mutex_unlock(&serve_lock);
+  return open;
 }
 
 static time_t start_time;
@@ -2572,7 +2580,9 @@ static int privsep_install_filter(bool control_started) {
   struct ps_parent_filter f;
 
   if (control_started) {
-    control_wake_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    /* Nonblocking: see the shutdown wake-up in main(). */
+    control_wake_fd =
+        socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (control_wake_fd < 0) {
       fprintf(stderr, "avd: privsep: could not create the control wake-up "
                       "socket: %s\n",
@@ -5388,6 +5398,7 @@ int main(int argc, char **argv) {
     pthread_t *workers = calloc((size_t)avd_scan_threads, sizeof(*workers));
     pthread_t control_thread;
     bool control_started;
+    bool served;
     pthread_t fan_thread;
     bool fan_started = false;
     int fan_mi_fd = -1;
@@ -5498,21 +5509,9 @@ int main(int argc, char **argv) {
         fan_teardown(fan_thread, fan_started, fan_mi_fd);
         privsep_stop();
         if (control_started) {
-          /* Same self-connect wake-up as the normal shutdown path
-           * below: joining the accept thread without it hangs. */
-          int wake_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-
-          if (wake_fd >= 0) {
-            struct sockaddr_un wake_addr;
-
-            memset(&wake_addr, 0, sizeof(wake_addr));
-            wake_addr.sun_family = AF_UNIX;
-            snprintf(wake_addr.sun_path, sizeof(wake_addr.sun_path), "%s",
-                     control_sock_path);
-            connect(wake_fd, (struct sockaddr *)&wake_addr,
-                    sizeof(wake_addr));
-            close(wake_fd);
-          }
+          /* The gate was closed before it ever opened, so the accept
+           * thread exits on its own: no wake-up connection (see
+           * serve_decide()). */
           pthread_join(control_thread, NULL);
           close(control_sock_fd);
           control_sock_fd = -1;
@@ -5535,7 +5534,11 @@ int main(int argc, char **argv) {
       exit_status = 1;
       atomic_store(&running, 0);
     } else {
-      serve_decide(true);
+      /* A termination signal may already have arrived: don't open the gate
+       * for an accept thread that would only exit (see serve_decide()). A
+       * signal landing after this check is covered by the nonblocking
+       * wake-up in the shutdown below. */
+      serve_decide(atomic_load(&running) != 0);
     }
 
     /* Wait in poll(), not inside libnl: nl_recvmsgs_default() retries
@@ -5587,7 +5590,7 @@ int main(int argc, char **argv) {
 
     printf("avd: shutting down, draining %zu queued scan(s)...\n", queue_len);
     /* No-op unless startup never completed: see serve_wait(). */
-    serve_decide(false);
+    served = serve_decide(false);
     pthread_mutex_lock(&queue_lock);
     shutting_down = true;
     pthread_cond_broadcast(&queue_not_empty);
@@ -5620,12 +5623,29 @@ int main(int argc, char **argv) {
        * spawned for it like any other (control_conn_main() below,
        * reading an empty line from a peer that's already gone -
        * harmless), which is fine since this only happens once, at
-       * shutdown. */
-      {
+       * shutdown.
+       *
+       * Only if the gate opened, though: otherwise the accept thread never
+       * reaches accept() and exits by itself (see serve_decide()).
+       *
+       * The wake-up socket is nonblocking. A blocking connect() waits for
+       * room in the listen backlog, and the accept thread may already have
+       * left (it checks `running` between connections) while clients fill
+       * it, so nothing would ever make room. A full backlog fails with
+       * EAGAIN instead, and needs no wake-up: with connections pending the
+       * thread cannot be parked in accept(), so it has either left or will
+       * get one at once and then see `running == 0`. */
+      if (!served) {
+        if (control_wake_fd >= 0)
+          close(control_wake_fd);
+        control_wake_fd = -1;
+      } else {
         /* Under the seccomp filter socket() is gone and connect() works only
          * on the descriptor privsep_install_filter() made in advance. */
-        int wake_fd = control_wake_fd >= 0 ? control_wake_fd
-                                           : socket(AF_UNIX, SOCK_STREAM, 0);
+        int wake_fd =
+            control_wake_fd >= 0
+                ? control_wake_fd
+                : socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 
         control_wake_fd = -1;
         if (wake_fd >= 0) {
