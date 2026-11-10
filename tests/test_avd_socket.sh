@@ -35,6 +35,10 @@
 set -u
 
 PRIVSEP="${AV_TEST_PRIVSEP:-0}"
+# AV_TEST_PRIVSEP_SECCOMP=log runs avd's main-process filter in log mode.
+PRIVSEP_SECCOMP="${AV_TEST_PRIVSEP_SECCOMP:-}"
+SECCOMP_WANT=enforcing
+[ "$PRIVSEP_SECCOMP" = log ] && SECCOMP_WANT="log only, AVD_PRIVSEP_SECCOMP=log"
 for arg in "$@"; do
     case "$arg" in
         --privsep) PRIVSEP=1 ;;
@@ -49,7 +53,7 @@ done
 # privsep run (or make avd exit when hyprav-scan does not exist).
 unset AVD_PRIVSEP
 AVD_ENV=()
-[ "$PRIVSEP" = 1 ] && AVD_ENV=(AVD_PRIVSEP=1)
+[ "$PRIVSEP" = 1 ] && AVD_ENV=(AVD_PRIVSEP=1 ${PRIVSEP_SECCOMP:+AVD_PRIVSEP_SECCOMP=$PRIVSEP_SECCOMP})
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod/rmmod, and to exercise avd's"
@@ -62,6 +66,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091 # sourced at runtime; lint it on its own
 . "$REPO_ROOT/tests/avd_guard.sh"
 avd_guard || exit 1
+# Every avd below starts under the shipped unit's CapabilityBoundingSet=
+# and NoNewPrivileges=, the way systemd starts it.
+# shellcheck disable=SC1091 # sourced at runtime; lint it on its own
+. "$REPO_ROOT/tests/avd_unit_caps.sh"
+avd_unit_wrap "$REPO_ROOT/packaging/avd.service" || exit 1
 AV_DIR="$REPO_ROOT/av"
 AVD_DIR="$REPO_ROOT/userspace/avd"
 AVCTL_DIR="$REPO_ROOT/userspace/avctl"
@@ -176,7 +185,7 @@ cp "$REPO_ROOT"/rules/*.yar "$TEST_RULES_DIR"/
 cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 (
     cd "$REPO_ROOT" || exit 1
-    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} "${AVD_UNIT_WRAP[@]}" stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -200,6 +209,44 @@ if [ "$PRIVSEP" = 1 ]; then
         cat "$AVD_LOG"
         exit 1
     fi
+    # The control socket exists before the filter goes on (it is the last
+    # step of startup), so wait for the outcome rather than read it early.
+    for _ in $(seq 1 50); do
+        grep -qE "seccomp filter on in the main process|could not install the seccomp filter" "$AVD_LOG" && break
+        kill -0 "$AVD_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    if grep -qF "avd: privsep: seccomp filter on in the main process ($SECCOMP_WANT)" "$AVD_LOG"; then
+        pass "avd reports its seccomp filter on ($SECCOMP_WANT)"
+    else
+        fail "avd did not report its seccomp filter on ($SECCOMP_WANT)"
+        cat "$AVD_LOG"
+    fi
+    # Installed with TSYNC, so every thread carries it, not just the main one.
+    SC_BAD=0; SC_N=0
+    for t in /proc/"$AVD_PID"/task/[0-9]*; do
+        v="$(sed -n 's/^Seccomp:[[:space:]]*//p' "$t/status" 2>/dev/null)"
+        [ -z "$v" ] && [ ! -d "$t" ] && continue
+        SC_N=$((SC_N + 1))
+        [ "$v" = 2 ] || { SC_BAD=$((SC_BAD + 1)); echo "    thread ${t##*/}: Seccomp='$v'"; }
+    done
+    if [ "$SC_N" -ge 2 ] && [ "$SC_BAD" -eq 0 ]; then
+        pass "all $SC_N avd threads are under a seccomp filter"
+    else
+        fail "$SC_BAD of $SC_N avd threads without a seccomp filter"
+    fi
+fi
+# Proves the unit's restrictions reached avd. With privilege separation
+# on, the main thread has since cut its bounding set to the six parent
+# capabilities (0x20100f, privsep_parent.h), a subset of the unit's.
+WANT_BND="$AVD_UNIT_CAPBND"
+[ "$PRIVSEP" = 1 ] && WANT_BND=000000000020100f
+GOT_BND="$(sed -n 's/^CapBnd:[[:space:]]*//p' "/proc/$AVD_PID/status" 2>/dev/null)"
+GOT_NNP="$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' "/proc/$AVD_PID/status" 2>/dev/null)"
+if [ "$GOT_BND" = "$WANT_BND" ] && [ "$GOT_NNP" = 1 ]; then
+    pass "avd runs under the unit's bounding set and NoNewPrivileges (CapBnd $GOT_BND)"
+else
+    fail "avd CapBnd='$GOT_BND' NoNewPrivs='$GOT_NNP', expected '$WANT_BND' and 1"
 fi
 
 export AVD_SOCK_PATH="$TEST_SOCK_PATH"
@@ -357,7 +404,8 @@ TEST_HOLD_DIR="$TEST_TMP_DIR/scan_hold"
 mkdir -p "$TEST_HOLD_DIR"
 (
     cd "$REPO_ROOT" || exit 1
-    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" stdbuf -oL \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} AVD_SCAN_THREADS=1 AVD_TEST_SCAN_HOLD_PATH="$TEST_HOLD_DIR" \
+        "${AVD_UNIT_WRAP[@]}" stdbuf -oL \
         "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
@@ -448,7 +496,7 @@ done
 rm -f "$TEST_SOCK_PATH"
 (
     cd "$REPO_ROOT" || exit 1
-    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec env ${AVD_ENV[@]+"${AVD_ENV[@]}"} "${AVD_UNIT_WRAP[@]}" stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -585,8 +633,17 @@ fi
 section "unload"
 if kill "$AVD_PID" 2>/dev/null; then
     wait "$AVD_PID" 2>/dev/null
+    AVD_RC=$?
     AVD_PID=""
-    pass "avd stopped"
+    # 0 from main(), so the whole shutdown path ran - with privilege
+    # separation that includes the wake-up connect() and the spawner kill
+    # under the seccomp filter, where a stray syscall would be SIGSYS (159).
+    if [ "$AVD_RC" -eq 0 ]; then
+        pass "avd stopped (exit status 0)"
+    else
+        fail "avd stopped with exit status $AVD_RC"
+        tail -20 "$AVD_LOG"
+    fi
 else
     fail "could not stop avd"
 fi

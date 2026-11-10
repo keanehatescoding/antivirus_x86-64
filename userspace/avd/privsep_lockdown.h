@@ -218,6 +218,17 @@ enum ps_lbl {
   PSL_CLONE,
   PSL_SOCKPAIR,
   PSL_PRLIMIT,
+  /* used only by the main process's filter (privsep_parent.h) */
+  PSL_DENY,
+  PSL_EPERM,
+  PSL_EBADF,
+  PSL_ENOSYS,
+  PSL_P_PROT,
+  PSL_P_CLONE,
+  PSL_P_CONNECT,
+  PSL_P_KILL,
+  PSL_P_TGKILL,
+  PSL_P_FANMARK,
   PSL_COUNT
 };
 
