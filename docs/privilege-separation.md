@@ -19,9 +19,10 @@ it is a manual run, not a CI job, and it passes, as does
 the control socket). Stage 2 step 2 (the main process drops
 capabilities once the spawner exists, `privsep_parent.h`) is built and tested,
 and `packaging/avd.service` now sets `CapabilityBoundingSet=` (the union,
-`0x2011ef`) and `NoNewPrivileges=yes` for every start; the parent's seccomp
-filter (step 3) and the unit's `SystemCallFilter=` are not built (see
-"Stage 2").
+`0x2011ef`) and `NoNewPrivileges=yes` for every start. Stage 2 step 3, the
+main process's own seccomp filter, is built and enforcing with `AVD_PRIVSEP=1`
+(`AVD_PRIVSEP_SECCOMP=log` for log-only); the unit's `SystemCallFilter=` is
+not built (see "Stage 2").
 Written against
 master at `08ff847` and revised after review of #199.
 
@@ -577,7 +578,10 @@ strictest result wins. Three consequences:
    The spawner also calls `signalfd4` before it locks itself down, so that
    filter has to allow it too, though the spawner's own filter does not.
 3. The main process installs its own Stage 2 filter only after it has forked
-   the spawner. Installed earlier, the spawner would inherit it.
+   the spawner, so the spawner does not inherit it. It is in fact the last
+   step of startup, once every thread exists, with
+   `SECCOMP_FILTER_FLAG_TSYNC` so it reaches all of them (see "Step 3 as
+   built").
 
 Optional extra layers once the above works: `chroot` to an empty directory
 and `unshare(CLONE_NEWNET)` before dropping privileges. Seccomp already
@@ -676,8 +680,9 @@ the issue suggests. Three steps, one PR each:
 1. A way to run avd end to end with privilege separation on (built, see "End-to-end
    test with privilege separation on").
 2. The capability drop, below (built, with `AVD_PRIVSEP=1` only).
-3. The parent's seccomp filter, log-only first to collect the real syscall
-   list, then enforcing (not built).
+3. The parent's seccomp filter (built, with `AVD_PRIVSEP=1` only; see "Step 3
+   as built"). The syscall list came from tracing avd rather than from a
+   log-only release; log-only stays available as `AVD_PRIVSEP_SECCOMP=log`.
 
 #### Step 2 as built: `privsep_parent.h`
 
@@ -738,8 +743,8 @@ Not done in this step, on purpose:
 
 - **No `packaging/avd.service` change in this step.** It came in a separate
   PR, once the list had been confirmed by a run; see "The unit" below.
-- **No seccomp filter on the parent** (step 3), so `Seccomp` in the parent's
-  `/proc/<pid>/status` is still 0.
+- **No seccomp filter on the parent.** That is step 3, in its own PR (see
+  "Step 3 as built").
 - **Without `AVD_PRIVSEP=1` this step changes nothing**: avd keeps whatever
   the unit's bounding set gives it (see "The unit" below).
 
@@ -778,14 +783,96 @@ pass in a virtme-ng guest (socket 28 and 30 checks, fanotify 28 and 33,
 without and with `--privsep`), and removing `CAP_SETPCAP` from the unit makes
 avd refuse to start with `AVD_PRIVSEP=1` (parent lockdown step 1).
 
-#### Step 3: still to do
+#### Step 3 as built: the main process's filter
 
-- The parent's seccomp filter, excluding `execve`, `ptrace`, module loading and
-  so on. The allowlist has to come from a traced run (log-only first), not from
-  reading the code.
-- `SystemCallFilter=` in the unit. It applies to the whole unit including the
-  spawner and workers, so it has to be a superset of the spawner's and the
-  worker's filters (see "Seccomp filters stack").
+`ps_seccomp_build_parent()` and `ps_seccomp_install_parent()` in
+`privsep_parent.h`; avd calls them from `privsep_install_filter()` with
+`AVD_PRIVSEP=1` only.
+
+**When.** The filter goes on as the last step of startup, after the spawner,
+the fanotify listener, the scan workers and the control socket all exist and
+just before the main loop. The call uses `SECCOMP_FILTER_FLAG_TSYNC`, so
+every existing thread gets the filter too. TSYNC needs `NO_NEW_PRIVS`, which
+the step 2 lockdown has already set. Because it goes on last, startup-only
+calls stay out of the allowlist: `socket`, `bind`, `listen`,
+`fanotify_init`, `capset`, `prctl`, `fork` and `getsockname` are all
+missing from it. Until the install is done nothing is served: the scan
+workers take no task and the control thread accepts no connection (clients
+wait in the listen backlog), and fanotify execs seen meanwhile wait in the
+queue, under the listener's usual watchdog. If the install fails, avd shuts
+down through its normal path and exits 1. It does not serve unfiltered:
+queued work is answered without a scan (a held exec by the daemon policy, an
+on-demand `SCAN` with `ERR scan not run`), and waiting control clients see
+the socket close.
+
+**What it allows.** The list was taken from `strace -f` of avd's own
+threads, not the spawner's or the workers', during the socket and fanotify
+suites with `--privsep`, counted after the main loop starts. Some
+neighbours glibc may pick instead were added: `readv`/`writev`, the `*at`
+forms, `ppoll`, `statx`, `accept4`, the time and id getters, `brk`,
+`mremap`, `rseq` and `sched_yield`, and `stat`/`lstat`, which glibc before
+2.33 uses for `stat()` and `lstat()` (avd calls `lstat()` in quarantine and
+restore). The rest of the filter checks arguments:
+
+| Call | Allowed |
+| --- | --- |
+| `mmap`, `mprotect` | any protection except `PROT_EXEC`, which gets `EPERM` |
+| `clone` | only `pthread_create()`'s exact flags (`0x3d0f00`, upper half zero) |
+| `clone3` | answered `ENOSYS`, so glibc falls back to `clone` |
+| `connect` | only on one `AF_UNIX` socket made just before the install, which the shutdown path uses to wake the accept thread |
+| `kill` | only `SIGKILL` to the spawner (`ps_client_stop()`) |
+| `tgkill` | only on this process (`abort()`, `raise()`) |
+| `fanotify_mark` | only `FAN_MARK_ADD \| FAN_MARK_FILESYSTEM`, and only on `fan_fd`. The right flags on another descriptor get `EBADF`, because `fan_disable()` sets `fan_fd` to -1 while the listener may still re-mark |
+
+Anything else kills the whole process (`SECCOMP_RET_KILL_PROCESS`). So do a
+foreign architecture and the x32 ABI. Even with every capability the parent
+keeps, it can no longer `execve`, `fork`, `ptrace`, load modules, mount, open
+new sockets, or map executable memory.
+
+**Log mode.** With `AVD_PRIVSEP_SECCOMP=log`, everything that would be killed
+goes through instead and is logged by the kernel (audit type 1326). This is
+for finding out what another distribution's libc calls before turning the
+filter on there. The errno answers above stay the same, and a foreign
+architecture or x32 still kills. Unset or `kill` enforces; any other value
+stops avd at startup. avd prints
+`avd: privsep: seccomp filter on in the main process (enforcing)`, or
+`(log only, AVD_PRIVSEP_SECCOMP=log)`.
+
+**Tests.** `tests/test_privsep_parent_seccomp.sh` needs no root.
+
+- **BPF interpreter (ASan+UBSan):**
+  - every syscall number 0..1023, checked against an independent list
+  - every argument check, including all 64 single-bit changes of the clone
+    flags
+  - log mode
+  - a missing wake-up socket, spawner or fanotify descriptor
+  - architecture and x32
+- **Forked children, real kernel:**
+  - `pthread_create()` still works through the `clone3` fallback (glibc 2.44)
+  - a thread that existed before the call reports `Seccomp: 2`
+  - a denied call in another thread kills the whole process
+  - `fork`, `socket`, `execve`, `prctl`, `bind`, a stray `connect` and a
+    stray `kill` die with `SIGSYS`
+  - `PROT_EXEC` gets `EPERM`
+  - `abort()` still raises `SIGABRT`
+  - log mode lets denied calls through, and a later enforcing filter stacks
+    on top of it
+
+`tests/test_avd_socket.sh --privsep` and `tests/test_fanotify_exec.sh
+--privsep` check the startup line and `Seccomp: 2` on every avd thread. The
+socket suite also checks that avd exits 0, so the whole shutdown path ran
+under the filter. `AV_TEST_PRIVSEP_SECCOMP=log` runs either suite in log mode.
+
+In a virtme-ng guest these all pass:
+- socket suite: 28 checks without `--privsep`, 32 with it enforcing, 32 in
+  log mode
+- fanotify suite: 34 checks enforcing and 34 in log mode
+
+The kernel logged no seccomp audit records during the log-mode runs.
+
+**Still to do:** `SystemCallFilter=` in the unit. It applies to the whole
+unit, spawner and workers included, so it has to be a superset of all three
+filters (see "Seccomp filters stack").
 
 ## Rollout
 
@@ -1002,8 +1089,11 @@ cannot lock itself down stops avd at startup.
   end-to-end scripts need root, a module build and (for fanotify) a VM. A job
   that does would be the safety net Stage 2 wants; it is a separate piece of
   work.
-- Stage 2 step 3: the parent's seccomp filter (log-only first) and the
-  unit's `SystemCallFilter=`; see "Stage 2".
+- The unit's `SystemCallFilter=`, the last piece of Stage 2; see "Step 3 as
+  built".
+- The parent's filter has been traced and tested on one distribution (glibc
+  2.44, Linux 7.3). Before it is enabled elsewhere, run once with
+  `AVD_PRIVSEP_SECCOMP=log` and check the audit log.
 
 ### End-to-end test with privilege separation on
 

@@ -169,6 +169,21 @@ it gets there.
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
+- **A `CLEAN` from `SCAN` can be inconclusive.** Some checks can fail to
+  run: the rules aren't loaded, a YARA scan errors or times out, a
+  fuzzy or TLSH hash fails, or (with `AVD_PRIVSEP=1`) no worker is
+  available or the worker fails. avd then fails open and the scan is
+  marked inconclusive internally. That marker isn't sent: the reply row
+  says `CLEAN`, and `VERDICTS RECENT` records it as `CLEAN` too. avd's
+  log shows some of these failures, not all of them. A line for the
+  path naming a failed check (for example `yr_rules_scan_fd(...) failed`
+  or `result inconclusive`) means that `CLEAN` is inconclusive. A
+  missing line doesn't mean the scan was conclusive: with
+  `AVD_PRIVSEP=1`, a check that fails inside the worker (a YARA error
+  or timeout, a fuzzy or TLSH hash failure) reaches avd only as the
+  internal marker and is never logged, and in either mode a scan with
+  no rules loaded logs nothing for the path. So the log can show that a
+  `CLEAN` is unreliable, but it can't show that a `CLEAN` is reliable.
 - **`SCAN /proc/<pid>/exe` fails for another user's process.** Opening
   that link is a ptrace access check (`PTRACE_MODE_READ_FSCREDS`), and
   across uids it needs `CAP_SYS_PTRACE`, which `avd` doesn't have under
@@ -183,12 +198,23 @@ it gets there.
   path later, and if the file was replaced in between (a package
   upgrade, a rename over it) the verdict is for a different file than
   the one running. A `CLEAN` there says nothing about the process. To
-  scan what a process is actually running, have a client that holds
-  `CAP_SYS_PTRACE` (ordinary root) copy `/proc/<pid>/exe` into a
+  scan the image a process is running, copy `/proc/<pid>/exe` into a
   root-only temporary directory and `SCAN` the copy. Reading the link
-  reads the running inode, even if its file was deleted. A `MALICIOUS`
-  verdict then quarantines the copy, not the original executable,
-  and does nothing to the process.
+  reads the running inode, even if its file was deleted. The client
+  needs `CAP_SYS_PTRACE` in the target's user namespace. A root shell
+  normally has it, but root under a reduced bounding set or in a
+  container may not, and the copy then fails the same way. What this
+  does and doesn't tell you:
+  - The verdict is for a snapshot. If the process `exec()`s something
+    else afterwards, the verdict says nothing about the new image.
+  - It covers the executable image only. For a script, `/proc/<pid>/exe`
+    is the interpreter (`python3`, `bash`), so a `CLEAN` says nothing
+    about the script, its modules or anything loaded at run time.
+  - A `MALICIOUS` verdict quarantines the copy, not the original
+    executable, and does nothing to the process. The reply doesn't say
+    whether quarantine succeeded. If it failed (see `avd`'s log), the
+    copy is still in the temporary directory, so remove that directory
+    afterwards whatever the verdict.
 - **`SCAN` shares the kernel-triggered scan queue.** A control-socket
   `SCAN` command enqueues an on-demand task on the same bounded worker
   pool `AV_C_SCAN_REQUEST` uses (size/queue depth runtime-tunable via

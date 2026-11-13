@@ -89,6 +89,12 @@ echo "### test_privsep_parent.sh (the main process dropping capabilities after t
 "$REPO_ROOT/tests/test_privsep_parent.sh" || FAIL=1
 
 echo
+echo "### test_privsep_parent_seccomp.sh (the main process's own seccomp filter, #103) ###"
+# Unprivileged: the program in a BPF interpreter, then installed for real in
+# forked children (a filter needs only NO_NEW_PRIVS).
+"$REPO_ROOT/tests/test_privsep_parent_seccomp.sh" || FAIL=1
+
+echo
 echo "### test_privsep_client.sh (main-process dispatch client, #103) ###"
 "$REPO_ROOT/tests/test_privsep_client.sh" || FAIL=1
 
