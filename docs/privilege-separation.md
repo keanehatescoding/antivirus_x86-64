@@ -964,27 +964,23 @@ The end-to-end tests have no systemd to install it, so `tests/avd_unit_caps.sh`
 reads the two `SystemCallFilter=` lines (it accepts only an allowlist first and
 `~` lines after it), expands the groups with `systemd-analyze syscall-filter`,
 subtracts, and builds `tests/avd_unit_seccomp.c` (libseccomp), which installs
-the result the way systemd does: kill on anything else or any other
-architecture, plus the calls systemd always allows (`execve`, `exit_group`,
-`rt_sigreturn`, the clock reads and sleeps). Every avd in both suites starts
-under `setpriv ... -- avd_unit_seccomp NAME... -- avd`. The suites check
+the result the way systemd 262 does. The listed calls and the calls systemd
+always allows (`execve`, `exit_group`, `rt_sigreturn`, the clock reads and
+sleeps) are allowed. Any other call in systemd's `@known` group (also expanded
+with `systemd-analyze`) kills the process, and anything newer gets `ENOSYS`.
+Any other architecture kills the process too. Every avd in both suites starts
+under `setpriv ... -- avd_unit_seccomp NAME... --known KNOWN... -- avd`. The
+suites check
 `Seccomp` 2 and the helper's `Seccomp_filters` counts in the table above on
 every avd thread, the spawner and each worker. All four runs pass in a
 virtme-ng guest (socket 29 checks without `--privsep` and 32 with it,
-fanotify 29 and 34). Three limits:
+fanotify 29 and 34). Two limits:
 
 - The emulation trusts the host's `systemd-analyze` to expand the groups the
   same way as the systemd that runs the unit. Groups grow between releases:
   the host's systemd 262 put `seccomp` in `@system-service`, so the tests
   could not notice that systemd 255 leaves it out (see above). Name any call
   avd makes directly instead of relying on a group to carry it.
-- The helper kills on every unlisted call, including calls outside systemd's
-  `@known` set, which the installed unit answers with `ENOSYS`. A newer libc
-  that probes such a call and falls back can work under the unit but die
-  under the helper. This only matters without `AVD_PRIVSEP=1` (or for the
-  main process in log mode). Otherwise avd's own filters kill such a call
-  under either filter. Here the tests are stricter than the unit, never
-  looser.
 - It does not check that the real systemd runs the unit at all. That check is
   the first start of the installed unit.
 

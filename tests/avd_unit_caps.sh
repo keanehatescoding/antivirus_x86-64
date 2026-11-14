@@ -104,8 +104,8 @@ _avd_unit_expand() {
 # SystemCallArchitectures=native. Also sets AVD_UNIT_SYSCALLS to the number of
 # names allowed.
 avd_unit_seccomp() {
-    local unit="$1" line first=1 allow="" deny="" names arch allowed denied
-    local -a lines=()
+    local unit="$1" line first=1 allow="" deny="" names arch allowed denied known
+    local -a lines=() known_lines=()
 
     AVD_UNIT_SYSCALLS=0
     mapfile -t lines < <(sed -n 's/^SystemCallFilter=//p' "$unit")
@@ -148,6 +148,10 @@ avd_unit_seccomp() {
     denied="$(_avd_unit_expand $deny)" || return 1
     names="$(comm -23 <(sort -u <<<"$allowed") <(sort -u <<<"$denied"))" || return 1
     [ -n "$names" ] || { echo "FAIL: SystemCallFilter= in $unit expands to nothing"; return 1; }
+    # systemd kills only on the calls it knows (@known) and answers anything
+    # newer with ENOSYS; the helper needs that list to do the same.
+    known="$(_avd_unit_expand @known)" || return 1
+    [ -n "$known" ] || { echo "FAIL: systemd-analyze expands @known to nothing"; return 1; }
     AVD_UNIT_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/avd_unit_seccomp.XXXXXX")" || return 1
     if ! gcc -O2 -Wall -Wextra -Werror -o "$AVD_UNIT_BUILD_DIR/avd_unit_seccomp" \
             "$(dirname "${BASH_SOURCE[0]}")/avd_unit_seccomp.c" -lseccomp; then
@@ -157,7 +161,9 @@ avd_unit_seccomp() {
     fi
     mapfile -t lines <<<"$names"
     AVD_UNIT_SYSCALLS="${#lines[@]}"
-    AVD_UNIT_WRAP+=("$AVD_UNIT_BUILD_DIR/avd_unit_seccomp" "${lines[@]}" --)
+    mapfile -t known_lines < <(sort -u <<<"$known")
+    AVD_UNIT_WRAP+=("$AVD_UNIT_BUILD_DIR/avd_unit_seccomp" "${lines[@]}"
+                    --known "${known_lines[@]}" --)
     return 0
 }
 
