@@ -1067,6 +1067,79 @@ int main(int argc, char *const argv[]) {
         }
       }
     }
+    /* V/W: absolute unlinks from inside a chroot (CodeRabbit on arm64
+     * #134). Root /tmp/sd_v; each child execs its own "/<x>", the
+     * host's /tmp/sd_v/<x>, whose d_path() key is "/tmp/sd_v/<x>".
+     *
+     *   V: unlink "/tmp/sd_v/v", the host's /tmp/sd_v/tmp/sd_v/v - an
+     *      unrelated file whose spelling equals the exec's d_path()
+     *      -> NOT killed. #229's string comparison had to be taught
+     *      this; matching the exec'd dentry gets it by construction.
+     *   W: unlink "/w", its own image -> killed. */
+    if (!failed) {
+      static const struct {
+        const char *name, *exec, *unlink, *survivor, *gone;
+        int expect_kill;
+      } vc[] = {
+          {"v", "/v", "/tmp/sd_v/v", "/tmp/sd_v/v", "/tmp/sd_v/tmp/sd_v/v",
+           0},
+          {"w", "/w", "/w", NULL, "/tmp/sd_v/w", 1},
+      };
+
+      if (mkdir("/tmp/sd_v", 0755) != 0 || mkdir("/tmp/sd_v/tmp", 0755) != 0 ||
+          mkdir("/tmp/sd_v/tmp/sd_v", 0755) != 0)
+        die("mkdir case v/w dirs");
+      for (size_t i = 0; i < sizeof(vc) / sizeof(vc[0]) && !failed; i++) {
+        char image[64];
+        int code, sig, saw_record, killed;
+        struct stat st;
+        pid_t child;
+
+        snprintf(image, sizeof(image), "/tmp/sd_v/%s", vc[i].name);
+        copy_file("/init", image);
+        if (!vc[i].expect_kill)
+          write_file(vc[i].gone, "not the executable\n");
+        sd_chroot_dir = "/tmp/sd_v";
+        killed = run_self_delete_case(vc[i].exec, "--self-unlink",
+                                      vc[i].unlink, NULL, image, NULL, &code,
+                                      &sig, &saw_record, &child);
+        sd_chroot_dir = NULL;
+        outmsg("QEMU_TEST: self-delete case %s (chroot /tmp/sd_v): exec %s, "
+               "unlink %s -> %s (exit=%d sig=%d, exec record %s)\n",
+               vc[i].name, vc[i].exec, vc[i].unlink,
+               killed ? "killed" : "not killed", code, sig,
+               saw_record ? "seen" : "not seen in log");
+        if (!saw_record || killed != vc[i].expect_kill) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s expected a seen exec "
+                 "record and %s\n",
+                 vc[i].name, vc[i].expect_kill ? "a kill" : "no kill");
+          failed = 1;
+          continue;
+        }
+        if (!killed && code != 43) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s exited %d, not 43 "
+                 "(44 = sync read, 45 = unlink, 125 = chroot)\n",
+                 vc[i].name, code);
+          failed = 1;
+          continue;
+        }
+        if (killed && !saw_kill_reason(child, "self-deleting binary")) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s was killed but dmesg "
+                 "has no reason=\"self-deleting binary ...\" pid=%d line\n",
+                 vc[i].name, (int)child);
+          failed = 1;
+          continue;
+        }
+        if ((vc[i].survivor && stat(vc[i].survivor, &st) != 0) ||
+            stat(vc[i].gone, &st) == 0) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s's unlink did not "
+                 "remove %s%s%s\n",
+                 vc[i].name, vc[i].gone, vc[i].survivor ? " and leave " : "",
+                 vc[i].survivor ? vc[i].survivor : "");
+          failed = 1;
+        }
+      }
+    }
     if (failed) {
       outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
       reboot(RB_POWER_OFF);
