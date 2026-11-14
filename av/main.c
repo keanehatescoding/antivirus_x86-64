@@ -1140,11 +1140,18 @@ static const char *av_exec_self_delete_key(const struct file *f,
  * aw->file itself: its directory, resolved following symlinks from the
  * exec'ing task's root, is the directory entry the executed dentry
  * hangs off, on the same mount. Same directory plus same final name
- * (checked by the caller) means the same directory entry. So a key that differs from d_path() only
- * because a DIRECTORY on the way is a symlink is accepted, and one
- * whose final component is a symlink to the file (/tmp/link/tool ->
- * /tmp/real/tool) is rejected even though the basenames match:
- * unlinking it only removes the symlink (CodeRabbit on x86 #229).
+ * (checked by the caller) means the same directory entry. So a key
+ * that differs from d_path() only because a DIRECTORY on the way is a
+ * symlink is accepted, and one whose final component is a symlink to
+ * the file (/tmp/link/tool -> /tmp/real/tool) is rejected even though
+ * the basenames match: unlinking it only removes the symlink
+ * (CodeRabbit on x86 #229).
+ *
+ * On success *parent_out holds a reference to the parent it validated,
+ * for the caller to record and then dput(). Reading the parent again
+ * later could see a different one if the image was renamed in between,
+ * recording a directory the key was never checked against (CodeRabbit
+ * on #229). On failure *parent_out is left alone.
  *
  * The parent is compared rather than the file, so an image already
  * unlinked before this runs still passes: its dentry keeps d_parent.
@@ -1155,7 +1162,8 @@ static const char *av_exec_self_delete_key(const struct file *f,
  * spell; /dev/fd and /proc/self links, which resolve against this
  * worker), returns false and loses only the second key. */
 static bool av_exec_key_names_file(const struct av_work *aw,
-                                   const char *key) {
+                                   const char *key,
+                                   struct dentry **parent_out) {
   const char *slash = strrchr(key, '/');
   struct dentry *parent;
   struct path dir;
@@ -1176,8 +1184,11 @@ static bool av_exec_key_names_file(const struct av_work *aw,
 
   parent = dget_parent(aw->file->f_path.dentry);
   same = dir.mnt == aw->file->f_path.mnt && dir.dentry == parent;
-  dput(parent);
   path_put(&dir);
+  if (same)
+    *parent_out = parent;
+  else
+    dput(parent);
   return same;
 }
 
@@ -1209,9 +1220,11 @@ static bool av_exec_key_names_file(const struct av_work *aw,
  * the executed binary. The basename comparison is the cheap filter;
  * av_exec_key_names_file() is the identity check. */
 static char *av_exec_lexical_path(const struct av_work *aw,
-                                  const char *canonical) {
+                                  const char *canonical,
+                                  struct dentry **parent_out) {
   char *buf;
 
+  *parent_out = NULL;
   if (!aw->exec_name || canonical[0] != '/')
     return NULL;
   if (!aw->has_root || (aw->exec_name[0] != '/' && !aw->has_pwd))
@@ -1233,7 +1246,7 @@ static char *av_exec_lexical_path(const struct av_work *aw,
    * collapsed one. */
   join_base_path(aw->exec_name, &aw->pwd, &aw->root, buf, PATH_MAX, false);
   if (buf[0] != '/' || strcmp(kbasename(buf), kbasename(canonical)) ||
-      !av_exec_key_names_file(aw, buf))
+      !av_exec_key_names_file(aw, buf, parent_out))
     goto drop;
   normalize_abs_path(buf, PATH_MAX);
   /* Equal to `canonical` makes the key redundant only when both are
@@ -1247,6 +1260,8 @@ static char *av_exec_lexical_path(const struct av_work *aw,
     goto drop;
   return buf;
 drop:
+  dput(*parent_out);
+  *parent_out = NULL;
   kfree(buf);
   return NULL;
 }
@@ -1297,6 +1312,7 @@ static void av_work_fn(struct work_struct *w) {
   char *esc_path;
   char *lex_path;
   const struct inode *lex_dir = NULL;
+  struct dentry *lex_parent = NULL;
   const char *sd_key;
   int ret;
 
@@ -1349,16 +1365,14 @@ static void av_work_fn(struct work_struct *w) {
       memmove(abs_path, p, strlen(p) + 1);
   }
   sd_key = av_exec_self_delete_key(aw->file, abs_path);
-  lex_path = av_exec_lexical_path(aw, sd_key);
-  /* The lexical key's directory, which av_exec_lexical_path() just
-   * checked is this dentry's parent. Recorded so the unlink check can
-   * tell when that name has since been pointed somewhere else. */
-  if (lex_path) {
-    struct dentry *parent = dget_parent(aw->file->f_path.dentry);
-
-    lex_dir = d_inode(parent);
-    dput(parent);
-  }
+  lex_path = av_exec_lexical_path(aw, sd_key, &lex_parent);
+  /* The lexical key's directory: the very parent av_exec_lexical_path()
+   * validated the key against, not a second dget_parent(), which a
+   * rename in between could move. Recorded so the unlink check can tell
+   * when that name has since been pointed somewhere else. The reference
+   * is dropped right after recording, not held through the scan. */
+  if (lex_parent)
+    lex_dir = d_inode(lex_parent);
 
   ret = hash_file_multi(aw->file, &digest, &ident);
   if (ret) {
@@ -1394,6 +1408,8 @@ static void av_work_fn(struct work_struct *w) {
    * across the signature-match/daemon-match/clean branches. */
   av_behavior_record_exec(aw->tgid, sd_key, lex_path, lex_dir,
                           digest.sha256, aw->start_time);
+  dput(lex_parent);
+  lex_parent = NULL;
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
     snprintf(reason, sizeof(reason), "signature:%s", sig_name);
@@ -1505,6 +1521,7 @@ static void av_work_fn(struct work_struct *w) {
   }
 
 out:
+  dput(lex_parent); /* still held only if hashing failed */
   if (sd_key != abs_path)
     kfree(sd_key);
   kfree(abs_path);
