@@ -65,6 +65,7 @@
 #include <linux/binfmts.h>
 #include <linux/crypto.h>
 #include <linux/dcache.h>
+#include <linux/delay.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -235,6 +236,28 @@ static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
 module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
                  "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
+
+/* TEST-ONLY: parks every deferred exec work item for this many ms
+ * immediately before it hashes, so tests/test_netlink.sh can rename or
+ * unlink the exec'd pathname while the request is still in flight and
+ * prove that avd scans the file the kernel hashed, not whatever the
+ * path names by then (issue #227). The hash itself reads the pinned
+ * bprm->file, so the delay cannot change what is hashed - only how
+ * late avd gets to open the path. Ported from the arm64 tree, where
+ * the same knob drives the QEMU boot test's exec-time TOCTOU cases.
+ *
+ * Default 0 = disabled, so every production configuration is byte-for-byte
+ * unaffected (the sleep is not even entered). Writable (0644) so the test
+ * can enable it around its cases and clear it again via
+ * /sys/module/av/parameters/av_toctou_test_delay_ms; read once per work
+ * item and clamped, so a concurrent out-of-range write can never turn it
+ * into an unbounded sleep. The _test_ infix marks it as never an
+ * operational knob. */
+#define AV_TOCTOU_TEST_DELAY_MAX_MS 2000
+static int av_toctou_test_delay_ms; /* = 0: disabled unless a test sets it */
+module_param(av_toctou_test_delay_ms, int, 0644);
+MODULE_PARM_DESC(av_toctou_test_delay_ms,
+                 "TEST ONLY: ms to sleep before the deferred exec hash, so a regression test can swap the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -935,6 +958,28 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
   kfree(esc_path);
 }
 
+/* Identity of the pinned exec file in the form userspace fstat() reports
+ * it, for the daemon's "is this still the file the kernel hashed" check
+ * (issue #227). Deliberately vfs_getattr() rather than inode->i_sb->s_dev/
+ * i_ino (what av_file_identity carries for logging): btrfs subvolumes and
+ * overlayfs report a different st_dev/st_ino through ->getattr than the
+ * raw inode fields, and a mismatch there would make avd refuse every
+ * legitimate exec on those filesystems. Returns false when getattr
+ * fails. The daemon is then not asked at all: an identity-free request
+ * is avd's compatibility mode for pre-#227 modules, which scans
+ * whatever the path names now, so av_work_fn() treats the exec as
+ * unverified instead (fail-closed kills, fail-open logs it). */
+static bool av_scan_ident_of(struct file *file, struct av_scan_ident *out) {
+  struct kstat st;
+
+  if (vfs_getattr(&file->f_path, &st, STATX_INO, AT_STATX_SYNC_AS_STAT))
+    return false;
+  out->dev_major = MAJOR(st.dev);
+  out->dev_minor = MINOR(st.dev);
+  out->ino = st.ino;
+  return true;
+}
+
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
  * GFP_KERNEL. This is where all "heavy" work happens.
  *
@@ -985,6 +1030,22 @@ static void av_work_fn(struct work_struct *w) {
       memmove(abs_path, p, strlen(p) + 1);
   }
 
+  /* TEST-ONLY delay (see av_toctou_test_delay_ms): a no-op whenever the
+   * knob is at its default 0, i.e. in every production configuration.
+   * After d_path() on purpose, so the request still carries the path
+   * the exec used even if a test unlinks it while this item is parked.
+   * Read once and clamped so a racing sysfs write of a bogus value
+   * cannot stall a worker indefinitely. */
+  {
+    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
+
+    if (delay_ms > 0) {
+      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
+        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
+      msleep(delay_ms);
+    }
+  }
+
   ret = hash_file_multi(aw->file, &digest, &ident);
   if (ret) {
     /* A hash failure skips both the signature match and the daemon
@@ -1033,14 +1094,53 @@ static void av_work_fn(struct work_struct *w) {
   {
     int verdict = AV_VERDICT_CLEAN;
     char rule_name[AV_RULE_NAME_MAXLEN + 1] = "";
+    struct av_scan_ident sid;
+    bool have_sid = av_scan_ident_of(aw->file, &sid);
     int nl_ret;
 
-    nl_ret = av_netlink_scan_request(
-        abs_path, digest.sha256, pid_nr(aw->target_pid), &verdict, rule_name,
-        sizeof(rule_name), DAEMON_TIMEOUT_MS);
+    if (have_sid) {
+      nl_ret = av_netlink_scan_request(
+          abs_path, digest.sha256, pid_nr(aw->target_pid), &sid, &verdict,
+          rule_name, sizeof(rule_name), DAEMON_TIMEOUT_MS);
+    } else {
+      /* We hashed the pinned file but can't name it to avd, which
+       * could then only scan whatever the path names now - or answer
+       * CLEAN if it names nothing. Don't ask: take the same "no
+       * verdict for the hashed file" branch as an UNAVAILABLE reply,
+       * so aw->fail_closed decides, never a by-path scan. */
+      nl_ret = 0;
+      verdict = AV_VERDICT_UNAVAILABLE;
+    }
     if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
       snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
       av_kill(aw->target_pid, abs_path, "daemon", reason, &ident);
+    } else if (nl_ret == 0 && verdict == AV_VERDICT_UNAVAILABLE) {
+      /* No verdict for the inode we hashed. Either avd answered
+       * UNAVAILABLE - the path names a different file now
+       * (rename-swap) or nothing (unlink), and /proc/<pid>/exe didn't
+       * lead back to it either (issue #227) - or vfs_getattr() failed
+       * and avd was never asked (have_sid above). That is "no
+       * verdict", not "clean" - same policy as a timeout
+       * (aw->fail_closed, captured at kprobe time), but logged
+       * distinctly at warn because a swap in this window is exactly
+       * what an evasion attempt looks like. */
+      if (aw->fail_closed) {
+        av_kill(aw->target_pid, abs_path, "fail-closed",
+                have_sid ? "daemon-unavailable" : "identity-unavailable",
+                &ident);
+      } else {
+        esc_path = av_log_escape(abs_path, GFP_KERNEL);
+        pr_warn_ratelimited("kernel-av: event=unverified type=daemon "
+                            "path=\"%s\" pid=%d sha256=%s dev=%u:%u ino=%lu "
+                            "(%s)\n",
+                            av_log_str(esc_path), pid_nr(aw->target_pid),
+                            digest.sha256, MAJOR(ident.dev), MINOR(ident.dev),
+                            ident.ino,
+                            have_sid ? "daemon could not open the hashed file"
+                                     : "could not read the hashed file's "
+                                       "identity; daemon not asked");
+        kfree(esc_path);
+      }
     } else if (nl_ret == 0) {
       /* pr_info_ratelimited, not plain pr_info: this fires for
        * every exec that reaches the daemon path (i.e. every
