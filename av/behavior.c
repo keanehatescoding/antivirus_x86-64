@@ -1553,8 +1553,9 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                      "rapid file modification (possible ransomware pattern)");
 }
 
-/* True when the directory part of `path` (absolute, as the unlink
- * worker resolved it) is `dir`, resolving symlinks NOW, at check time.
+/* True when `spelled` (the unlink target, absolute but unnormalized)
+ * names an ordinary entry in `dir`, resolving its directory part NOW,
+ * at check time.
  *
  * The lexical key is a name, and the directory symlinks in it can be
  * retargeted after the exec: exec /tmp/alias/tool with /tmp/alias ->
@@ -1565,6 +1566,14 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
  * directory normally is not. Comparing inodes rather than mounts lets
  * a bind mount of the same directory through.
  *
+ * The unnormalized spelling, not the collapsed key: with
+ * /tmp/x/link -> /tmp/y/sub, an exec of /tmp/x/link/tool and an unlink
+ * of /tmp/x/link/../link/tool share the key /tmp/x/link/tool, but the
+ * kernel follows the link before the "..", so the unlink removes
+ * /tmp/y/link/tool (CodeRabbit on #229). Walking the spelling the
+ * syscall walked lands in /tmp/y, not /tmp/y/sub. A final "." or ".."
+ * is not the file the key names (and unlink() refuses it anyway).
+ *
  * Resolved from the unlinking task's root as captured at the syscall,
  * like the exec-time check in main.c (av_exec_key_names_file()), not
  * from this worker's: kthreads start in a private nullfs since the
@@ -1574,17 +1583,20 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
  * returns false, which only drops the lexical-key match. A process that retargets the
  * symlink between its unlink and this lookup also escapes the lexical
  * key; inode identity at unlink time (issue #230) closes that. */
-static bool unlink_dir_is(const struct path *root, const char *path,
+static bool unlink_dir_is(const struct path *root, const char *spelled,
                           const struct inode *dir) {
-  const char *slash = strrchr(path, '/');
+  const char *slash = spelled ? strrchr(spelled, '/') : NULL;
   struct path p;
   char *dirname;
   bool same;
   int err;
 
-  if (!root || !slash || !dir)
+  if (!root || !slash || !dir || spelled[0] != '/')
     return false;
-  dirname = kstrndup(path, slash == path ? 1 : slash - path, GFP_KERNEL);
+  if (!slash[1] || !strcmp(slash + 1, ".") || !strcmp(slash + 1, ".."))
+    return false;
+  dirname = kstrndup(spelled, slash == spelled ? 1 : slash - spelled,
+                     GFP_KERNEL);
   if (!dirname)
     return false;
   err = vfs_path_lookup(root->dentry, root->mnt, dirname,
@@ -1598,7 +1610,7 @@ static bool unlink_dir_is(const struct path *root, const char *path,
 }
 
 void av_behavior_check_unlink(pid_t pid, const char *path,
-                              const struct path *root,
+                              const char *spelled, const struct path *root,
                               struct pid *target_pid) {
   const struct av_behavior_entry *e;
   const struct inode *lexical_dir = NULL;
@@ -1650,7 +1662,7 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
   mutex_unlock(&behavior_lock);
 
   if (lexical_dir)
-    self_delete = unlink_dir_is(root, path, lexical_dir);
+    self_delete = unlink_dir_is(root, spelled, lexical_dir);
 
   sensitive = path_is_sensitive(path);
 

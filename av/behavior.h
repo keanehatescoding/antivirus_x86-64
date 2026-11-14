@@ -105,11 +105,14 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
  * list, killing target_pid and logging on either match. Trust status
  * does NOT exempt this check - deleting your own binary or a sensitive
  * path is worth flagging regardless of how trusted the process is.
- * `pid` is the tgid - see the note above. `root` is the unlinking
- * task's root at the syscall, or NULL; a lexical-key match is resolved
- * from it (see unlink_dir_is() in behavior.c) and dropped without it. */
+ * `pid` is the tgid - see the note above. `path` is the normalized
+ * target (matched against the keys and the sensitive list); `spelled`
+ * is the same target unnormalized, as the syscall walks it, or NULL.
+ * A lexical-key match is confirmed by resolving `spelled`'s directory
+ * from `root`, the unlinking task's root at the syscall (see
+ * unlink_dir_is() in behavior.c), and dropped when either is NULL. */
 void av_behavior_check_unlink(pid_t pid, const char *path,
-                               const struct path *root,
+                               const char *spelled, const struct path *root,
                                struct pid *target_pid);
 
 /* Called from the rename/renameat/renameat2 work handler. Flags a

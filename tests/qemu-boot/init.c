@@ -306,7 +306,13 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
   if (on_record && *saw_record)
     on_record();
 
-  if (write(sync_fd[1], "x", 1) != 1)
+  /* EPIPE means the child is already gone: in D/E the helper's first
+   * unlink is checked on an unbound workqueue and can land after the
+   * record, killing the child before this write - a correct detection,
+   * judged by the wait and the caller's assertions below like any
+   * other. (pid 1 never takes SIGPIPE's default action, so the write
+   * returns the error rather than killing init.) */
+  if (write(sync_fd[1], "x", 1) != 1 && errno != EPIPE)
     die("write(self-delete sync)");
   close(sync_fd[1]);
   wait_for_exit(pid, 15000, exit_code, term_sig);
@@ -720,6 +726,49 @@ int main(int argc, char *const argv[]) {
         outmsg("QEMU_TEST: FAIL: self-delete case g's unlink did not "
                "remove /tmp/sd_other/g and leave /tmp/sd_real/g - the "
                "retarget did not take effect\n");
+        failed = 1;
+      }
+    }
+    /* H: exec through a directory symlink, then unlink through that
+     * symlink followed by ".." -> NOT killed. /tmp/sd_hx/link ->
+     * /tmp/sd_hy/sub; the child execs /tmp/sd_hx/link/h and unlinks
+     * /tmp/sd_hx/link/../link/h. That collapses lexically to the exec's
+     * key, but the kernel follows the link before the "..", so the
+     * unlink removes /tmp/sd_hy/link/h and the image is untouched.
+     * Checking the collapsed name's directory found /tmp/sd_hy/sub and
+     * killed (CodeRabbit on x86 #229); the check now walks the
+     * spelling the syscall walked. */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+      struct stat st;
+
+      if (mkdir("/tmp/sd_hx", 0755) != 0 || mkdir("/tmp/sd_hy", 0755) != 0 ||
+          mkdir("/tmp/sd_hy/sub", 0755) != 0 ||
+          mkdir("/tmp/sd_hy/link", 0755) != 0)
+        die("mkdir case h dirs");
+      if (symlink("/tmp/sd_hy/sub", "/tmp/sd_hx/link") != 0)
+        die("symlink /tmp/sd_hx/link");
+      copy_file("/init", "/tmp/sd_hy/sub/h");
+      copy_file("/init", "/tmp/sd_hy/link/h");
+      killed = run_self_delete_case("/tmp/sd_hx/link/h", "--self-unlink",
+                                    "/tmp/sd_hy/sub/h",
+                                    "/tmp/sd_hx/link/../link/h", NULL, &code,
+                                    &sig, &saw_record);
+      outmsg("QEMU_TEST: self-delete case h (\"..\" after a dir symlink): "
+             "exec /tmp/sd_hx/link/h, unlink /tmp/sd_hx/link/../link/h -> "
+             "%s (exit=%d sig=%d, exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (!saw_record || killed || code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete case h expected a seen exec "
+               "record, no kill and exit 43 (44 = sync read, 45 = "
+               "unlink)\n");
+        failed = 1;
+      } else if (stat("/tmp/sd_hy/sub/h", &st) != 0 ||
+                 stat("/tmp/sd_hy/link/h", &st) == 0) {
+        outmsg("QEMU_TEST: FAIL: self-delete case h's unlink did not "
+               "remove /tmp/sd_hy/link/h and leave /tmp/sd_hy/sub/h - the "
+               "\"..\" did not resolve physically\n");
         failed = 1;
       }
     }

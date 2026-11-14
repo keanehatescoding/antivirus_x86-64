@@ -426,14 +426,15 @@ static void normalize_abs_path(char *path, size_t path_len) {
  * failure this falls back to copying `path` through unresolved rather
  * than dropping the event - a degraded (pre-fix) check on this one
  * call is better than silently skipping it. */
-static void resolve_absolute_path(const char *path, const struct path *base,
-                                  char *out, size_t out_len) {
+static void join_base_path(const char *path, const struct path *base,
+                           char *out, size_t out_len, bool normalize) {
   char *tmp;
   char *dirpath;
 
   if (path[0] == '/') {
     strscpy(out, path, out_len);
-    normalize_abs_path(out, out_len);
+    if (normalize)
+      normalize_abs_path(out, out_len);
     return;
   }
 
@@ -485,11 +486,44 @@ static void resolve_absolute_path(const char *path, const struct path *base,
 
     if (need < 0 || (size_t)need >= out_len)
       strscpy(out, path, out_len);
-    else
+    else if (normalize)
       normalize_abs_path(out, out_len);
   }
 
   kfree(tmp);
+}
+
+static void resolve_absolute_path(const char *path, const struct path *base,
+                                  char *out, size_t out_len) {
+  join_base_path(path, base, out, out_len, true);
+}
+
+/* The unlink target made absolute but spelled exactly as the syscall
+ * walks it: no "." / ".." collapsing. The kernel follows a directory
+ * symlink before applying a ".." after it, so the collapsed spelling
+ * can name a different directory than the one the unlink touches. The
+ * self-delete check confirms its lexical match against this (see
+ * unlink_dir_is() in behavior.c). Returns NULL when that spelling is
+ * unavailable, which only drops a lexical-key match; *owned is set
+ * when the result must be kfree()d. */
+static const char *unlink_spelled_path(const char *path,
+                                       const struct path *base,
+                                       char **owned) {
+  char *buf;
+
+  *owned = NULL;
+  if (path[0] == '/')
+    return path;
+  buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (!buf)
+    return NULL;
+  join_base_path(path, base, buf, PATH_MAX, false);
+  if (buf[0] != '/') {
+    kfree(buf);
+    return NULL;
+  }
+  *owned = buf;
+  return buf;
 }
 
 struct av_work {
@@ -1604,8 +1638,12 @@ struct av_unlink_work {
 static void av_unlink_work_fn(struct work_struct *w) {
   struct av_unlink_work *uw = container_of(w, struct av_unlink_work, work);
   char *abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
+  const char *spelled;
+  char *spelled_buf;
 
   if (!abs_path) {
+    if (uw->has_root)
+      path_put(&uw->root);
     path_put(&uw->base);
     put_pid(uw->target_pid);
     kfree(uw);
@@ -1614,9 +1652,11 @@ static void av_unlink_work_fn(struct work_struct *w) {
   }
 
   resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
-  av_behavior_check_unlink(uw->pid, abs_path,
+  spelled = unlink_spelled_path(uw->path, &uw->base, &spelled_buf);
+  av_behavior_check_unlink(uw->pid, abs_path, spelled,
                            uw->has_root ? &uw->root : NULL, uw->target_pid);
 
+  kfree(spelled_buf);
   kfree(abs_path);
   if (uw->has_root)
     path_put(&uw->root);
