@@ -48,7 +48,9 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
+#include <linux/random.h>
 #include <linux/seq_file.h>
+#include <linux/siphash.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/stringhash.h>
@@ -281,6 +283,15 @@ struct av_behavior_entry {
   struct hlist_node node;
   pid_t pid; /* tgid (process ID), not a thread id - see behavior.h */
   char exec_path[PATH_MAX]; /* recorded at execve time, empty if unknown */
+  /* Second self-delete key: siphash of the lexical exec path (see
+   * av_behavior_record_exec()). A hash rather than another PATH_MAX
+   * buffer, which across MAX_BEHAVIOR_ENTRIES would be up to 32 MiB
+   * more. Keyed with a per-load random key and 64 bits wide, so a
+   * false match needs a collision nobody can aim for: with merged
+   * /usr, every process exec'd as /bin/... carries this key, and an
+   * `rm -rf` of millions of files must not trip it by chance. */
+  u64 exec_lexical_hash;
+  bool exec_lexical_set;
 
   /* Dedup ring buffer for the rapid-write-open heuristic - counts
    * DISTINCT paths written in a TRUE trailing window (see
@@ -1414,6 +1425,7 @@ static void behavior_gc_fn(struct work_struct *w) {
        * new occupant is never judged on the previous process's activity. */
       e->start_time = cur_start;
       e->exec_path[0] = '\0';
+      e->exec_lexical_set = false;
       e->trusted = false;
       e->recent_path_next = 0;
       e->recent_path_filled = 0;
@@ -1431,7 +1443,15 @@ static void behavior_gc_fn(struct work_struct *w) {
                      msecs_to_jiffies(GC_INTERVAL_MS));
 }
 
+/* Key for exec_lexical_hash - generated once in av_behavior_init(). */
+static siphash_key_t exec_lexical_key;
+
+static u64 lexical_key_hash(const char *path) {
+  return siphash(path, strlen(path), &exec_lexical_key);
+}
+
 void av_behavior_record_exec(pid_t pid, const char *path,
+                             const char *lexical_path,
                              const char *sha256_hex, u64 start_time) {
   struct av_behavior_entry *e;
   /* cppcheck-suppress knownConditionTrueFalse
@@ -1445,6 +1465,11 @@ void av_behavior_record_exec(pid_t pid, const char *path,
   e = get_or_create_entry(pid);
   if (e) {
     strscpy(e->exec_path, path, sizeof(e->exec_path));
+    /* Cleared on every exec that has no lexical key, so a re-exec
+     * never inherits the previous image's. */
+    e->exec_lexical_set = lexical_path && lexical_path[0] == '/';
+    e->exec_lexical_hash =
+        e->exec_lexical_set ? lexical_key_hash(lexical_path) : 0;
     e->trusted = trusted;
     /* A reused pid can land on a stale entry left behind by a
      * previous, unrelated process (get_or_create_entry() matches on
@@ -1521,9 +1546,14 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
   const struct av_behavior_entry *e;
   bool self_delete = false;
   bool sensitive;
+  u64 path_hash;
 
   if (path_is_pseudo_fs(path))
     return;
+
+  /* Outside the lock - only needed for an absolute path (same leading-
+   * '/' rule as below), and only compared, never stored. */
+  path_hash = path[0] == '/' ? lexical_key_hash(path) : 0;
 
   mutex_lock(&behavior_lock);
   /* Read-only lookup, deliberately NOT get_or_create_entry(): every
@@ -1546,8 +1576,13 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
    * one of those fallbacks could otherwise share the exact same
    * leftover relative remainder and falsely strcmp() equal here,
    * triggering a self-delete kill of an unrelated process. */
-  if (e && e->exec_path[0] == '/' && path[0] == '/' &&
-      !strcmp(e->exec_path, path))
+  /* Either recorded key counts: exec_path is the d_path() of the
+   * executed file (symlinks followed), the lexical hash is the name
+   * exec was given (symlinks not followed, like `path` here). See
+   * av_exec_lexical_path() in main.c. */
+  if (e && path[0] == '/' &&
+      ((e->exec_path[0] == '/' && !strcmp(e->exec_path, path)) ||
+       (e->exec_lexical_set && e->exec_lexical_hash == path_hash)))
     self_delete = true;
   mutex_unlock(&behavior_lock);
 
@@ -1617,6 +1652,8 @@ void av_behavior_check_rename(pid_t pid, const char *oldpath,
 
 int av_behavior_init(void) {
   int ret;
+
+  get_random_bytes(&exec_lexical_key, sizeof(exec_lexical_key));
 
   hash_init(behavior_table);
   hash_init(trust_table);

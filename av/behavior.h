@@ -67,8 +67,15 @@ void av_behavior_exit(void);
  * is the exec'ing task's `task_struct->start_time`, captured by the
  * caller while running in that task's own context - see the
  * pid-reuse-vs-re-exec note on this function's definition for why
- * it's needed. */
+ * it's needed.
+ *
+ * `path` is the executed file's d_path() (symlinks followed);
+ * `lexical_path`, or NULL, is the name exec was asked to run, made
+ * absolute without following symlinks. av_behavior_check_unlink()
+ * counts an unlink of either as a self-delete - see
+ * av_exec_lexical_path() in main.c for why both are needed. */
 void av_behavior_record_exec(pid_t pid, const char *path,
+                              const char *lexical_path,
                               const char *sha256_hex, u64 start_time);
 
 /* Called from the openat work handler. If the open is write-intent
@@ -84,7 +91,7 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                                struct pid *target_pid);
 
 /* Called from the unlink/unlinkat work handler. Checks self-delete
- * (path matches this pid's recorded exec path) and the sensitive-path
+ * (path matches either of this pid's recorded exec paths) and the sensitive-path
  * list, killing target_pid and logging on either match. Trust status
  * does NOT exempt this check - deleting your own binary or a sensitive
  * path is worth flagging regardless of how trusted the process is.

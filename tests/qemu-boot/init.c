@@ -20,17 +20,21 @@
  * lost), for reasons not fully root-caused. write() sidesteps
  * whatever that was rather than chasing it further.
  *
- * Runs in one of two modes:
+ * Runs in one of three modes:
  *   - argv[1] == "--clean-marker": immediately exit(42). This is what
  *     gets exec'd as the "definitely not malicious" test case - no
  *     separate coreutils/busybox binary needed, we just re-exec
  *     ourselves.
+ *   - argv[1] == "--self-unlink" <path>: wait for a byte on fd 3, then
+ *     unlink <path> and linger (exit 43 if still alive). Run from a
+ *     copy of this binary by the self-delete correlation case.
  *   - no args (PID 1): the actual init/test-runner logic below.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/reboot.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +44,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define EICAR                                                                \
@@ -147,9 +152,143 @@ static char *read_kernel_log(void) {
   return buf;
 }
 
+/* ---- helpers for the self-delete correlation case ---- */
+
+static void sleep_ms(long ms) {
+  struct timespec ts = {.tv_sec = ms / 1000,
+                        .tv_nsec = (ms % 1000) * 1000 * 1000L};
+
+  nanosleep(&ts, NULL);
+}
+
+static void copy_file(const char *src, const char *dst) {
+  char buf[65536];
+  int in = open(src, O_RDONLY);
+  int out;
+  ssize_t n;
+
+  if (in < 0)
+    die("open copy source");
+  out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+  if (out < 0)
+    die("open copy destination");
+  while ((n = read(in, buf, sizeof(buf))) > 0) {
+    if (write(out, buf, (size_t)n) != n)
+      die("write copy destination");
+  }
+  if (n < 0)
+    die("read copy source");
+  close(in);
+  close(out);
+}
+
+/* Waits up to timeout_ms for `pid`, SIGKILLing (and reaping) it if it
+ * is still running then. *exit_code is -1 unless it exited normally;
+ * *term_sig is 0 unless a signal ended it. A timeout reports the
+ * timeout's own SIGKILL as -1/0 so it can't pass for a detection. */
+static void wait_for_exit(pid_t pid, int timeout_ms, int *exit_code,
+                          int *term_sig) {
+  int status;
+  int waited = 0;
+
+  for (;;) {
+    pid_t r = waitpid(pid, &status, WNOHANG);
+
+    if (r < 0)
+      die("waitpid");
+    if (r == pid)
+      break;
+    if (waited >= timeout_ms) {
+      kill(pid, SIGKILL);
+      if (waitpid(pid, &status, 0) < 0)
+        die("waitpid after timeout");
+      *exit_code = -1;
+      *term_sig = 0;
+      return;
+    }
+    sleep_ms(50);
+    waited += 50;
+  }
+  *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  *term_sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+}
+
+/* Execs `exec_path` (a copy of /init) in --self-unlink mode, lets it
+ * unlink `unlink_path` once av.ko has recorded the exec, and reports
+ * how it ended. `recorded_path` is the d_path() av.ko logs for the
+ * exec (symlinks followed); its event=clean line for this pid is the
+ * signal that av_behavior_record_exec() has run, since av_work_fn()
+ * records before it logs. That line is ratelimited, so if it never
+ * shows the case proceeds after SELF_DELETE_RECORD_WAIT_MS anyway -
+ * an unscanned exec would leave no record and fail the kill
+ * assertion, not pass it. Returns 1 if the child was SIGKILLed. */
+#define SELF_DELETE_RECORD_WAIT_MS 5000
+static int run_self_delete_case(const char *exec_path,
+                                const char *recorded_path,
+                                const char *unlink_path, int *exit_code,
+                                int *term_sig, int *saw_record) {
+  int sync_fd[2];
+  pid_t pid;
+  char needle[256];
+  int waited = 0;
+
+  if (pipe(sync_fd) != 0)
+    die("pipe(self-delete sync)");
+  pid = fork();
+  if (pid < 0)
+    die("fork(self-delete)");
+  if (pid == 0) {
+    char *const cargv[] = {(char *)exec_path, "--self-unlink",
+                           (char *)unlink_path, NULL};
+
+    close(sync_fd[1]);
+    if (sync_fd[0] != 3) {
+      if (dup2(sync_fd[0], 3) < 0)
+        _exit(126);
+      close(sync_fd[0]);
+    }
+    execv(exec_path, cargv);
+    _exit(127);
+  }
+  close(sync_fd[0]);
+
+  snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", recorded_path,
+           (int)pid);
+  *saw_record = 0;
+  while (waited < SELF_DELETE_RECORD_WAIT_MS) {
+    if (strstr(read_kernel_log(), needle)) {
+      *saw_record = 1;
+      break;
+    }
+    sleep_ms(50);
+    waited += 50;
+  }
+
+  if (write(sync_fd[1], "x", 1) != 1)
+    die("write(self-delete sync)");
+  close(sync_fd[1]);
+  wait_for_exit(pid, 15000, exit_code, term_sig);
+  return *term_sig == SIGKILL;
+}
+
 int main(int argc, char *const argv[]) {
   if (argc > 1 && !strcmp(argv[1], "--clean-marker")) {
     _exit(42);
+  }
+  /* Child half of the self-delete case below, run as a COPY of this
+   * binary: block until the parent writes one byte to fd 3 (it does so
+   * once av.ko has recorded this exec), unlink argv[2], then linger so
+   * the kernel's asynchronous self-delete kill has time to land. Exit
+   * 43 means it was NOT killed; 44/45 mean the helper itself broke. */
+  if (argc > 2 && !strcmp(argv[1], "--self-unlink")) {
+    char c;
+
+    if (read(3, &c, 1) != 1)
+      _exit(44);
+    if (unlink(argv[2]) != 0)
+      _exit(45);
+    sleep(5);
+    _exit(43);
   }
 
   /* ---- pid 1 setup ---- */
@@ -291,6 +430,88 @@ int main(int argc, char *const argv[]) {
     }
   }
   outmsg("QEMU_TEST: cold-pathname check passed\n");
+
+  /* ---- regression case: self-delete correlation through a directory
+   * symlink ----
+   * av_behavior_check_unlink() kills a process that unlinks its own
+   * executable, matched by path string. The unlink side spells the path
+   * lexically (resolve_absolute_path(): symlinks NOT followed); since
+   * the security_bprm_check() hook the exec side records d_path() of
+   * the executed file, which DOES follow them. With only that key,
+   * exec /tmp/sd_alias/a followed by unlink("/tmp/sd_alias/a")
+   * compared /tmp/sd_real/a against /tmp/sd_alias/a and missed. av.ko
+   * now also records the exec name lexically (av_exec_lexical_path()),
+   * and an unlink matching either key counts.
+   *
+   *   A: exec via the alias, unlink via the alias  -> killed (lexical key)
+   *   B: exec via the alias, unlink via the real dir -> killed (d_path key)
+   *   C: exec via the alias, unlink an unrelated file -> NOT killed
+   *
+   * C is the control: it proves the kills in A and B come from the
+   * self-delete match and not from something else about the setup. */
+  {
+    static const struct {
+      const char *name;   /* file under /tmp/sd_real */
+      const char *unlink; /* what the child unlinks */
+      int expect_kill;
+    } cases[] = {
+        {"a", "/tmp/sd_alias/a", 1},
+        {"b", "/tmp/sd_real/b", 1},
+        {"c", "/tmp/sd_real/c_other", 0},
+    };
+    int failed = 0;
+
+    if (mkdir("/tmp/sd_real", 0755) != 0)
+      die("mkdir /tmp/sd_real");
+    if (symlink("/tmp/sd_real", "/tmp/sd_alias") != 0)
+      die("symlink /tmp/sd_alias");
+    write_file("/tmp/sd_real/c_other", "not the executable\n");
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      char real[64], alias[64];
+      int code, sig, saw_record, killed;
+
+      snprintf(real, sizeof(real), "/tmp/sd_real/%s", cases[i].name);
+      snprintf(alias, sizeof(alias), "/tmp/sd_alias/%s", cases[i].name);
+      copy_file("/init", real);
+      killed = run_self_delete_case(alias, real, cases[i].unlink, &code,
+                                    &sig, &saw_record);
+      outmsg("QEMU_TEST: self-delete case %s: exec %s, unlink %s -> "
+             "%s (exit=%d sig=%d, exec record %s)\n",
+             cases[i].name, alias, cases[i].unlink,
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (killed != cases[i].expect_kill) {
+        outmsg("QEMU_TEST: FAIL: self-delete case %s expected %s\n",
+               cases[i].name, cases[i].expect_kill ? "a kill" : "no kill");
+        failed = 1;
+      } else if (!killed && code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete control case %s exited %d, "
+               "not 43 - the helper itself broke (44 = sync read, "
+               "45 = unlink)\n",
+               cases[i].name, code);
+        failed = 1;
+      }
+    }
+    if (!failed) {
+      const char *log = read_kernel_log();
+
+      if (!strstr(log, "path=\"/tmp/sd_alias/a\" reason=\"self-deleting "
+                       "binary") ||
+          !strstr(log, "path=\"/tmp/sd_real/b\" reason=\"self-deleting "
+                       "binary")) {
+        outmsg("QEMU_TEST: FAIL: self-delete kills happened but dmesg is "
+               "missing a reason=\"self-deleting binary\" line for them\n");
+        failed = 1;
+      }
+    }
+    if (failed) {
+      outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
+      reboot(RB_POWER_OFF);
+      return 1;
+    }
+  }
+  outmsg("QEMU_TEST: self-delete correlation check passed\n");
 
   pass_and_poweroff();
   return 0; /* unreached */
