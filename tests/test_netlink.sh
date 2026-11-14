@@ -19,6 +19,10 @@
 #   - a real end-to-end AV_C_SCAN_REQUEST/AV_C_VERDICT round trip via
 #     the real avd binary, for both a clean and a malicious (YARA-only,
 #     not signature-table) exec
+#   - avd scans the file the kernel hashed, not whatever the path
+#     names by the time it opens it (#227): exec-then-unlink is
+#     answered UNAVAILABLE, exec-then-rename-a-decoy still convicts
+#     the real image via /proc/<pid>/exe and leaves the decoy alone
 #
 # Uses tests/netlink_test_helper.c, a throwaway genl client built only
 # by this script (never linked into avd or any shipped binary) -
@@ -133,6 +137,9 @@ cleanup() {
             kill "$p" 2>/dev/null
         fi
     done
+    # The #227 section clears it itself; this covers a fail mid-section
+    # so the host isn't left delaying every exec until rmmod.
+    echo 0 > /sys/module/av/parameters/av_toctou_test_delay_ms 2>/dev/null
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
     rm -rf "$TEST_TMP_DIR"
     rm -f "$BUILD_LOG" "$INSMOD_LOG" "$AVD_LOG" "$RMMOD_LOG"
@@ -408,7 +415,10 @@ cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 AVD_MARK="$(dmesg_mark)"
 (
     cd "$REPO_ROOT" || exit 1
-    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    # stdbuf -oL: avd's progress lines are printf()s, block-buffered
+    # into a file - the #227 section greps one ("via /proc/<pid>/exe")
+    # while avd is still running.
+    exec stdbuf -oL "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -500,6 +510,154 @@ else
     fail "expected daemon-path detected/kill log line not found in dmesg"
     dmesg | tail -10
 fi
+
+section "daemon scans the hashed file, not what the path names now (#227)"
+# av.ko hashes the exec's pinned bprm->file, but avd used to re-open the
+# PATH from the request: a rename in between made it scan a decoy, and an
+# unlink made the open fail, which it answered CLEAN. The test-only
+# av_toctou_test_delay_ms knob parks the kernel's work item before it
+# hashes (and so before the request reaches avd), so the swap below
+# always lands first instead of winning by luck.
+#
+# Everything between enabling the knob and the swap uses bash builtins
+# only: while it is set, every exec on the host parks a kernel worker
+# for TOCTOU_DELAY_MS, and a poll loop of `sleep`/`readlink` execs could
+# fill AV_MAX_INFLIGHT_WORK and get this test's own exec skipped. The
+# knob is cleared right after each swap - a work item already parked
+# keeps sleeping, and one not yet started no longer needs to.
+TOCTOU_DELAY_PARAM=/sys/module/av/parameters/av_toctou_test_delay_ms
+TOCTOU_DELAY_MS=1000
+# toctou_wait_until CMD... - spin (no execs, see above) until CMD
+# succeeds, for up to 3s. Returns CMD's last status.
+toctou_wait_until() {
+    local deadline=$(( ${EPOCHSECONDS:-$(date +%s)} + 3 ))
+    until "$@"; do
+        [ "$EPOCHSECONDS" -ge "$deadline" ] && return 1
+    done
+}
+# script_execd PID PATH - PID has exec'd the script PATH (its argv[1]
+# under the interpreter).
+script_execd() {
+    local -a args=()
+    mapfile -d '' -t args < "/proc/$1/cmdline" 2>/dev/null || return 1
+    [ "${args[1]:-}" = "$2" ]
+}
+# binary_execd PID PATH - PID's image is PATH's inode.
+binary_execd() { [[ "/proc/$1/exe" -ef "$2" ]]; }
+
+if [ ! -w "$TOCTOU_DELAY_PARAM" ]; then
+    fail "$TOCTOU_DELAY_PARAM missing - av.ko built without the test knob?"
+elif [ -z "${EPOCHSECONDS:-}" ]; then
+    echo "  SKIP: needs bash >= 5.0 (EPOCHSECONDS) for the exec-free wait"
+else
+    # (a) exec, then unlink. avd can't open the path, and /proc/<pid>/exe
+    # names the interpreter, not the script, so the only honest answer
+    # is UNAVAILABLE: the kernel must log event=unverified for it and
+    # never event=clean. Malicious content, so the old CLEAN answer is
+    # visibly wrong. d_path() may run before or after the unlink, so
+    # both "<path>" and "<path> (deleted)" are matched (prefix).
+    UNL_UNVERIFIED=0
+    UNL_CLEAN=0
+    for i in 1 2 3; do
+        p="$TEST_TMP_DIR/id_unlink_$i.sh"
+        printf '#!/bin/sh\n# attempt %s\necho "/bin/sh -i" >/dev/null\nsleep 3\n' \
+            "$i" > "$p"
+        chmod +x "$p"
+        MARK="$(dmesg_mark)"
+        echo "$TOCTOU_DELAY_MS" > "$TOCTOU_DELAY_PARAM"
+        "$p" >/dev/null 2>&1 &
+        cpid=$!
+        if toctou_wait_until script_execd "$cpid" "$p"; then
+            rm -f "$p"
+        else
+            echo "  (attempt $i: exec of $p not observed in time)"
+        fi
+        echo 0 > "$TOCTOU_DELAY_PARAM"
+        if wait_dmesg_since "$MARK" "event=unverified type=daemon path=\"$p" 15; then
+            UNL_UNVERIFIED=$((UNL_UNVERIFIED + 1))
+        fi
+        if dmesg_since "$MARK" | grep -q -- "event=clean type=daemon path=\"$p"; then
+            UNL_CLEAN=$((UNL_CLEAN + 1))
+        fi
+        wait "$cpid" 2>/dev/null
+    done
+    echo "  unlink: unverified=$UNL_UNVERIFIED/3 clean=$UNL_CLEAN/3"
+    if [ "$UNL_CLEAN" -eq 0 ] && [ "$UNL_UNVERIFIED" -gt 0 ]; then
+        pass "exec-then-unlink is answered UNAVAILABLE (logged unverified), never clean"
+    elif [ "$UNL_CLEAN" -ne 0 ]; then
+        fail "exec-then-unlink was logged clean - avd answered for a file it never scanned"
+    else
+        fail "exec-then-unlink logged neither clean nor unverified - see $AVD_LOG"
+        dmesg | tail -10
+    fi
+
+    # (b) exec a binary carrying the fixture's "/bin/sh -i" marker, then
+    # rename a clean decoy over its path. avd's open of the path now
+    # reaches the decoy, fails the dev/ino check, and falls back to
+    # /proc/<pid>/exe - the real image - which must still convict and
+    # SIGKILL it. The decoy must survive: quarantine only unlinks the
+    # path after an lstat() re-check against the scanned fd. Before #227
+    # avd scanned the decoy, answered CLEAN, and the child exited 43.
+    LINGER_SRC="$TEST_TMP_DIR/linger.c"
+    LINGER_BIN="$TEST_TMP_DIR/linger"
+    cat > "$LINGER_SRC" <<'CEOF'
+#include <unistd.h>
+/* Matches tests/fixtures/test.yar (Suspicious_Shell_Reverse_Shell_String);
+ * never runs a shell. */
+__attribute__((used)) static const char marker[] = "/bin/sh -i";
+int main(void) {
+  volatile const char *keep = marker;
+  (void)keep;
+  sleep(8);
+  return 43;
+}
+CEOF
+    if ! gcc -O0 -o "$LINGER_BIN" "$LINGER_SRC" 2>>"$BUILD_LOG"; then
+        fail "could not build the rename-case test binary - see $BUILD_LOG"
+    else
+        REN_KILLED=0
+        REN_DECOY_KEPT=0
+        REN_VIA_EXE=0
+        for i in 1 2; do
+            p="$TEST_TMP_DIR/id_rename_$i"
+            cp "$LINGER_BIN" "$p"
+            chmod +x "$p"
+            printf 'clean decoy %s\n' "$i" > "$p.decoy"
+            echo "$TOCTOU_DELAY_MS" > "$TOCTOU_DELAY_PARAM"
+            "$p" >/dev/null 2>&1 &
+            cpid=$!
+            if toctou_wait_until binary_execd "$cpid" "$p"; then
+                mv -f "$p.decoy" "$p"
+            else
+                echo "  (attempt $i: exec of $p not observed in time)"
+            fi
+            echo 0 > "$TOCTOU_DELAY_PARAM"
+            wait "$cpid" 2>/dev/null
+            rc=$?
+            echo "  rename attempt $i: child exit status $rc (137 = SIGKILL)"
+            [ "$rc" -eq 137 ] && REN_KILLED=$((REN_KILLED + 1))
+            [ "$(cat "$p" 2>/dev/null)" = "clean decoy $i" ] && \
+                REN_DECOY_KEPT=$((REN_DECOY_KEPT + 1))
+            grep -qF "via /proc/$cpid/exe" "$AVD_LOG" && REN_VIA_EXE=$((REN_VIA_EXE + 1))
+        done
+        if [ "$REN_KILLED" -eq 2 ]; then
+            pass "exec-then-rename-a-decoy still convicts and kills the real image"
+        else
+            fail "only $REN_KILLED of 2 exec-then-rename children were SIGKILLed - see $AVD_LOG"
+        fi
+        if [ "$REN_DECOY_KEPT" -eq 2 ]; then
+            pass "the decoy renamed over the path was left in place"
+        else
+            fail "the decoy at the path was removed or changed ($REN_DECOY_KEPT of 2 kept)"
+        fi
+        if [ "$REN_VIA_EXE" -eq 2 ]; then
+            pass "avd reached the real image via /proc/<pid>/exe"
+        else
+            fail "avd log shows /proc/<pid>/exe scans for $REN_VIA_EXE of 2 renames - see $AVD_LOG"
+        fi
+    fi
+fi
+echo 0 > "$TOCTOU_DELAY_PARAM" 2>/dev/null
 
 section "SIGTERM with an unterminated multipart message pending"
 # One NLM_F_MULTI message with no NLMSG_DONE makes libnl's recvmsgs()

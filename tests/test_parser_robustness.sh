@@ -131,7 +131,8 @@ int main(void) {
      * av_verdict_valid() is the production helper netlink_chan.c calls. */
     CHECK(av_verdict_valid(0) == 1, "netlink verdict accepts CLEAN (0)");
     CHECK(av_verdict_valid(1) == 1, "netlink verdict accepts MALICIOUS (1)");
-    CHECK(av_verdict_valid(2) == 0, "netlink verdict rejects 2");
+    CHECK(av_verdict_valid(2) == 1, "netlink verdict accepts UNAVAILABLE (2, issue #227)");
+    CHECK(av_verdict_valid(3) == 0, "netlink verdict rejects 3");
     CHECK(av_verdict_valid(42) == 0, "netlink verdict rejects 42");
     CHECK(av_verdict_valid(255) == 0, "netlink verdict rejects 255");
 
