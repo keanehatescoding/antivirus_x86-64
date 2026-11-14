@@ -1610,7 +1610,8 @@ static bool unlink_dir_is(const struct path *root, const char *spelled,
 }
 
 void av_behavior_check_unlink(pid_t pid, const char *path,
-                              const char *lexical, const char *spelled,
+                              bool path_is_workers, const char *lexical,
+                              const char *spelled,
                               const struct path *root,
                               struct pid *target_pid) {
   const struct av_behavior_entry *e;
@@ -1657,7 +1658,14 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
   /* The lexical key is compared against `lexical`, not `path`: both
    * it and the exec's key are spelled from the task's root, `path`
    * from this worker's (see av_rebase_on_root() in main.c). */
-  if (e && path[0] == '/' && e->exec_path[0] == '/' &&
+  /* The d_path() key is spelled from the worker's root, so `path` has
+   * to be too. A chroot()ed task's absolute spelling is not: rooted at
+   * /j, its exec of "tool" records /j/tool, while its unlink of
+   * "/j/tool" removes the host's /j/j/tool and leaves the image alone
+   * (CodeRabbit on arm64 #134). That spelling can equal the key only by
+   * naming another file, so it is left to the lexical key, which is
+   * spelled and checked from the task's root. */
+  if (e && path_is_workers && path[0] == '/' && e->exec_path[0] == '/' &&
       !strcmp(e->exec_path, path))
     self_delete = true;
   else if (e && lexical && lexical[0] == '/' && e->exec_lexical_set &&

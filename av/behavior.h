@@ -107,14 +107,17 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
  * path is worth flagging regardless of how trusted the process is.
  * `pid` is the tgid - see the note above. `path` is the normalized
  * target (matched against the d_path() key and the sensitive list);
- * `lexical` is the same target spelled from the task's root and
+ * `path_is_workers` says `path` is spelled from the worker's root, as
+ * the d_path() key is: false for an absolute spelling by a chroot()ed
+ * task, which then matches through the lexical key only. `lexical` is the same target spelled from the task's root and
  * normalized, matched against the lexical key, or NULL; `spelled` is
  * that spelling unnormalized, as the syscall walks it, or NULL.
  * A lexical-key match is confirmed by resolving `spelled`'s directory
  * from `root`, the unlinking task's root at the syscall (see
  * unlink_dir_is() in behavior.c), and dropped when either is NULL. */
 void av_behavior_check_unlink(pid_t pid, const char *path,
-                               const char *lexical, const char *spelled,
+                               bool path_is_workers, const char *lexical,
+                               const char *spelled,
                                const struct path *root,
                                struct pid *target_pid);
 
