@@ -38,6 +38,12 @@ echo "### test_quarantine_unlink.sh (quarantine's removal of the original, #231)
 "$REPO_ROOT/tests/test_quarantine_unlink.sh" || FAIL=1
 
 echo
+echo "### test_quarantine_dirfd.sh (quarantine created through the pinned dirfd, #231) ###"
+# Same no-root-needed reasoning as test_sha256.sh above - pure
+# source-level greps, no module, no VM.
+"$REPO_ROOT/tests/test_quarantine_dirfd.sh" || FAIL=1
+
+echo
 echo "### test_corpus_format.sh (load-time corpus validation in userspace/avd/avd.c) ###"
 # Same no-root-needed reasoning as test_sha256.sh above - avd loads
 # both corpora before resolving the netlink family, so the expected
