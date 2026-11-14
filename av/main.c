@@ -426,6 +426,22 @@ static void normalize_abs_path(char *path, size_t path_len) {
  * failure this falls back to copying `path` through unresolved rather
  * than dropping the event - a degraded (pre-fix) check on this one
  * call is better than silently skipping it. */
+/* True when `root` is this worker's own root, i.e. names d_path()
+ * spells from here are also spelled from `root`. Any failure says no,
+ * which only costs the caller an optimization. */
+static bool av_root_is_workers(const struct path *root) {
+  char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  char *p;
+  bool same;
+
+  if (!buf)
+    return false;
+  p = d_path(root, buf, PATH_MAX);
+  same = !IS_ERR(p) && !strcmp(p, "/");
+  kfree(buf);
+  return same;
+}
+
 /* d_path() spells `base` from this worker's root, which is not the
  * root the task resolved its names from once it has chroot()ed: there
  * a task rooted at /j that unlinks "alias/tool" from its "/" removes
@@ -1119,12 +1135,12 @@ static const char *av_exec_self_delete_key(const struct file *f,
   return kstrndup(canonical, len - sfx_len, GFP_KERNEL) ?: canonical;
 }
 
-/* True when `key` (an absolute, lexically normalized name for the
- * executed file) names aw->file itself: its directory, resolved
- * following symlinks from the exec'ing task's root, is the directory
- * entry the executed dentry hangs off, on the same mount. Same
- * directory plus same final name (checked by the caller) means the
- * same directory entry. So a key that differs from d_path() only
+/* True when `key` (an absolute name for the executed file, spelled
+ * as exec walked it, not collapsed: see av_exec_lexical_path()) names
+ * aw->file itself: its directory, resolved following symlinks from the
+ * exec'ing task's root, is the directory entry the executed dentry
+ * hangs off, on the same mount. Same directory plus same final name
+ * (checked by the caller) means the same directory entry. So a key that differs from d_path() only
  * because a DIRECTORY on the way is a symlink is accepted, and one
  * whose final component is a symlink to the file (/tmp/link/tool ->
  * /tmp/real/tool) is rejected even though the basenames match:
@@ -1205,15 +1221,34 @@ static char *av_exec_lexical_path(const struct av_work *aw,
   if (!buf)
     return NULL;
   /* From the task's root, like av_exec_key_names_file()'s lookup
-   * below and the unlink side's spelling (av_rebase_on_root()). */
-  join_base_path(aw->exec_name, &aw->pwd, &aw->root, buf, PATH_MAX, true);
-  if (buf[0] != '/' || !strcmp(buf, canonical) ||
-      strcmp(kbasename(buf), kbasename(canonical)) ||
-      !av_exec_key_names_file(aw, buf)) {
-    kfree(buf);
-    return NULL;
-  }
+   * below and the unlink side's spelling (av_rebase_on_root()).
+   *
+   * Validated as spelled, collapsed only afterwards for the key: with
+   * /tmp/x/link -> /tmp/y/sub, an exec of /tmp/x/link/../tool runs
+   * /tmp/y/tool, because the kernel follows the link before the "..".
+   * The collapsed /tmp/x/tool would send the directory check to /tmp/x
+   * and drop the key, so an unlink of the same spelling matched
+   * nothing (CodeRabbit on #229). The unlink side works the same way:
+   * unlink_dir_is() walks the raw spelling, the hash uses the
+   * collapsed one. */
+  join_base_path(aw->exec_name, &aw->pwd, &aw->root, buf, PATH_MAX, false);
+  if (buf[0] != '/' || strcmp(kbasename(buf), kbasename(canonical)) ||
+      !av_exec_key_names_file(aw, buf))
+    goto drop;
+  normalize_abs_path(buf, PATH_MAX);
+  /* Equal to `canonical` makes the key redundant only when both are
+   * spelled from the same root. `canonical` is this worker's d_path(),
+   * the key the task's: a task chrooted to /j, with /j/j -> ., that
+   * execs "j/tool" has the key /j/tool and the canonical name /j/tool,
+   * but its unlink of "j/tool" spells /j/tool from its root and
+   * /j/j/tool from this worker's, so only the key matches it
+   * (CodeRabbit on #229). */
+  if (!strcmp(buf, canonical) && av_root_is_workers(&aw->root))
+    goto drop;
   return buf;
+drop:
+  kfree(buf);
+  return NULL;
 }
 
 /* Identity of the pinned exec file in the form userspace fstat() reports
