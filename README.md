@@ -47,7 +47,16 @@ scripts/               setup-hooks.sh, av-reload.sh
 ```bash
 sudo apt update
 sudo apt install build-essential linux-headers-$(uname -r) git
+sudo apt install libseccomp-dev   # for the avd end-to-end tests
 ```
+
+The end-to-end suites build `tests/avd_unit_seccomp.c` to run avd under
+`packaging/avd.service`'s `SystemCallFilter=` (virtme-ng has no systemd), and
+it links against libseccomp: `libseccomp-dev` on Debian/Ubuntu,
+`libseccomp-devel` on Fedora, `libseccomp` on Arch. Without it they fail
+with "cannot build tests/avd_unit_seccomp.c". `tests/run_fanotify_vng.sh`
+builds it inside a virtme-ng guest that shares the host's `/usr`, so there
+the package goes on the host.
 
 ## Building
 
