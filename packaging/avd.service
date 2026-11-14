@@ -61,10 +61,11 @@ ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib
 # the kernel keyring, mlock, setrlimit and friends - the spawner sets limits
 # with prlimit64, which stays in) and userfaultfd. A call outside the list
 # kills the caller (SIGSYS) rather than failing with an errno, like avd's own
-# filters; only calls newer than systemd's @known set get ENOSYS. In avd that
-# is a crash and a restart. In a privsep worker it is not: avd replaces the
-# worker and the scan fails open ("scan of ... failed ... result
-# inconclusive"), so watch for that line too. See
+# filters; only calls newer than systemd's @known set get ENOSYS, and with
+# AVD_PRIVSEP avd's own filters kill those anyway (the strictest stacked
+# filter wins). In avd a kill is a crash and a restart. In a privsep worker
+# it is not: avd replaces the worker and the scan fails open ("scan of ...
+# failed ... result inconclusive"), so watch for that line too. See
 # docs/privilege-separation.md, "The unit: SystemCallFilter=".
 #
 # tests/avd_unit_caps.sh reads these settings back out of this file to run

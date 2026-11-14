@@ -916,8 +916,21 @@ On systemd 262 the filter allows 365 calls.
 No `SystemCallErrorNumber=`, so a call outside the list kills the process
 with `SIGSYS`, as avd's own filters do. That holds for every call in systemd's
 `@known` group. A call outside `@known` (one newer than the systemd that runs
-the unit) gets `ENOSYS` instead. systemd does this on purpose, so libc can
-fall back to an older call. avd sees an ordinary error there, not a crash.
+the unit) gets `ENOSYS` from the unit filter instead. systemd does this on
+purpose, so libc can fall back to an older call.
+
+Whether avd actually sees that `ENOSYS` depends on the filters under it. The
+kernel runs every stacked filter and applies the strictest result, and
+`SECCOMP_RET_KILL_PROCESS` beats `SECCOMP_RET_ERRNO`:
+
+- Without `AVD_PRIVSEP=1`, the unit filter is the only one, so avd gets
+  `ENOSYS`: an ordinary error, not a crash.
+- With it, the main process, spawner and worker filters each kill on any call
+  they do not list, and none of them lists a call that new. So the call is
+  killed with `SIGSYS` whichever avd process makes it. There are two
+  exceptions. `clone3` in the main process gets `ENOSYS` from avd's own
+  filter. With `AVD_PRIVSEP_SECCOMP=log`, the main process's filter only logs,
+  which is weaker than `ERRNO`, so the unit's `ENOSYS` wins there.
 
 What a kill does depends on which process made the call:
 
@@ -953,7 +966,10 @@ fanotify 29 and 34). Three limits:
 - The helper kills on every unlisted call, including calls outside systemd's
   `@known` set, which the installed unit answers with `ENOSYS`. A newer libc
   that probes such a call and falls back can work under the unit but die
-  under the helper. Here the tests are stricter than the unit, never looser.
+  under the helper. This only matters without `AVD_PRIVSEP=1` (or for the
+  main process in log mode). Otherwise avd's own filters kill such a call
+  under either filter. Here the tests are stricter than the unit, never
+  looser.
 - It does not check that the real systemd runs the unit at all. That check is
   the first start of the installed unit.
 
@@ -1178,8 +1194,10 @@ cannot lock itself down stops avd at startup.
   and check the audit log. The unit filter has no log mode. On a new distribution, a
   gap in avd itself shows as avd killed by `SIGSYS`, with the call in the
   audit log (or in the core dump's signal info). A gap in a worker shows only
-  as `scan of ... failed ... result inconclusive` lines, and a call newer than
-  systemd's `@known` set shows as nothing at all: it gets `ENOSYS`.
+  as `scan of ... failed ... result inconclusive` lines. A call newer than
+  systemd's `@known` set shows as nothing at all without `AVD_PRIVSEP=1` (it
+  gets `ENOSYS`). With it, avd's own filters kill that call, so it shows up
+  the same way as any other gap in that process.
 
 ### End-to-end test with privilege separation on
 
