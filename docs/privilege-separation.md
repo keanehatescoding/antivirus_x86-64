@@ -884,9 +884,27 @@ SystemCallFilter=~@aio @keyring @memlock @resources userfaultfd
 ```
 
 Without `AVD_PRIVSEP=1` this is avd's only syscall filter. With it, it is the
-outermost of the stack: the main process carries it and its own filter (two),
-the spawner it and its own (two), a worker those two and the worker filter
-(three). The list comes from `strace -f` runs of the socket and fanotify
+outermost of the stack: the main process and the spawner each add their own
+filter under it, and a worker adds the worker filter under the spawner's.
+
+On x86-64 the unit itself installs two seccomp filters, not one (systemd 262,
+`src/core/exec-invoke.c`): `SystemCallArchitectures=native` loads a filter of
+its own that only refuses the x86 and x32 ABIs, and `SystemCallFilter=` then
+loads one for native calls. So `Seccomp_filters` in `/proc/PID/status` of the
+installed service reads:
+
+| process | installed unit | test helper |
+|---|---|---|
+| avd, no `AVD_PRIVSEP` | 2 | 1 |
+| avd main process | 3 | 2 |
+| spawner | 3 | 2 |
+| worker | 4 | 3 |
+
+The test helper (below) folds the architecture check into its one filter,
+which is why every count under the tests is one lower. Checked on systemd 262
+with a transient unit carrying the three lines above.
+
+The list comes from `strace -f` runs of the socket and fanotify
 suites, with and without `--privsep`: avd, the spawner and the workers make
 78 distinct calls between exec and exit, all in `@system-service` except
 `fanotify_init` and `fanotify_mark`. The `~` line takes out groups avd never
@@ -895,9 +913,27 @@ the other `@resources` calls; the spawner sets worker limits with `prlimit64`,
 which is in `@default`) and `userfaultfd`. None of the 78 is in those groups.
 On systemd 262 the filter allows 365 calls.
 
-No `SystemCallErrorNumber=`: a call outside the list kills avd with `SIGSYS`,
-as avd's own filters do, so a missing entry shows up as a crash and a restart
-(`Restart=on-failure`), not as a scan that quietly does less.
+No `SystemCallErrorNumber=`, so a call outside the list kills the process
+with `SIGSYS`, as avd's own filters do. That holds for every call in systemd's
+`@known` group. A call outside `@known` (one newer than the systemd that runs
+the unit) gets `ENOSYS` instead. systemd does this on purpose, so libc can
+fall back to an older call. avd sees an ordinary error there, not a crash.
+
+What a kill does depends on which process made the call:
+
+- **avd itself** (the main process, or any avd without `AVD_PRIVSEP=1`): avd
+  dies and systemd restarts it (`Restart=on-failure`). A missing entry shows
+  up as a crash and a restart.
+- **a worker**: avd keeps running. It replaces the worker and logs
+  `avd: privsep: scan of "PATH" failed: ... - worker replaced, result
+  inconclusive`. The scan counts as CLEAN plus inconclusive, and
+  `fan_run_task()` answers from the verdict alone, so the held exec is
+  allowed, even with the daemon policy set to fail-closed. A worker that hits
+  the same missing call every time makes every scan fail open while the
+  service looks healthy. With privilege separation on, alert on that log line
+  as well as on restarts.
+- **the spawner**: avd logs `privsep spawner lost` and the cause (see
+  "Spawner death is logged with its cause").
 
 The end-to-end tests have no systemd to install it, so `tests/avd_unit_caps.sh`
 reads the two `SystemCallFilter=` lines (it accepts only an allowlist first and
@@ -907,12 +943,19 @@ the result the way systemd does: kill on anything else or any other
 architecture, plus the calls systemd always allows (`execve`, `exit_group`,
 `rt_sigreturn`, the clock reads and sleeps). Every avd in both suites starts
 under `setpriv ... -- avd_unit_seccomp NAME... -- avd`. The suites check
-`Seccomp` 2 and the `Seccomp_filters` counts above on every avd thread, the
-spawner and each worker. All four runs pass in a virtme-ng guest (socket 29
-checks without `--privsep` and 32 with it, fanotify 29 and 34). Two limits:
-the emulation trusts the host's `systemd-analyze` to expand the groups as the
-systemd that runs the unit will, and it does not check that the real systemd
-runs the unit at all. That check is the first start of the installed unit.
+`Seccomp` 2 and the helper's `Seccomp_filters` counts in the table above on
+every avd thread, the spawner and each worker. All four runs pass in a
+virtme-ng guest (socket 29 checks without `--privsep` and 32 with it,
+fanotify 29 and 34). Three limits:
+
+- The emulation trusts the host's `systemd-analyze` to expand the groups the
+  same way as the systemd that runs the unit.
+- The helper kills on every unlisted call, including calls outside systemd's
+  `@known` set, which the installed unit answers with `ENOSYS`. A newer libc
+  that probes such a call and falls back can work under the unit but die
+  under the helper. Here the tests are stricter than the unit, never looser.
+- It does not check that the real systemd runs the unit at all. That check is
+  the first start of the installed unit.
 
 ## Rollout
 
@@ -1132,9 +1175,11 @@ cannot lock itself down stops avd at startup.
 - The parent's filter and the unit's `SystemCallFilter=` have been traced and
   tested on one distribution (glibc 2.44, Linux 7.3, systemd 262). Before the
   parent filter is enabled elsewhere, run once with `AVD_PRIVSEP_SECCOMP=log`
-  and check the audit log. The unit filter has no log mode; on a new distribution, a
-  gap shows as avd killed by `SIGSYS`, with the call in the audit log (or in
-  the core dump's signal info).
+  and check the audit log. The unit filter has no log mode. On a new distribution, a
+  gap in avd itself shows as avd killed by `SIGSYS`, with the call in the
+  audit log (or in the core dump's signal info). A gap in a worker shows only
+  as `scan of ... failed ... result inconclusive` lines, and a call newer than
+  systemd's `@known` set shows as nothing at all: it gets `ENOSYS`.
 
 ### End-to-end test with privilege separation on
 

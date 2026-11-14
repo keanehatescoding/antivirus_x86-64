@@ -163,8 +163,10 @@ avd_unit_seccomp() {
 
 # avd_unit_seccomp_threads PID FILTERS - checks every thread of PID for
 # Seccomp 2 (filter mode) with exactly FILTERS filters stacked
-# (Seccomp_filters): 1 is the unit's alone, more means avd's own filters on
-# top. Prints each thread that differs, sets AVD_UNIT_THREADS to the number of
+# (Seccomp_filters): 1 is the emulated unit filter alone, more means avd's own
+# filters on top. The installed unit reads one higher: systemd loads
+# SystemCallArchitectures= as a separate filter (docs/privilege-separation.md).
+# Prints each thread that differs, sets AVD_UNIT_THREADS to the number of
 # threads looked at, returns 1 if any differed. A thread that exits while it
 # is being read is skipped, not counted.
 avd_unit_seccomp_threads() {
