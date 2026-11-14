@@ -992,6 +992,81 @@ int main(int argc, char *const argv[]) {
         }
       }
     }
+    /* T/U: exec spellings whose lexical key used to be dropped
+     * (CodeRabbit on x86 #229). Both must be killed.
+     *
+     *   T: ".." in the EXEC spelling (case H has it in the unlink).
+     *      /tmp/sd_tx/link -> /tmp/sd_ty/sub, so an exec of
+     *      /tmp/sd_tx/link/../t runs /tmp/sd_ty/t. The key was checked
+     *      collapsed, as /tmp/sd_tx/t, whose directory is not the
+     *      image's, and dropped; unlinking the same spelling then
+     *      matched neither key.
+     *   U: chroot /tmp/sd_u, inside which /tmp/sd_u -> "..", i.e. the
+     *      task's own "/". Exec "tmp/sd_u/u" from "/" runs the host's
+     *      /tmp/sd_u/u. Its canonical name equals the task-rooted key,
+     *      so the key was dropped as redundant, but the unlink of
+     *      "tmp/sd_u/u" is /tmp/sd_u/tmp/sd_u/u as this side spells
+     *      it, and only the key matches it.
+     *
+     * Those were #229's path-string keys. Matching the dentry the
+     * kernel resolved for the unlink is spelling- and root-independent,
+     * so here they just pin that down. */
+    if (!failed) {
+      static const struct {
+        const char *name, *chroot_dir, *exec, *image, *unlink;
+      } kc[] = {
+          {"t", NULL, "/tmp/sd_tx/link/../t", "/tmp/sd_ty/t",
+           "/tmp/sd_tx/link/../t"},
+          {"u", "/tmp/sd_u", "tmp/sd_u/u", "/tmp/sd_u/u", "tmp/sd_u/u"},
+      };
+
+      if (mkdir("/tmp/sd_tx", 0755) != 0 || mkdir("/tmp/sd_ty", 0755) != 0 ||
+          mkdir("/tmp/sd_ty/sub", 0755) != 0 ||
+          mkdir("/tmp/sd_u", 0755) != 0 || mkdir("/tmp/sd_u/tmp", 0755) != 0)
+        die("mkdir case t/u dirs");
+      if (symlink("/tmp/sd_ty/sub", "/tmp/sd_tx/link") != 0)
+        die("symlink /tmp/sd_tx/link");
+      if (symlink("..", "/tmp/sd_u/tmp/sd_u") != 0)
+        die("symlink /tmp/sd_u/tmp/sd_u");
+      for (size_t i = 0; i < sizeof(kc) / sizeof(kc[0]) && !failed; i++) {
+        int code, sig, saw_record, killed;
+        struct stat st;
+        pid_t child;
+
+        copy_file("/init", kc[i].image);
+        sd_chroot_dir = kc[i].chroot_dir;
+        killed = run_self_delete_case(kc[i].exec, "--self-unlink",
+                                      kc[i].unlink, NULL, kc[i].image, NULL,
+                                      &code, &sig, &saw_record, &child);
+        sd_chroot_dir = NULL;
+        outmsg("QEMU_TEST: self-delete case %s%s%s%s: exec %s, unlink %s "
+               "-> %s (exit=%d sig=%d, exec record %s)\n",
+               kc[i].name, kc[i].chroot_dir ? " (chroot " : "",
+               kc[i].chroot_dir ? kc[i].chroot_dir : "",
+               kc[i].chroot_dir ? ")" : "", kc[i].exec, kc[i].unlink,
+               killed ? "killed" : "not killed", code, sig,
+               saw_record ? "seen" : "not seen in log");
+        if (!saw_record || !killed) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s expected a seen exec "
+                 "record and a kill%s\n",
+                 kc[i].name,
+                 code == 45 ? " (helper's unlink failed)"
+                 : code == 125 ? " (chroot failed)"
+                               : "");
+          failed = 1;
+        } else if (!saw_kill_reason(child, "self-deleting binary")) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s was killed but dmesg "
+                 "has no reason=\"self-deleting binary ...\" pid=%d line\n",
+                 kc[i].name, (int)child);
+          failed = 1;
+        } else if (stat(kc[i].image, &st) == 0) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s's unlink did not "
+                 "remove %s\n",
+                 kc[i].name, kc[i].image);
+          failed = 1;
+        }
+      }
+    }
     if (failed) {
       outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
       reboot(RB_POWER_OFF);
