@@ -426,8 +426,66 @@ static void normalize_abs_path(char *path, size_t path_len) {
  * failure this falls back to copying `path` through unresolved rather
  * than dropping the event - a degraded (pre-fix) check on this one
  * call is better than silently skipping it. */
+/* d_path() spells `base` from this worker's root, which is not the
+ * root the task resolved its names from once it has chroot()ed: there
+ * a task rooted at /j that unlinks "alias/tool" from its "/" removes
+ * the host's /j/alias/tool, which d_path() spells "/j/alias/tool" - the
+ * same string as the task's own absolute "/j/alias/tool", which is the
+ * host's /j/j/alias/tool. The self-delete check's lexical key and its
+ * unlink_dir_is() lookup both work in the task's coordinates (absolute
+ * spellings arrive that way, and the lookups start at the captured
+ * root), so a relative spelling has to be rendered there too, or the
+ * two collide (CodeRabbit on x86 #229).
+ *
+ * Only d_path() is exported, not __d_path(), so this renders `root`
+ * the same way and strips it as a prefix, after path_is_under() has
+ * confirmed `base` lies beneath it. Rewrites `dirpath` (d_path()'s
+ * rendering of `base`, in a buffer the caller owns) and returns the
+ * root-relative spelling, which points into that buffer, or an
+ * ERR_PTR when there is none: `base` outside `root` (a cwd left
+ * outside a chroot), or a rendering that doesn't start with root's. */
+static char *av_rebase_on_root(char *dirpath, const struct path *base,
+                               const struct path *root) {
+  char *buf, *rootpath;
+  char *ret = ERR_PTR(-EXDEV);
+
+  if (!path_is_under(base, root))
+    return ERR_PTR(-EXDEV);
+  buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (!buf)
+    return ERR_PTR(-ENOMEM);
+  rootpath = d_path(root, buf, PATH_MAX);
+  if (IS_ERR(rootpath)) {
+    ret = rootpath;
+  } else if (!strcmp(rootpath, "/")) {
+    ret = dirpath; /* not chrooted: nothing to strip */
+  } else {
+    size_t len = strlen(rootpath);
+
+    if (!strncmp(dirpath, rootpath, len)) {
+      if (dirpath[len] == '/') {
+        ret = dirpath + len;
+      } else if (!dirpath[len]) {
+        /* `base` is the root itself: "/". len >= 2 here, so the
+         * byte before the terminator is root's last character,
+         * which is no longer needed. */
+        dirpath[len - 1] = '/';
+        ret = dirpath + len - 1;
+      }
+    }
+  }
+  kfree(buf);
+  return ret;
+}
+
+/* `root`, when non-NULL, renders a relative `path` from that root
+ * instead of this worker's (see av_rebase_on_root()); when `base` lies
+ * outside it the result is the unresolved fallback, which no
+ * self-delete key ever matches. An absolute `path` is already spelled
+ * from the task's root and is used as is. */
 static void join_base_path(const char *path, const struct path *base,
-                           char *out, size_t out_len, bool normalize) {
+                           const struct path *root, char *out,
+                           size_t out_len, bool normalize) {
   char *tmp;
   char *dirpath;
 
@@ -445,6 +503,8 @@ static void join_base_path(const char *path, const struct path *base,
   }
 
   dirpath = d_path(base, tmp, PATH_MAX);
+  if (!IS_ERR(dirpath) && root)
+    dirpath = av_rebase_on_root(dirpath, base, root);
   if (IS_ERR(dirpath))
     strscpy(out, path, out_len);
   else {
@@ -495,7 +555,7 @@ static void join_base_path(const char *path, const struct path *base,
 
 static void resolve_absolute_path(const char *path, const struct path *base,
                                   char *out, size_t out_len) {
-  join_base_path(path, base, out, out_len, true);
+  join_base_path(path, base, NULL, out, out_len, true);
 }
 
 /* The unlink target made absolute but spelled exactly as the syscall
@@ -503,21 +563,27 @@ static void resolve_absolute_path(const char *path, const struct path *base,
  * symlink before applying a ".." after it, so the collapsed spelling
  * can name a different directory than the one the unlink touches. The
  * self-delete check confirms its lexical match against this (see
- * unlink_dir_is() in behavior.c). Returns NULL when that spelling is
- * unavailable, which only drops a lexical-key match; *owned is set
- * when the result must be kfree()d. */
+ * unlink_dir_is() in behavior.c). Spelled from `root`, the unlinking
+ * task's own, which is where unlink_dir_is() resolves it from and
+ * where the exec's lexical key was spelled (see av_rebase_on_root()).
+ * Returns NULL when that spelling is unavailable, which only drops a
+ * lexical-key match; *owned is set when the result must be
+ * kfree()d. */
 static const char *unlink_spelled_path(const char *path,
                                        const struct path *base,
+                                       const struct path *root,
                                        char **owned) {
   char *buf;
 
   *owned = NULL;
   if (path[0] == '/')
     return path;
+  if (!root)
+    return NULL;
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!buf)
     return NULL;
-  join_base_path(path, base, buf, PATH_MAX, false);
+  join_base_path(path, base, root, buf, PATH_MAX, false);
   if (buf[0] != '/') {
     kfree(buf);
     return NULL;
@@ -1132,13 +1198,15 @@ static char *av_exec_lexical_path(const struct av_work *aw,
 
   if (!aw->exec_name || canonical[0] != '/')
     return NULL;
-  if (aw->exec_name[0] != '/' && !aw->has_pwd)
+  if (!aw->has_root || (aw->exec_name[0] != '/' && !aw->has_pwd))
     return NULL;
 
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!buf)
     return NULL;
-  resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX);
+  /* From the task's root, like av_exec_key_names_file()'s lookup
+   * below and the unlink side's spelling (av_rebase_on_root()). */
+  join_base_path(aw->exec_name, &aw->pwd, &aw->root, buf, PATH_MAX, true);
   if (buf[0] != '/' || !strcmp(buf, canonical) ||
       strcmp(kbasename(buf), kbasename(canonical)) ||
       !av_exec_key_names_file(aw, buf)) {
@@ -1640,6 +1708,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
   char *abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
   const char *spelled;
   char *spelled_buf;
+  char *lexical = NULL;
 
   if (!abs_path) {
     if (uw->has_root)
@@ -1652,10 +1721,22 @@ static void av_unlink_work_fn(struct work_struct *w) {
   }
 
   resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
-  spelled = unlink_spelled_path(uw->path, &uw->base, &spelled_buf);
-  av_behavior_check_unlink(uw->pid, abs_path, spelled,
+  spelled = unlink_spelled_path(uw->path, &uw->base,
+                                uw->has_root ? &uw->root : NULL, &spelled_buf);
+  /* The lexical-key form: `spelled` collapsed the way the exec's key
+   * was. Not abs_path, which a chroot()ed task's relative spelling
+   * renders in this worker's coordinates (see av_rebase_on_root()). */
+  if (spelled && spelled[0] == '/') {
+    lexical = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (lexical) {
+      strscpy(lexical, spelled, PATH_MAX);
+      normalize_abs_path(lexical, PATH_MAX);
+    }
+  }
+  av_behavior_check_unlink(uw->pid, abs_path, lexical, spelled,
                            uw->has_root ? &uw->root : NULL, uw->target_pid);
 
+  kfree(lexical);
   kfree(spelled_buf);
   kfree(abs_path);
   if (uw->has_root)

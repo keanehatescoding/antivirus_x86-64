@@ -261,6 +261,11 @@ static void wait_for_exit(pid_t pid, int timeout_ms, int *exit_code,
  * the "(deleted)" record overwhelmingly likely, but only that log line
  * proves the ordering, so a run without it is retried, never counted. */
 #define SELF_DELETE_EARLY_ATTEMPTS 3
+/* Set around a run_self_delete_case() call to chroot() the child (and
+ * chdir() it to the new "/") before it execs: exec_path and the unlink
+ * path are then spelled from inside that root. Cases R and S. */
+static const char *sd_chroot_dir;
+
 static int run_self_delete_case(const char *exec_path, const char *mode,
                                 const char *recorded_path,
                                 const char *unlink_path,
@@ -286,6 +291,8 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
         _exit(126);
       close(sync_fd[0]);
     }
+    if (sd_chroot_dir && (chroot(sd_chroot_dir) != 0 || chdir("/") != 0))
+      _exit(125);
     execv(exec_path, cargv);
     _exit(127);
   }
@@ -770,6 +777,91 @@ int main(int argc, char *const argv[]) {
                "remove /tmp/sd_hy/link/h and leave /tmp/sd_hy/sub/h - the "
                "\"..\" did not resolve physically\n");
         failed = 1;
+      }
+    }
+    /* R/S: a chroot()ed task (CodeRabbit on x86 #229). Root
+     * /tmp/sd_j, inside which /tmp/sd_j/alias -> real, so the task's
+     * own "/tmp/sd_j/alias/<x>" is the host's
+     * /tmp/sd_j/tmp/sd_j/real/<x> - the image. The host's
+     * /tmp/sd_j/alias/<x>, the task's "/alias/<x>", is a different
+     * file. Each child execs "/tmp/sd_j/alias/<x>" from inside the
+     * chroot and unlinks relative to its "/".
+     *
+     *   R: unlink "alias/r" -> the unrelated host /tmp/sd_j/alias/r ->
+     *      NOT killed. Spelling the relative unlink from this worker's
+     *      root gave "/tmp/sd_j/alias/r", the exec's lexical key, and
+     *      the directory check (from the task's root) then found the
+     *      image's directory and killed.
+     *   S: unlink "tmp/sd_j/alias/s" -> the image -> killed. Spelled
+     *      from the worker's root that was "/tmp/sd_j/tmp/sd_j/alias/s",
+     *      which matched neither key. */
+    if (!failed) {
+      static const struct {
+        const char *name, *unlink, *survivor, *gone;
+        int expect_kill;
+      } jc[] = {
+          {"r", "alias/r", "/tmp/sd_j/tmp/sd_j/real/r", "/tmp/sd_j/alias/r",
+           0},
+          {"s", "tmp/sd_j/alias/s", NULL, "/tmp/sd_j/tmp/sd_j/real/s", 1},
+      };
+
+      if (mkdir("/tmp/sd_j", 0755) != 0 || mkdir("/tmp/sd_j/alias", 0755) != 0 ||
+          mkdir("/tmp/sd_j/tmp", 0755) != 0 ||
+          mkdir("/tmp/sd_j/tmp/sd_j", 0755) != 0 ||
+          mkdir("/tmp/sd_j/tmp/sd_j/real", 0755) != 0)
+        die("mkdir case r/s dirs");
+      if (symlink("real", "/tmp/sd_j/tmp/sd_j/alias") != 0)
+        die("symlink /tmp/sd_j/tmp/sd_j/alias");
+      for (size_t i = 0; i < sizeof(jc) / sizeof(jc[0]) && !failed; i++) {
+        char image[64], exec_in[64], unrelated[64], needle[128];
+        int code, sig, saw_record, killed;
+        struct stat st;
+
+        snprintf(image, sizeof(image), "/tmp/sd_j/tmp/sd_j/real/%s",
+                 jc[i].name);
+        snprintf(exec_in, sizeof(exec_in), "/tmp/sd_j/alias/%s", jc[i].name);
+        snprintf(unrelated, sizeof(unrelated), "/tmp/sd_j/alias/%s",
+                 jc[i].name);
+        copy_file("/init", image);
+        write_file(unrelated, "not the executable\n");
+        sd_chroot_dir = "/tmp/sd_j";
+        killed = run_self_delete_case(exec_in, "--self-unlink", image,
+                                      jc[i].unlink, NULL, &code, &sig,
+                                      &saw_record);
+        sd_chroot_dir = NULL;
+        outmsg("QEMU_TEST: self-delete case %s (chroot /tmp/sd_j): exec "
+               "%s, unlink %s -> %s (exit=%d sig=%d, exec record %s)\n",
+               jc[i].name, exec_in, jc[i].unlink,
+               killed ? "killed" : "not killed", code, sig,
+               saw_record ? "seen" : "not seen in log");
+        snprintf(needle, sizeof(needle),
+                 "path=\"/tmp/sd_j/tmp/sd_j/alias/%s\" reason=\"self-deleting "
+                 "binary",
+                 jc[i].name);
+        if (!saw_record || killed != jc[i].expect_kill) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s expected a seen exec "
+                 "record and %s\n",
+                 jc[i].name, jc[i].expect_kill ? "a kill" : "no kill");
+          failed = 1;
+        } else if (!killed && code != 43) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s exited %d, not 43 "
+                 "(44 = sync read, 45 = unlink, 125 = chroot)\n",
+                 jc[i].name, code);
+          failed = 1;
+        } else if (killed && !strstr(read_kernel_log(), needle)) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s was killed but dmesg "
+                 "has no %s line\n",
+                 jc[i].name, needle);
+          failed = 1;
+        } else if ((jc[i].survivor && stat(jc[i].survivor, &st) != 0) ||
+                   stat(jc[i].gone, &st) == 0) {
+          outmsg("QEMU_TEST: FAIL: self-delete case %s's unlink did not "
+                 "remove %s%s%s\n",
+                 jc[i].name, jc[i].gone,
+                 jc[i].survivor ? " and leave " : "",
+                 jc[i].survivor ? jc[i].survivor : "");
+          failed = 1;
+        }
       }
     }
     if (failed) {

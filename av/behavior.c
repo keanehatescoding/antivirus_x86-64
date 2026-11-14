@@ -1610,7 +1610,8 @@ static bool unlink_dir_is(const struct path *root, const char *spelled,
 }
 
 void av_behavior_check_unlink(pid_t pid, const char *path,
-                              const char *spelled, const struct path *root,
+                              const char *lexical, const char *spelled,
+                              const struct path *root,
                               struct pid *target_pid) {
   const struct av_behavior_entry *e;
   const struct inode *lexical_dir = NULL;
@@ -1621,9 +1622,9 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
   if (path_is_pseudo_fs(path))
     return;
 
-  /* Outside the lock - only needed for an absolute path (same leading-
-   * '/' rule as below), and only compared, never stored. */
-  path_hash = path[0] == '/' ? lexical_key_hash(path) : 0;
+  /* Outside the lock - only needed for an absolute spelling (same
+   * leading-'/' rule as below), and only compared, never stored. */
+  path_hash = lexical && lexical[0] == '/' ? lexical_key_hash(lexical) : 0;
 
   mutex_lock(&behavior_lock);
   /* Read-only lookup, deliberately NOT get_or_create_entry(): every
@@ -1653,12 +1654,15 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
   /* A lexical-only match is confirmed below, outside the lock, by
    * unlink_dir_is(): the hash says the name matches, not that the name
    * still leads to the same directory. */
-  if (e && path[0] == '/') {
-    if (e->exec_path[0] == '/' && !strcmp(e->exec_path, path))
-      self_delete = true;
-    else if (e->exec_lexical_set && e->exec_lexical_hash == path_hash)
-      lexical_dir = e->exec_lexical_dir;
-  }
+  /* The lexical key is compared against `lexical`, not `path`: both
+   * it and the exec's key are spelled from the task's root, `path`
+   * from this worker's (see av_rebase_on_root() in main.c). */
+  if (e && path[0] == '/' && e->exec_path[0] == '/' &&
+      !strcmp(e->exec_path, path))
+    self_delete = true;
+  else if (e && lexical && lexical[0] == '/' && e->exec_lexical_set &&
+           e->exec_lexical_hash == path_hash)
+    lexical_dir = e->exec_lexical_dir;
   mutex_unlock(&behavior_lock);
 
   if (lexical_dir)
