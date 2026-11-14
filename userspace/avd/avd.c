@@ -4269,12 +4269,20 @@ static void cmd_quarantine_list(int fd, uid_t peer_uid, bool is_root) {
   for (i = 0; i < n; i++) {
     char meta_path[PATH_MAX + 72]; /* see cmd_quarantine_restore()'s comment */
     struct quarantine_meta meta;
+    int mret;
 
-    snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", quarantine_dir,
-             namelist[i]->d_name);
-
-    visible[i] = is_root || (read_quarantine_meta(meta_path, &meta) == 0 &&
-                             meta.original_uid == peer_uid);
+    mret = snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", quarantine_dir,
+                    namelist[i]->d_name);
+    if (mret < 0 || (size_t)mret >= sizeof(meta_path)) {
+      /* Fail closed: a truncated path could point at the wrong
+       * sidecar, so treat it as missing/unreadable. Non-root peers
+       * must not see an entry whose owner cannot be verified safely;
+       * root still sees it, but without metadata (see row loop). */
+      visible[i] = is_root;
+    } else {
+      visible[i] = is_root || (read_quarantine_meta(meta_path, &meta) == 0 &&
+                               meta.original_uid == peer_uid);
+    }
     if (visible[i])
       visible_count++;
   }
@@ -4299,21 +4307,24 @@ static void cmd_quarantine_list(int fd, uid_t peer_uid, bool is_root) {
 
     snprintf(id, sizeof(id), "%.*s", (int)(namelen - suflen),
              namelist[i]->d_name);
-    snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", quarantine_dir,
-             namelist[i]->d_name);
-
-    if (read_quarantine_meta(meta_path, &meta) == 0)
-      snprintf(row, sizeof(row), "%s\t%s\t%ld\t%s\t%s\n", id,
-               meta.original_path, (long)meta.timestamp, meta.rule_name,
-               meta.sha256_hex);
-    else
-      /* No metadata - quarantined before this feature existed, or the
-       * sidecar write itself failed (see quarantine_file()'s comment).
-       * Still list it (it's a real quarantined file on disk) rather
-       * than hiding it, just without the extra fields. Only reachable
-       * here when is_root, since a missing/unreadable meta makes
-       * visible[i] false for anyone else above. */
-      snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", id);
+    {
+      int mret = snprintf(meta_path, sizeof(meta_path), "%s/%s.meta",
+                          quarantine_dir, namelist[i]->d_name);
+      if (mret >= 0 && (size_t)mret < sizeof(meta_path) &&
+          read_quarantine_meta(meta_path, &meta) == 0)
+        snprintf(row, sizeof(row), "%s\t%s\t%ld\t%s\t%s\n", id,
+                 meta.original_path, (long)meta.timestamp, meta.rule_name,
+                 meta.sha256_hex);
+      else
+        /* No metadata - quarantined before this feature existed, the
+         * sidecar write/read failed, or the path could not be formed
+         * safely (truncation would make a different file's metadata
+         * addressable). Still list it (it's a real quarantined file on
+         * disk) rather than hiding it, just without the extra fields.
+         * Only reachable here when is_root, since a missing/unreadable
+         * meta makes visible[i] false for anyone else above. */
+        snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", id);
+    }
 
     /* Stop at the first failed write, same reasoning as
      * cmd_verdicts_recent()'s identical check - still have to free
