@@ -1752,6 +1752,81 @@ static int copy_fd_to(int fd, const char *dst) {
 }
 
 /*
+ * Removes quarantine_file()'s original at `path`, but only while that
+ * name still refers to the inode `want` describes (the fstat() of the
+ * scanned fd). Returns 0 once it is removed, 1 when refused because the
+ * name is gone or now refers to another file, and -1 with errno set
+ * on any other failure.
+ *
+ * unlink() has no fd form, so this pins the parent directory instead:
+ * the identity check (fstatat) and the removal (unlinkat) both go
+ * through one O_PATH dirfd. Swapping any directory on `path` for a
+ * symlink, before or after the open(), can then only make the check
+ * fail. It can never send the unlink somewhere else. A path-based
+ * lstat()+unlink() pair could not promise that. Each call walked the
+ * whole path again, so an ancestor swapped in between let root remove
+ * a same-named file in an attacker-chosen directory (#231).
+ *
+ * What is left is a swap of the final name inside that one pinned
+ * directory, between fstatat() and unlinkat(). Only a user who can
+ * write to that directory can do that. They can only put in a file
+ * they could already link or rename there, and could therefore remove
+ * themselves: protected_hardlinks and the sticky bit stop them using
+ * anyone else's. Flags 0 never removes a directory.
+ */
+static int unlink_original_pinned(const char *path, const struct stat *want) {
+  char dir[PATH_MAX];
+  const char *slash = strrchr(path, '/');
+  const char *base;
+  struct stat st;
+  int dirfd;
+  int rc;
+  int saved_errno;
+
+  if (!slash) {
+    strcpy(dir, ".");
+    base = path;
+  } else {
+    size_t len = slash == path ? 1 : (size_t)(slash - path);
+
+    if (len >= sizeof(dir)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+    base = slash + 1;
+  }
+  if (!*base || !strcmp(base, ".") || !strcmp(base, "..")) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  dirfd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (dirfd < 0)
+    return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
+
+  if (fstatat(dirfd, base, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+    saved_errno = errno;
+    close(dirfd);
+    if (saved_errno == ENOENT)
+      return 1;
+    errno = saved_errno;
+    return -1;
+  }
+  if (st.st_dev != want->st_dev || st.st_ino != want->st_ino) {
+    close(dirfd);
+    return 1;
+  }
+
+  rc = unlinkat(dirfd, base, 0);
+  saved_errno = errno;
+  close(dirfd);
+  errno = saved_errno;
+  return rc == 0 ? 0 : -1;
+}
+
+/*
  * Moves the already-open file `fd` into the quarantine directory and
  * chmod's it to 0000 (unreadable/unwritable/unexecutable by anyone,
  * including root without an explicit chmod back - a deliberate speed
@@ -1791,15 +1866,13 @@ static int copy_fd_to(int fd, const char *dst) {
  * owe us a choice between the two). copy_fd_to() below is the
  * fallback for any such failure, still reading through `fd` rather
  * than `path` either way. Once the quarantine copy exists (by
- * whichever route), removing the ORIGINAL by `path` is the one step left
- * that still has to re-walk it - unlink() has no fd-based equivalent
- * - so it gets a re-check-and-refuse immediately before it, comparing
- * the fd's true identity against a fresh lstat(). This is
- * risk-reduction, not elimination, for this one narrowed step - same
- * kind of tradeoff documented elsewhere in this codebase (see
- * Has_RWX_Segment's scope note) - but unlike the old design, a
- * mismatch here only means the original wasn't also cleaned up from
- * its old location, never that the wrong content got quarantined.
+ * whichever route), removing the ORIGINAL is the one step left that
+ * still goes by name - unlink() has no fd-based equivalent. It goes
+ * through unlink_original_pinned(), which checks the fd's identity and
+ * unlinks through the same pinned parent dirfd, so a directory swapped
+ * on `path` cannot redirect it. A mismatch only means the original
+ * wasn't also cleaned up from its old location, never that the wrong
+ * content got quarantined or a different file got removed.
  *
  * `rule_name`/`sha256_hex` (may be NULL/empty) are passed through only
  * for write_quarantine_meta()'s sidecar - purely informational, no
@@ -1923,46 +1996,29 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
     return;
   }
 
-  {
-    struct stat now_st;
-
-    /* This lstat()-then-unlink() pair is not, and cannot be made,
-     * atomic through standard POSIX path-based syscalls - a swap
-     * landing in the gap between this check and unlink() below (as
-     * opposed to before it, which this check does catch) would still
-     * remove whatever now occupies `path` instead of the original.
-     * There is no portable "unlink iff this path still names inode X"
-     * primitive to close that with. The alternative - doing this
-     * removal from kernel space, where the already-resolved dentry
-     * from detection could be unlinked directly - is deliberately out
-     * of scope: see this file's top comment on why kernel-side
-     * rename()/unlink() is the riskier direction, not the safer one,
-     * for this codebase specifically. What's left is the same
-     * risk-reduction-not-elimination tradeoff as every other
-     * TOCTOU note in this codebase (see Has_RWX_Segment's scope
-     * note): this check narrows the race to the syscall gap right
-     * here instead of the whole scan-to-quarantine sequence, which is
-     * what it was worth fixing for - it was never going to make
-     * path-based removal provably atomic, and claiming otherwise
-     * would be the actual bug. */
-    if (lstat(path, &now_st) != 0 || now_st.st_dev != fd_st.st_dev ||
-        now_st.st_ino != fd_st.st_ino) {
-      fprintf(stderr,
-              "avd: quarantined \"%s\" to \"%s\", but refusing to remove "
-              "the original - path now resolves to a different file "
-              "(possible symlink swap); remove it manually if "
-              "appropriate\n",
-              path, dest);
-      return;
-    }
-  }
-
-  if (unlink(path) != 0)
-    fprintf(stderr, "avd: unlink of original \"%s\" failed: %s\n", path,
-            strerror(errno));
-  else
+  /* Removal is the one step here that has to go by name. It goes
+   * through a pinned parent dirfd and re-checks the fd's identity there
+   * - see unlink_original_pinned(). A mismatch means only that the
+   * original is not also removed from its old location; the
+   * quarantine copy above came from the fd either way. */
+  switch (unlink_original_pinned(path, &fd_st)) {
+  case 0:
     printf("avd: QUARANTINED \"%s\" -> \"%s\"%s\n", path, dest,
            linked ? "" : " (copy fallback)");
+    break;
+  case 1:
+    fprintf(stderr,
+            "avd: quarantined \"%s\" to \"%s\", but refusing to remove "
+            "the original - path now resolves to a different file "
+            "(possible symlink swap); remove it manually if "
+            "appropriate\n",
+            path, dest);
+    break;
+  default:
+    fprintf(stderr, "avd: unlink of original \"%s\" failed: %s\n", path,
+            strerror(errno));
+    break;
+  }
 }
 
 /* ---- fanotify exec-permission enforcement: shared state (#176) ----
