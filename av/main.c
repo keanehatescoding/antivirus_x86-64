@@ -262,6 +262,16 @@ module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
                  "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
+/* TEST ONLY, like av_toctou_test_delay_ms (same default, clamp and
+ * read-once), but placed after av_work_fn()'s d_path() and before
+ * av_exec_lexical_path(): the QEMU boot test renames the image in that
+ * window to check that the lexical key is validated against the file's
+ * current name, not the d_path() string. */
+static int av_lexkey_test_delay_ms; /* = 0: disabled unless a test sets it */
+module_param(av_lexkey_test_delay_ms, int, 0644);
+MODULE_PARM_DESC(av_lexkey_test_delay_ms,
+                 "TEST ONLY: ms to sleep between the exec work's d_path() and its lexical self-delete key check (default 0 = disabled; clamped to [0, 2000]); never set in production");
+
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
     atomic_dec(&av_inflight_work);
@@ -1139,13 +1149,26 @@ static const char *av_exec_self_delete_key(const struct file *f,
  * as exec walked it, not collapsed: see av_exec_lexical_path()) names
  * aw->file itself: its directory, resolved following symlinks from the
  * exec'ing task's root, is the directory entry the executed dentry
- * hangs off, on the same mount. Same directory plus same final name
- * (checked by the caller) means the same directory entry. So a key
+ * hangs off, on the same mount, and its final component is that
+ * dentry's name. Same directory plus same final name means the same
+ * directory entry. So a key
  * that differs from d_path() only because a DIRECTORY on the way is a
  * symlink is accepted, and one whose final component is a symlink to
  * the file (/tmp/link/tool -> /tmp/real/tool) is rejected even though
  * the basenames match: unlinking it only removes the symlink
  * (CodeRabbit on x86 #229).
+ *
+ * The name and the parent are read from the dentry together, inside
+ * one d_seq window, which __d_move() bumps around changing both. The
+ * final component used to be compared with the earlier d_path()
+ * string instead, so a rename in between could pair the old name with
+ * the new parent: exec /tmp/alias/tool (alias -> /tmp/a), and after
+ * d_path() move the image to /tmp/b/renamed and point the alias at
+ * /tmp/b. "tool" still matched the stale string, /tmp/alias resolved
+ * to the image's new parent, and an unlink of /tmp/alias/tool, an
+ * unrelated /tmp/b/tool, was taken for a self-delete (CodeRabbit on
+ * #229). A dentry still being renamed after a few tries loses
+ * the key, like any other failure here.
  *
  * On success *parent_out holds a reference to the parent it validated,
  * for the caller to record and then dput(). Reading the parent again
@@ -1161,15 +1184,18 @@ static const char *av_exec_self_delete_key(const struct file *f,
  * chroot or mount namespace, whose names d_path() here does not
  * spell; /dev/fd and /proc/self links, which resolve against this
  * worker), returns false and loses only the second key. */
+#define AV_EXEC_KEY_SNAPSHOT_TRIES 4
 static bool av_exec_key_names_file(const struct av_work *aw,
                                    const char *key,
                                    struct dentry **parent_out) {
+  struct dentry *dentry = aw->file->f_path.dentry;
   const char *slash = strrchr(key, '/');
+  struct name_snapshot name;
   struct dentry *parent;
   struct path dir;
   char *dirname;
   bool same;
-  int err;
+  int err, tries = 0;
 
   if (!aw->has_root || !slash)
     return false;
@@ -1182,8 +1208,23 @@ static bool av_exec_key_names_file(const struct av_work *aw,
   if (err)
     return false;
 
-  parent = dget_parent(aw->file->f_path.dentry);
-  same = dir.mnt == aw->file->f_path.mnt && dir.dentry == parent;
+  for (;;) {
+    unsigned int seq = read_seqcount_begin(&dentry->d_seq);
+
+    parent = dget_parent(dentry);
+    take_dentry_name_snapshot(&name, dentry);
+    if (!read_seqcount_retry(&dentry->d_seq, seq))
+      break;
+    release_dentry_name_snapshot(&name);
+    dput(parent);
+    if (++tries == AV_EXEC_KEY_SNAPSHOT_TRIES) {
+      path_put(&dir);
+      return false;
+    }
+  }
+  same = dir.mnt == aw->file->f_path.mnt && dir.dentry == parent &&
+         !strcmp((const char *)name.name.name, slash + 1);
+  release_dentry_name_snapshot(&name);
   path_put(&dir);
   if (same)
     *parent_out = parent;
@@ -1217,8 +1258,9 @@ static bool av_exec_key_names_file(const struct av_work *aw,
  * FILE itself, whether the final name differs (/usr/bin/python ->
  * python3.12) or matches (/tmp/link/tool -> /tmp/real/tool); unlinking
  * that name only removes the symlink, so it must not count as deleting
- * the executed binary. The basename comparison is the cheap filter;
- * av_exec_key_names_file() is the identity check. */
+ * the executed binary. av_exec_key_names_file() is the identity check;
+ * it compares the final component with the dentry's current name, not
+ * with `canonical`, which a rename since d_path() can leave stale. */
 static char *av_exec_lexical_path(const struct av_work *aw,
                                   const char *canonical,
                                   struct dentry **parent_out) {
@@ -1245,8 +1287,7 @@ static char *av_exec_lexical_path(const struct av_work *aw,
    * unlink_dir_is() walks the raw spelling, the hash uses the
    * collapsed one. */
   join_base_path(aw->exec_name, &aw->pwd, &aw->root, buf, PATH_MAX, false);
-  if (buf[0] != '/' || strcmp(kbasename(buf), kbasename(canonical)) ||
-      !av_exec_key_names_file(aw, buf, parent_out))
+  if (buf[0] != '/' || !av_exec_key_names_file(aw, buf, parent_out))
     goto drop;
   normalize_abs_path(buf, PATH_MAX);
   /* Equal to `canonical` makes the key redundant only when both are
@@ -1365,6 +1406,17 @@ static void av_work_fn(struct work_struct *w) {
       memmove(abs_path, p, strlen(p) + 1);
   }
   sd_key = av_exec_self_delete_key(aw->file, abs_path);
+  /* TEST-ONLY delay (see av_lexkey_test_delay_ms), between d_path() and
+   * the lexical key's check of the file's name and parent. */
+  {
+    int delay_ms = READ_ONCE(av_lexkey_test_delay_ms);
+
+    if (delay_ms > 0) {
+      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
+        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
+      msleep(delay_ms);
+    }
+  }
   lex_path = av_exec_lexical_path(aw, sd_key, &lex_parent);
   /* The lexical key's directory: the very parent av_exec_lexical_path()
    * validated the key against, not a second dget_parent(), which a
