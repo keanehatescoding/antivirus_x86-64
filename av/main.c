@@ -965,8 +965,10 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
  * overlayfs report a different st_dev/st_ino through ->getattr than the
  * raw inode fields, and a mismatch there would make avd refuse every
  * legitimate exec on those filesystems. Returns false when getattr
- * fails; the request then goes out without identity and avd falls back
- * to the pre-#227 by-path scan rather than the kernel guessing. */
+ * fails. The daemon is then not asked at all: an identity-free request
+ * is avd's compatibility mode for pre-#227 modules, which scans
+ * whatever the path names now, so av_work_fn() treats the exec as
+ * unverified instead (fail-closed kills, fail-open logs it). */
 static bool av_scan_ident_of(struct file *file, struct av_scan_ident *out) {
   struct kstat st;
 
@@ -1096,32 +1098,47 @@ static void av_work_fn(struct work_struct *w) {
     bool have_sid = av_scan_ident_of(aw->file, &sid);
     int nl_ret;
 
-    nl_ret = av_netlink_scan_request(
-        abs_path, digest.sha256, pid_nr(aw->target_pid),
-        have_sid ? &sid : NULL, &verdict, rule_name, sizeof(rule_name),
-        DAEMON_TIMEOUT_MS);
+    if (have_sid) {
+      nl_ret = av_netlink_scan_request(
+          abs_path, digest.sha256, pid_nr(aw->target_pid), &sid, &verdict,
+          rule_name, sizeof(rule_name), DAEMON_TIMEOUT_MS);
+    } else {
+      /* We hashed the pinned file but can't name it to avd, which
+       * could then only scan whatever the path names now - or answer
+       * CLEAN if it names nothing. Don't ask: take the same "no
+       * verdict for the hashed file" branch as an UNAVAILABLE reply,
+       * so aw->fail_closed decides, never a by-path scan. */
+      nl_ret = 0;
+      verdict = AV_VERDICT_UNAVAILABLE;
+    }
     if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
       snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
       av_kill(aw->target_pid, abs_path, "daemon", reason, &ident);
     } else if (nl_ret == 0 && verdict == AV_VERDICT_UNAVAILABLE) {
-      /* avd answered, but could not reach the inode we hashed: the
-       * path names a different file now (rename-swap) or nothing
-       * (unlink), and /proc/<pid>/exe didn't lead back to it either
-       * (issue #227). That is "no verdict", not "clean" - same policy
-       * as a timeout (aw->fail_closed, captured at kprobe time), but
-       * logged distinctly at warn because a swap in this window is
-       * exactly what an evasion attempt looks like. */
+      /* No verdict for the inode we hashed. Either avd answered
+       * UNAVAILABLE - the path names a different file now
+       * (rename-swap) or nothing (unlink), and /proc/<pid>/exe didn't
+       * lead back to it either (issue #227) - or vfs_getattr() failed
+       * and avd was never asked (have_sid above). That is "no
+       * verdict", not "clean" - same policy as a timeout
+       * (aw->fail_closed, captured at kprobe time), but logged
+       * distinctly at warn because a swap in this window is exactly
+       * what an evasion attempt looks like. */
       if (aw->fail_closed) {
-        av_kill(aw->target_pid, abs_path, "fail-closed", "daemon-unavailable",
+        av_kill(aw->target_pid, abs_path, "fail-closed",
+                have_sid ? "daemon-unavailable" : "identity-unavailable",
                 &ident);
       } else {
         esc_path = av_log_escape(abs_path, GFP_KERNEL);
         pr_warn_ratelimited("kernel-av: event=unverified type=daemon "
                             "path=\"%s\" pid=%d sha256=%s dev=%u:%u ino=%lu "
-                            "(daemon could not open the hashed file)\n",
+                            "(%s)\n",
                             av_log_str(esc_path), pid_nr(aw->target_pid),
                             digest.sha256, MAJOR(ident.dev), MINOR(ident.dev),
-                            ident.ino);
+                            ident.ino,
+                            have_sid ? "daemon could not open the hashed file"
+                                     : "could not read the hashed file's "
+                                       "identity; daemon not asked");
         kfree(esc_path);
       }
     } else if (nl_ret == 0) {

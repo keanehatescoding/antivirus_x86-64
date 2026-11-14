@@ -128,7 +128,7 @@ the flip, never ones already in flight.
 | `AV_A_RULE_NAME` | nul-string | VERDICT | Which rule/heuristic matched, for logging. Optional/empty on a clean verdict. |
 | `AV_A_DEV_MAJOR` | u32 | SCAN_REQUEST | `major()` of the hashed file's `st_dev`, as userspace `fstat()` reports it (kernel side uses `vfs_getattr()`, not the raw inode fields, so btrfs subvolumes and overlayfs agree). |
 | `AV_A_DEV_MINOR` | u32 | SCAN_REQUEST | `minor()` of the same. |
-| `AV_A_INO` | u64 | SCAN_REQUEST | `st_ino` of the hashed file. The three identity attributes are sent together or not at all (omitted only if `vfs_getattr()` fails). |
+| `AV_A_INO` | u64 | SCAN_REQUEST | `st_ino` of the hashed file. The three identity attributes are always sent together. If `vfs_getattr()` fails, the kernel sends no request at all - see *Scanning the hashed file*. |
 
 ## Scanning the hashed file (issue #227)
 
@@ -155,6 +155,13 @@ whose `fstat()` matches it:
    fail-open logs `event=unverified type=daemon` at warn - never
    `event=clean type=daemon`.
 
+If the kernel can't read the hashed file's identity in the first place
+(`vfs_getattr()` fails on the pinned file), it doesn't send a request:
+an identity-free request would put avd in the by-path compatibility
+mode below. It applies the same policy as an `UNAVAILABLE` reply instead
+(`reason=identity-unavailable` under fail-closed; under fail-open the
+`event=unverified` line ends "daemon not asked").
+
 The fanotify verdict cache (`AVD_FANOTIFY=1`) is consulted only with the
 `fstat()` of an fd that passed this check, so a decoy's cached `CLEAN`
 can't answer for the hashed file.
@@ -177,7 +184,8 @@ only unlinks `PATH` after an `lstat()` re-check that it still names the
 fd's inode.
 
 **Version skew.** A request with no identity attributes comes from a
-module that predates them, and that module also rejects verdict `2`.
+module that predates them (current modules never send one), and that
+module also rejects verdict `2`.
 avd keeps the old by-path behaviour for those requests (including
 `CLEAN` on a failed open) instead of making every such exec wait out
 `DAEMON_TIMEOUT_MS`. An older avd ignores the new attributes and never

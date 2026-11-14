@@ -308,10 +308,9 @@ int av_netlink_scan_request(const char *path, const char *sha256_hex,
     payload_size = nla_total_size_64bit(sizeof(u64)) +
                    nla_total_size(sizeof(u32)) +
                    nla_total_size(strlen(path) + 1) +
-                   nla_total_size(strlen(sha256_hex) + 1);
-    if (ident)
-        payload_size += nla_total_size(sizeof(u32)) * 2 +
-                        nla_total_size_64bit(sizeof(u64));
+                   nla_total_size(strlen(sha256_hex) + 1) +
+                   nla_total_size(sizeof(u32)) * 2 +
+                   nla_total_size_64bit(sizeof(u64));
 
     skb = genlmsg_new(payload_size, GFP_KERNEL);
     if (!skb) {
@@ -329,11 +328,9 @@ int av_netlink_scan_request(const char *path, const char *sha256_hex,
     ret = ret ?: nla_put_u32(skb, AV_A_PID, pid);
     ret = ret ?: nla_put_string(skb, AV_A_PATH, path);
     ret = ret ?: nla_put_string(skb, AV_A_SHA256, sha256_hex);
-    if (ident) {
-        ret = ret ?: nla_put_u32(skb, AV_A_DEV_MAJOR, ident->dev_major);
-        ret = ret ?: nla_put_u32(skb, AV_A_DEV_MINOR, ident->dev_minor);
-        ret = ret ?: nla_put_u64_64bit(skb, AV_A_INO, ident->ino, 0);
-    }
+    ret = ret ?: nla_put_u32(skb, AV_A_DEV_MAJOR, ident->dev_major);
+    ret = ret ?: nla_put_u32(skb, AV_A_DEV_MINOR, ident->dev_minor);
+    ret = ret ?: nla_put_u64_64bit(skb, AV_A_INO, ident->ino, 0);
     if (ret)
         goto err_free_skb;
 

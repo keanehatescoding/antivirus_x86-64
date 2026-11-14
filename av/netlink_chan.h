@@ -25,13 +25,18 @@ struct av_scan_ident {
  * context only - call from the workqueue, never from the kprobe atomic
  * path) until a verdict arrives or timeout_ms elapses.
  *
- * Returns:
- * ident may be NULL (identity unavailable): the request then omits the
- * identity attributes and the daemon falls back to scanning by path.
+ * ident is required. Every request this module sends carries the
+ * hashed file's identity, so avd only ever scans that file (or answers
+ * AV_VERDICT_UNAVAILABLE). An identity-free request is what a module
+ * from before #227 sends, and avd scans it by path for compatibility;
+ * sending one from here would opt back into that unchecked scan. A
+ * caller without an identity must not ask the daemon at all - see
+ * av_work_fn().
  *
+ * Returns:
  *   0          - verdict received; *verdict_out and rule_out are valid
- *                (*verdict_out may be AV_VERDICT_UNAVAILABLE when ident
- *                was supplied - treat it like a missing verdict)
+ *                (*verdict_out may be AV_VERDICT_UNAVAILABLE - treat it
+ *                like a missing verdict)
  *   -ENOTCONN  - no daemon currently registered
  *   -ETIMEDOUT - daemon didn't reply in time
  *   <0         - other error (message build/send failure)
