@@ -183,6 +183,17 @@ avd keeps the old by-path behaviour for those requests (including
 `DAEMON_TIMEOUT_MS`. An older avd ignores the new attributes and never
 sends `2`.
 
+**Testing the race.** `av.ko` has a test-only parameter,
+`av_toctou_test_delay_ms` (0 by default, clamped to 2000), that makes
+the exec work item sleep before hashing and so before the request
+reaches avd. `tests/test_netlink.sh` sets it through
+`/sys/module/av/parameters/` so its swaps land deterministically:
+exec-then-unlink must come back as `event=unverified`, never
+`event=clean`, and exec-then-rename-a-decoy must still SIGKILL the real
+image (via step 2 - the test avd runs as full root) and leave the decoy
+in place. Leave the parameter at 0 outside tests: while it is set every
+exec waits that long and parks a worker.
+
 ## Known limitations (document these in your report)
 
 - **Single daemon only.** No multi-client support - only one daemon can

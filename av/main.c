@@ -65,6 +65,7 @@
 #include <linux/binfmts.h>
 #include <linux/crypto.h>
 #include <linux/dcache.h>
+#include <linux/delay.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -235,6 +236,28 @@ static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
 module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
                  "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
+
+/* TEST-ONLY: parks every deferred exec work item for this many ms
+ * immediately before it hashes, so tests/test_netlink.sh can rename or
+ * unlink the exec'd pathname while the request is still in flight and
+ * prove that avd scans the file the kernel hashed, not whatever the
+ * path names by then (issue #227). The hash itself reads the pinned
+ * bprm->file, so the delay cannot change what is hashed - only how
+ * late avd gets to open the path. Ported from the arm64 tree, where
+ * the same knob drives the QEMU boot test's exec-time TOCTOU cases.
+ *
+ * Default 0 = disabled, so every production configuration is byte-for-byte
+ * unaffected (the sleep is not even entered). Writable (0644) so the test
+ * can enable it around its cases and clear it again via
+ * /sys/module/av/parameters/av_toctou_test_delay_ms; read once per work
+ * item and clamped, so a concurrent out-of-range write can never turn it
+ * into an unbounded sleep. The _test_ infix marks it as never an
+ * operational knob. */
+#define AV_TOCTOU_TEST_DELAY_MAX_MS 2000
+static int av_toctou_test_delay_ms; /* = 0: disabled unless a test sets it */
+module_param(av_toctou_test_delay_ms, int, 0644);
+MODULE_PARM_DESC(av_toctou_test_delay_ms,
+                 "TEST ONLY: ms to sleep before the deferred exec hash, so a regression test can swap the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1003,6 +1026,22 @@ static void av_work_fn(struct work_struct *w) {
       abs_path[0] = '\0';
     else
       memmove(abs_path, p, strlen(p) + 1);
+  }
+
+  /* TEST-ONLY delay (see av_toctou_test_delay_ms): a no-op whenever the
+   * knob is at its default 0, i.e. in every production configuration.
+   * After d_path() on purpose, so the request still carries the path
+   * the exec used even if a test unlinks it while this item is parked.
+   * Read once and clamped so a racing sysfs write of a bogus value
+   * cannot stall a worker indefinitely. */
+  {
+    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
+
+    if (delay_ms > 0) {
+      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
+        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
+      msleep(delay_ms);
+    }
   }
 
   ret = hash_file_multi(aw->file, &digest, &ident);
