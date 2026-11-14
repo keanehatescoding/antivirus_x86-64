@@ -75,6 +75,7 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/pid.h>
@@ -238,10 +239,12 @@ MODULE_PARM_DESC(av_wq_max_active,
                  "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
 
 /* TEST-ONLY: parks every deferred exec work item for this many ms
- * immediately before it hashes, so tests/test_netlink.sh can rename or
- * unlink the exec'd pathname while the request is still in flight and
- * prove that avd scans the file the kernel hashed, not whatever the
- * path names by then (issue #227). The hash itself reads the pinned
+ * before it looks at the file at all (d_path() and the hash), so
+ * tests/test_netlink.sh can rename or unlink the exec'd pathname while
+ * the request is still in flight and prove that avd scans the file the
+ * kernel hashed, not whatever the path names by then (issue #227), and
+ * the QEMU boot test can unlink an image before d_path() runs and
+ * prove the self-delete check still matches it. The hash itself reads the pinned
  * bprm->file, so the delay cannot change what is hashed - only how
  * late avd gets to open the path. Ported from the arm64 tree, where
  * the same knob drives the QEMU boot test's exec-time TOCTOU cases.
@@ -257,7 +260,7 @@ MODULE_PARM_DESC(av_wq_max_active,
 static int av_toctou_test_delay_ms; /* = 0: disabled unless a test sets it */
 module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
-                 "TEST ONLY: ms to sleep before the deferred exec hash, so a regression test can swap the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
+                 "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -524,7 +527,11 @@ struct av_work {
                       * av_exec_lexical_path()), never opened. */
   struct path pwd;   /* cwd at exec time, for a relative exec_name.
                       * Only valid when has_pwd. */
+  struct path root;  /* root at exec time, which av_exec_key_names_file()
+                      * looks the lexical key up from. Only valid when
+                      * has_root. */
   bool has_pwd;
+  bool has_root;
 };
 
 struct algo_ctx {
@@ -971,10 +978,91 @@ static void av_work_free(struct av_work *aw) {
   kfree(aw->exec_name);
   if (aw->has_pwd)
     path_put(&aw->pwd);
+  if (aw->has_root)
+    path_put(&aw->root);
   fput(aw->file);
   put_pid(aw->target_pid);
   kfree(aw);
   av_work_release();
+}
+
+/* d_path() renders an unlinked dentry as "<path> (deleted)". That is
+ * the right thing for the log lines and for the daemon request (avd
+ * must not open whatever now sits at the bare path), but not for the
+ * self-delete keys: a dropper that unlinks its own image before this
+ * work item reaches d_path() would otherwise be recorded as
+ * "/tmp/payload (deleted)", and an unlink check for "/tmp/payload"
+ * that runs after the record would match neither key (CodeRabbit on
+ * #110). Returns the key to record: `canonical` itself, or a
+ * kmalloc()ed copy without the suffix that the caller kfree()s.
+ *
+ * Stripped only when d_unlinked() AND the suffix is present, so a file
+ * whose real name ends in " (deleted)" is left alone, and so is the
+ * window where the unlink lands between d_path() and the d_unlinked()
+ * test (unlinked, but rendered without the suffix). Files on an
+ * internal mount (memfd_create(), shmem/anon inodes) are never on a
+ * path anything can unlink, so their "/memfd:x (deleted)" stays as is
+ * rather than becoming a key that a real file named /memfd:x could
+ * match. On kmalloc failure the suffixed string is returned, which
+ * just loses the match - the behaviour before this helper existed. */
+static const char *av_exec_self_delete_key(const struct file *f,
+                                           const char *canonical) {
+  static const char sfx[] = " (deleted)";
+  const size_t sfx_len = sizeof(sfx) - 1;
+  size_t len = strlen(canonical);
+
+  if (canonical[0] != '/' || len <= sfx_len ||
+      strcmp(canonical + len - sfx_len, sfx) ||
+      !d_unlinked(f->f_path.dentry) ||
+      (f->f_path.mnt->mnt_flags & MNT_INTERNAL))
+    return canonical;
+  return kstrndup(canonical, len - sfx_len, GFP_KERNEL) ?: canonical;
+}
+
+/* True when `key` (an absolute, lexically normalized name for the
+ * executed file) names aw->file itself: its directory, resolved
+ * following symlinks from the exec'ing task's root, is the directory
+ * entry the executed dentry hangs off, on the same mount. Same
+ * directory plus same final name (checked by the caller) means the
+ * same directory entry. So a key that differs from d_path() only
+ * because a DIRECTORY on the way is a symlink is accepted, and one
+ * whose final component is a symlink to the file (/tmp/link/tool ->
+ * /tmp/real/tool) is rejected even though the basenames match:
+ * unlinking it only removes the symlink (CodeRabbit on x86 #229).
+ *
+ * The parent is compared rather than the file, so an image already
+ * unlinked before this runs still passes: its dentry keeps d_parent.
+ *
+ * Sleepable context only (path lookup can do I/O). Any failure, or a
+ * name that resolves differently from inside the task's root (a
+ * chroot or mount namespace, whose names d_path() here does not
+ * spell; /dev/fd and /proc/self links, which resolve against this
+ * worker), returns false and loses only the second key. */
+static bool av_exec_key_names_file(const struct av_work *aw,
+                                   const char *key) {
+  const char *slash = strrchr(key, '/');
+  struct dentry *parent;
+  struct path dir;
+  char *dirname;
+  bool same;
+  int err;
+
+  if (!aw->has_root || !slash)
+    return false;
+  dirname = kstrndup(key, slash == key ? 1 : slash - key, GFP_KERNEL);
+  if (!dirname)
+    return false;
+  err = vfs_path_lookup(aw->root.dentry, aw->root.mnt, dirname,
+                        LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &dir);
+  kfree(dirname);
+  if (err)
+    return false;
+
+  parent = dget_parent(aw->file->f_path.dentry);
+  same = dir.mnt == aw->file->f_path.mnt && dir.dentry == parent;
+  dput(parent);
+  path_put(&dir);
+  return same;
 }
 
 /* The second self-delete key for this exec: the name the process
@@ -989,13 +1077,21 @@ static void av_work_free(struct av_work *aw) {
  * every match the old lexical-only key made and adds the reverse one
  * (exec through the alias, unlink through the real path).
  *
+ * `canonical` is the first key as av_exec_self_delete_key() returned
+ * it, i.e. without d_path()'s " (deleted)" suffix - comparing against
+ * the suffixed form rejected this key on the final-component check
+ * below for every image unlinked before d_path() ran.
+ *
  * Returns a kmalloc()ed PATH_MAX buffer, or NULL when there is no
  * useful second key: same string as `canonical`, not absolute (a
  * resolve_absolute_path() fallback - see av_behavior_check_unlink()'s
- * leading-'/' rule), or a different final component. That last case is
- * an exec through a symlink to the FILE itself (/usr/bin/python ->
- * python3.12); unlinking that name only removes the symlink, so it
- * must not count as deleting the executed binary. */
+ * leading-'/' rule), or a name that is not the executed file's own
+ * directory entry. That last case is an exec through a symlink to the
+ * FILE itself, whether the final name differs (/usr/bin/python ->
+ * python3.12) or matches (/tmp/link/tool -> /tmp/real/tool); unlinking
+ * that name only removes the symlink, so it must not count as deleting
+ * the executed binary. The basename comparison is the cheap filter;
+ * av_exec_key_names_file() is the identity check. */
 static char *av_exec_lexical_path(const struct av_work *aw,
                                   const char *canonical) {
   char *buf;
@@ -1010,7 +1106,8 @@ static char *av_exec_lexical_path(const struct av_work *aw,
     return NULL;
   resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX);
   if (buf[0] != '/' || !strcmp(buf, canonical) ||
-      strcmp(kbasename(buf), kbasename(canonical))) {
+      strcmp(kbasename(buf), kbasename(canonical)) ||
+      !av_exec_key_names_file(aw, buf)) {
     kfree(buf);
     return NULL;
   }
@@ -1062,7 +1159,29 @@ static void av_work_fn(struct work_struct *w) {
   char *abs_path;
   char *esc_path;
   char *lex_path;
+  const char *sd_key;
   int ret;
+
+  /* TEST-ONLY delay (see av_toctou_test_delay_ms): a no-op whenever the
+   * knob is at its default 0, i.e. in every production configuration.
+   * Placed before this work item looks at the file at all - the
+   * d_path() below and the hash - so a test can rename or unlink the
+   * pathname while it is parked. The request then carries the
+   * " (deleted)" form d_path() gives an unlinked image, which avd
+   * cannot open either, so #227's UNAVAILABLE answer is unchanged; and
+   * an image unlinked before d_path() must still match the self-delete
+   * check (av_exec_self_delete_key()). Read once and clamped so a
+   * racing sysfs write of a bogus value cannot stall a worker
+   * indefinitely. */
+  {
+    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
+
+    if (delay_ms > 0) {
+      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
+        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
+      msleep(delay_ms);
+    }
+  }
 
   /* Recorded as this process's exec_path (for the unlink hook's
    * self-delete comparison, av_behavior_check_unlink()) and used in
@@ -1070,7 +1189,9 @@ static void av_work_fn(struct work_struct *w) {
    * f_path: absolute, with symlinks already followed (so a
    * /usr/bin/python symlink exec records the real target's path),
    * and " (deleted)"-suffixed if the file was unlinked after the
-   * exec opened it. Because it follows symlinks, it is recorded
+   * exec opened it - the logs and the daemon get that suffixed form,
+   * the self-delete record gets sd_key, the same path without it
+   * (av_exec_self_delete_key()). Because it follows symlinks, it is recorded
    * alongside a second, lexical key (lex_path - see
    * av_exec_lexical_path()) that matches how the unlink hook spells
    * the same file. A d_path() failure leaves an empty string, which
@@ -1089,23 +1210,8 @@ static void av_work_fn(struct work_struct *w) {
     else
       memmove(abs_path, p, strlen(p) + 1);
   }
-  lex_path = av_exec_lexical_path(aw, abs_path);
-
-  /* TEST-ONLY delay (see av_toctou_test_delay_ms): a no-op whenever the
-   * knob is at its default 0, i.e. in every production configuration.
-   * After d_path() on purpose, so the request still carries the path
-   * the exec used even if a test unlinks it while this item is parked.
-   * Read once and clamped so a racing sysfs write of a bogus value
-   * cannot stall a worker indefinitely. */
-  {
-    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
-
-    if (delay_ms > 0) {
-      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
-        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
-      msleep(delay_ms);
-    }
-  }
+  sd_key = av_exec_self_delete_key(aw->file, abs_path);
+  lex_path = av_exec_lexical_path(aw, sd_key);
 
   ret = hash_file_multi(aw->file, &digest, &ident);
   if (ret) {
@@ -1139,7 +1245,7 @@ static void av_work_fn(struct work_struct *w) {
    * immediately it'll never reach the unlink hook anyway, and this
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
-  av_behavior_record_exec(aw->tgid, abs_path, lex_path, digest.sha256,
+  av_behavior_record_exec(aw->tgid, sd_key, lex_path, digest.sha256,
                           aw->start_time);
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
@@ -1252,6 +1358,8 @@ static void av_work_fn(struct work_struct *w) {
   }
 
 out:
+  if (sd_key != abs_path)
+    kfree(sd_key);
   kfree(abs_path);
   kfree(lex_path);
   av_work_free(aw);
@@ -1306,17 +1414,24 @@ static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
   }
 
   aw->file = get_file(bprm->file);
-  /* The lexical self-delete key (av_exec_lexical_path()). Both copies
-   * are atomic-safe: bprm->filename is already kernel memory, and
-   * get_fs_pwd() only takes fs->lock and bumps refcounts. A relative
-   * name needs the cwd it was relative to; execveat() with a real dfd
-   * arrives here as an absolute "/dev/fd/N/..." name, so cwd is only
-   * ever the right base. A failed copy only loses the second key. */
+  /* The lexical self-delete key (av_exec_lexical_path()). All the
+   * copies are atomic-safe: bprm->filename is already kernel memory,
+   * and get_fs_pwd()/get_fs_root() only take fs->lock and bump
+   * refcounts. A relative name needs the cwd it was relative to;
+   * execveat() with a real dfd arrives here as an absolute
+   * "/dev/fd/N/..." name, so cwd is only ever the right base. The root
+   * is what av_exec_key_names_file() resolves the key from. A failed
+   * copy only loses the second key. */
   aw->exec_name = kstrdup(bprm->filename, GFP_ATOMIC);
   aw->has_pwd = false;
-  if (aw->exec_name && aw->exec_name[0] != '/' && current->fs) {
-    get_fs_pwd(current->fs, &aw->pwd);
-    aw->has_pwd = true;
+  aw->has_root = false;
+  if (aw->exec_name && current->fs) {
+    get_fs_root(current->fs, &aw->root);
+    aw->has_root = true;
+    if (aw->exec_name[0] != '/') {
+      get_fs_pwd(current->fs, &aw->pwd);
+      aw->has_pwd = true;
+    }
   }
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
