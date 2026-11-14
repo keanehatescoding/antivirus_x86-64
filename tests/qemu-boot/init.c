@@ -359,6 +359,18 @@ static void retarget_sd_ralias(void) {
     die("symlink /tmp/sd_ralias -> /tmp/sd_other");
 }
 
+/* Case X's on_record hook: move the image to /tmp/sd_xb/renamed, point
+ * /tmp/sd_x/alias at /tmp/sd_xb, and put an unrelated "x" there. */
+static void move_sd_x_image(void) {
+  if (rename("/tmp/sd_xa/x", "/tmp/sd_xb/renamed") != 0)
+    die("rename /tmp/sd_xa/x");
+  if (unlink("/tmp/sd_x/alias") != 0)
+    die("unlink /tmp/sd_x/alias");
+  if (symlink("/tmp/sd_xb", "/tmp/sd_x/alias") != 0)
+    die("symlink /tmp/sd_x/alias -> /tmp/sd_xb");
+  write_file("/tmp/sd_xb/x", "not the executable\n");
+}
+
 int main(int argc, char *const argv[]) {
   if (argc > 1 && !strcmp(argv[1], "--clean-marker")) {
     _exit(42);
@@ -1138,6 +1150,50 @@ int main(int argc, char *const argv[]) {
                  vc[i].survivor ? vc[i].survivor : "");
           failed = 1;
         }
+      }
+    }
+    /* X: the image moved away after exec, and an unrelated file put
+     * where its alias now points (CodeRabbit on #229) -> NOT
+     * killed. The child execs /tmp/sd_x/alias/x, alias -> /tmp/sd_xa;
+     * once the exec is recorded the image moves to /tmp/sd_xb/renamed,
+     * the alias is pointed at /tmp/sd_xb, and an unrelated /tmp/sd_xb/x
+     * appears. The child's unlink of /tmp/sd_x/alias/x removes that
+     * file, a different dentry from the image. The string-matching
+     * branch had to check the lexical key's name and parent from one
+     * snapshot to get this right, with the rename landing between its
+     * d_path() and that check; matching the exec'd dentry gets it by
+     * construction, wherever the rename lands. */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+      struct stat st;
+      pid_t child;
+
+      if (mkdir("/tmp/sd_x", 0755) != 0 || mkdir("/tmp/sd_xa", 0755) != 0 ||
+          mkdir("/tmp/sd_xb", 0755) != 0)
+        die("mkdir case x dirs");
+      if (symlink("/tmp/sd_xa", "/tmp/sd_x/alias") != 0)
+        die("symlink /tmp/sd_x/alias");
+      copy_file("/init", "/tmp/sd_xa/x");
+      killed = run_self_delete_case("/tmp/sd_x/alias/x", "--self-unlink",
+                                    "/tmp/sd_x/alias/x", NULL, "/tmp/sd_xa/x",
+                                    move_sd_x_image, &code, &sig, &saw_record,
+                                    &child);
+      outmsg("QEMU_TEST: self-delete case x (image moved after exec): "
+             "exec /tmp/sd_x/alias/x, image -> /tmp/sd_xb/renamed, alias "
+             "-> /tmp/sd_xb, unlink /tmp/sd_x/alias/x -> %s (exit=%d sig=%d, "
+             "exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (!saw_record || killed || code != 43) {
+        outmsg("QEMU_TEST: FAIL: self-delete case x expected a seen exec "
+               "record, no kill and exit 43 (44 = sync read, 45 = "
+               "unlink)\n");
+        failed = 1;
+      } else if (stat("/tmp/sd_xb/renamed", &st) != 0 ||
+                 stat("/tmp/sd_xb/x", &st) == 0) {
+        outmsg("QEMU_TEST: FAIL: self-delete case x's unlink did not "
+               "remove /tmp/sd_xb/x and leave /tmp/sd_xb/renamed\n");
+        failed = 1;
       }
     }
     if (failed) {
