@@ -57,6 +57,10 @@ ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib
 # any of the three calls from exec to exit. The list comes from strace runs
 # of the socket and fanotify end-to-end suites, with and without privsep:
 # 78 syscalls, all in @system-service except fanotify_init/fanotify_mark.
+# seccomp is named as well: the main process installs its filter with
+# seccomp(2) (TSYNC), and @system-service only includes it from systemd 257
+# on (@sandbox joined @default there), so on 255/256 avd would be killed
+# at startup with AVD_PRIVSEP=1.
 # The "~" line takes out groups avd never touches (async and io_uring I/O,
 # the kernel keyring, mlock, setrlimit and friends - the spawner sets limits
 # with prlimit64, which stays in) and userfaultfd. A call outside the list
@@ -74,7 +78,7 @@ ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL
 NoNewPrivileges=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service fanotify_init fanotify_mark
+SystemCallFilter=@system-service seccomp fanotify_init fanotify_mark
 SystemCallFilter=~@aio @keyring @memlock @resources userfaultfd
 
 Restart=on-failure

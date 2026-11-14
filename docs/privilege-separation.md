@@ -879,7 +879,7 @@ The kernel logged no seccomp audit records during the log-mode runs.
 
 ```
 SystemCallArchitectures=native
-SystemCallFilter=@system-service fanotify_init fanotify_mark
+SystemCallFilter=@system-service seccomp fanotify_init fanotify_mark
 SystemCallFilter=~@aio @keyring @memlock @resources userfaultfd
 ```
 
@@ -906,12 +906,24 @@ with a transient unit carrying the three lines above.
 
 The list comes from `strace -f` runs of the socket and fanotify
 suites, with and without `--privsep`: avd, the spawner and the workers make
-78 distinct calls between exec and exit, all in `@system-service` except
-`fanotify_init` and `fanotify_mark`. The `~` line takes out groups avd never
+78 distinct calls between exec and exit, all in systemd 262's
+`@system-service` except `fanotify_init` and `fanotify_mark`.
+
+`seccomp` is listed explicitly too. The main process installs its filter
+with `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, ...)`
+(`privsep_parent.h`), and `@system-service` only contains `seccomp` from
+systemd 257 on, where `@sandbox` joined `@default`. On systemd 255 and 256
+(Ubuntu 24.04, for one) the unit would otherwise kill avd at startup with
+`AVD_PRIVSEP=1`. The spawner and workers use `prctl(PR_SET_SECCOMP)`, which
+was always in `@default`. Of the other 19 names the groups gained between
+255 and 262, avd's source calls none, and the main-process filter allows
+none.
+
+The `~` line takes out groups avd never
 uses (async I/O and io_uring, the kernel keyring, `mlock`, `setrlimit` and
 the other `@resources` calls; the spawner sets worker limits with `prlimit64`,
 which is in `@default`) and `userfaultfd`. None of the 78 is in those groups.
-On systemd 262 the filter allows 365 calls.
+The filter allows 365 calls on systemd 262 and 346 on systemd 255.
 
 No `SystemCallErrorNumber=`, so a call outside the list kills the process
 with `SIGSYS`, as avd's own filters do. That holds for every call in systemd's
@@ -962,7 +974,10 @@ virtme-ng guest (socket 29 checks without `--privsep` and 32 with it,
 fanotify 29 and 34). Three limits:
 
 - The emulation trusts the host's `systemd-analyze` to expand the groups the
-  same way as the systemd that runs the unit.
+  same way as the systemd that runs the unit. Groups grow between releases:
+  the host's systemd 262 put `seccomp` in `@system-service`, so the tests
+  could not notice that systemd 255 leaves it out (see above). Name any call
+  avd makes directly instead of relying on a group to carry it.
 - The helper kills on every unlisted call, including calls outside systemd's
   `@known` set, which the installed unit answers with `ENOSYS`. A newer libc
   that probes such a call and falls back can work under the unit but die
