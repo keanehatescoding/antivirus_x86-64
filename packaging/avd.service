@@ -50,12 +50,32 @@ ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib
 # (see docs/privilege-separation.md, "Stage 2"). The spawner's lockdown
 # fails if any of its four is missing here, so keep the union. avd never
 # exec()s anything, so NoNewPrivileges= costs nothing.
-# tests/avd_unit_caps.sh reads both settings back out of this file to run
-# the end-to-end tests under them; keep each on one line.
-# SystemCallFilter= is not set yet: it has to be a superset of the
-# spawner's and the worker's filters and come from a traced run.
+#
+# SystemCallFilter= is avd's only syscall filter without AVD_PRIVSEP and the
+# outermost one with it (the main process, the spawner and the workers each
+# stack their own, narrower filter under it), so it has to allow everything
+# any of the three calls from exec to exit. The list comes from strace runs
+# of the socket and fanotify end-to-end suites, with and without privsep:
+# 78 syscalls, all in @system-service except fanotify_init/fanotify_mark.
+# The "~" line takes out groups avd never touches (async and io_uring I/O,
+# the kernel keyring, mlock, setrlimit and friends - the spawner sets limits
+# with prlimit64, which stays in) and userfaultfd. A call outside the list
+# kills the caller (SIGSYS) rather than failing with an errno, like avd's own
+# filters; only calls newer than systemd's @known set get ENOSYS, and with
+# AVD_PRIVSEP avd's own filters kill those anyway (the strictest stacked
+# filter wins). In avd a kill is a crash and a restart. In a privsep worker
+# it is not: avd replaces the worker and the scan fails open ("scan of ...
+# failed ... result inconclusive"), so watch for that line too. See
+# docs/privilege-separation.md, "The unit: SystemCallFilter=".
+#
+# tests/avd_unit_caps.sh reads these settings back out of this file to run
+# the end-to-end tests under them; keep each on one line, the allowlist
+# first and only "~" lines after it.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL
 NoNewPrivileges=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service fanotify_init fanotify_mark
+SystemCallFilter=~@aio @keyring @memlock @resources userfaultfd
 
 Restart=on-failure
 RestartSec=5

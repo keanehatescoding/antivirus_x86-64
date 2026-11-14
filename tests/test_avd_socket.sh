@@ -139,7 +139,7 @@ cleanup() {
         echo "  avd stopped"
     fi
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
-    rm -rf "$TEST_TMP_DIR" "$TEST_RULES_DIR"
+    rm -rf "$TEST_TMP_DIR" "$TEST_RULES_DIR" "$AVD_UNIT_BUILD_DIR"
     rm -f "$BUILD_LOG" "$INSMOD_LOG" "$AVD_LOG" "$SOCAT_LOG" "$AVCTL_LOG" "$RMMOD_LOG"
 }
 trap cleanup EXIT
@@ -222,19 +222,16 @@ if [ "$PRIVSEP" = 1 ]; then
         fail "avd did not report its seccomp filter on ($SECCOMP_WANT)"
         cat "$AVD_LOG"
     fi
-    # Installed with TSYNC, so every thread carries it, not just the main one.
-    SC_BAD=0; SC_N=0
-    for t in /proc/"$AVD_PID"/task/[0-9]*; do
-        v="$(sed -n 's/^Seccomp:[[:space:]]*//p' "$t/status" 2>/dev/null)"
-        [ -z "$v" ] && [ ! -d "$t" ] && continue
-        SC_N=$((SC_N + 1))
-        [ "$v" = 2 ] || { SC_BAD=$((SC_BAD + 1)); echo "    thread ${t##*/}: Seccomp='$v'"; }
-    done
-    if [ "$SC_N" -ge 2 ] && [ "$SC_BAD" -eq 0 ]; then
-        pass "all $SC_N avd threads are under a seccomp filter"
-    else
-        fail "$SC_BAD of $SC_N avd threads without a seccomp filter"
-    fi
+fi
+# Every thread runs under the unit's SystemCallFilter= (tests/avd_unit_caps.sh
+# installs it as systemd would); with privilege separation the main process's
+# own filter is stacked on top, installed with TSYNC so no thread misses it.
+WANT_FILTERS=1
+[ "$PRIVSEP" = 1 ] && WANT_FILTERS=2
+if avd_unit_seccomp_threads "$AVD_PID" "$WANT_FILTERS" && [ "$AVD_UNIT_THREADS" -ge 2 ]; then
+    pass "all $AVD_UNIT_THREADS avd threads are under $WANT_FILTERS seccomp filter(s), the unit's $AVD_UNIT_SYSCALLS syscalls outermost"
+else
+    fail "avd threads not under the expected $WANT_FILTERS seccomp filter(s) ($AVD_UNIT_THREADS threads)"
 fi
 # Proves the unit's restrictions reached avd. With privilege separation
 # on, the main thread has since cut its bounding set to the six parent
