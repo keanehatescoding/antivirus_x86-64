@@ -55,6 +55,9 @@
 #include <linux/types.h>
 #include <linux/pid.h>
 
+struct inode;
+struct path;
+
 int av_behavior_init(void);
 void av_behavior_exit(void);
 
@@ -73,9 +76,15 @@ void av_behavior_exit(void);
  * `lexical_path`, or NULL, is the name exec was asked to run, made
  * absolute without following symlinks. av_behavior_check_unlink()
  * counts an unlink of either as a self-delete - see
- * av_exec_lexical_path() in main.c for why both are needed. */
+ * av_exec_lexical_path() in main.c for why both are needed.
+ * `lexical_dir` is the inode of the directory the executed file sits
+ * in (the lexical key's directory, as main.c verified at exec time).
+ * An unlink that matches only the lexical key must still name that
+ * directory when it is checked - see av_behavior_check_unlink(). It
+ * is compared, never dereferenced, so no reference is held. */
 void av_behavior_record_exec(pid_t pid, const char *path,
                               const char *lexical_path,
+                              const struct inode *lexical_dir,
                               const char *sha256_hex, u64 start_time);
 
 /* Called from the openat work handler. If the open is write-intent
@@ -90,13 +99,17 @@ void av_behavior_record_exec(pid_t pid, const char *path,
 void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                                struct pid *target_pid);
 
-/* Called from the unlink/unlinkat work handler. Checks self-delete
+/* Called from the unlink/unlinkat work handler, in sleepable context
+ * (a lexical-key match does a path lookup). Checks self-delete
  * (path matches either of this pid's recorded exec paths) and the sensitive-path
  * list, killing target_pid and logging on either match. Trust status
  * does NOT exempt this check - deleting your own binary or a sensitive
  * path is worth flagging regardless of how trusted the process is.
- * `pid` is the tgid - see the note above. */
+ * `pid` is the tgid - see the note above. `root` is the unlinking
+ * task's root at the syscall, or NULL; a lexical-key match is resolved
+ * from it (see unlink_dir_is() in behavior.c) and dropped without it. */
 void av_behavior_check_unlink(pid_t pid, const char *path,
+                               const struct path *root,
                                struct pid *target_pid);
 
 /* Called from the rename/renameat/renameat2 work handler. Flags a
