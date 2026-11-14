@@ -494,6 +494,14 @@ struct av_work {
                      * fail-closed mid-flight can no longer retroactively
                      * kill an exec that was already committed under
                      * fail-open. */
+  char *exec_name;   /* kstrdup() of bprm->filename - the name exec was
+                      * asked to run, before symlinks were followed -
+                      * or NULL if that copy failed. Only ever a
+                      * self-delete correlation key (see
+                      * av_exec_lexical_path()), never opened. */
+  struct path pwd;   /* cwd at exec time, for a relative exec_name.
+                      * Only valid when has_pwd. */
+  bool has_pwd;
 };
 
 struct algo_ctx {
@@ -935,6 +943,57 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
   kfree(esc_path);
 }
 
+/* Releases everything an av_work holds. */
+static void av_work_free(struct av_work *aw) {
+  kfree(aw->exec_name);
+  if (aw->has_pwd)
+    path_put(&aw->pwd);
+  fput(aw->file);
+  put_pid(aw->target_pid);
+  kfree(aw);
+  av_work_release();
+}
+
+/* The second self-delete key for this exec: the name the process
+ * asked to exec, made absolute against its cwd the same way
+ * av_unlink_work_fn() resolves an unlink target (resolve_absolute_path:
+ * lexical, symlinks NOT followed). `canonical` is the d_path() of the
+ * executed file, which DOES follow symlinks, so on its own it misses
+ * `exec /tmp/alias/x` + `unlink("/tmp/alias/x")` whenever a directory
+ * on the way is a symlink (/tmp/alias -> /tmp/real, merged-/usr's
+ * /bin -> /usr/bin, Silverblue's /home -> /var/home): the unlink side
+ * says /tmp/alias/x, the exec side /tmp/real/x. Recording both keeps
+ * every match the old lexical-only key made and adds the reverse one
+ * (exec through the alias, unlink through the real path).
+ *
+ * Returns a kmalloc()ed PATH_MAX buffer, or NULL when there is no
+ * useful second key: same string as `canonical`, not absolute (a
+ * resolve_absolute_path() fallback - see av_behavior_check_unlink()'s
+ * leading-'/' rule), or a different final component. That last case is
+ * an exec through a symlink to the FILE itself (/usr/bin/python ->
+ * python3.12); unlinking that name only removes the symlink, so it
+ * must not count as deleting the executed binary. */
+static char *av_exec_lexical_path(const struct av_work *aw,
+                                  const char *canonical) {
+  char *buf;
+
+  if (!aw->exec_name || canonical[0] != '/')
+    return NULL;
+  if (aw->exec_name[0] != '/' && !aw->has_pwd)
+    return NULL;
+
+  buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (!buf)
+    return NULL;
+  resolve_absolute_path(aw->exec_name, &aw->pwd, buf, PATH_MAX);
+  if (buf[0] != '/' || !strcmp(buf, canonical) ||
+      strcmp(kbasename(buf), kbasename(canonical))) {
+    kfree(buf);
+    return NULL;
+  }
+  return buf;
+}
+
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
  * GFP_KERNEL. This is where all "heavy" work happens.
  *
@@ -957,6 +1016,7 @@ static void av_work_fn(struct work_struct *w) {
   char reason[AV_SIG_NAME_LEN + 32];
   char *abs_path;
   char *esc_path;
+  char *lex_path;
   int ret;
 
   /* Recorded as this process's exec_path (for the unlink hook's
@@ -965,15 +1025,15 @@ static void av_work_fn(struct work_struct *w) {
    * f_path: absolute, with symlinks already followed (so a
    * /usr/bin/python symlink exec records the real target's path),
    * and " (deleted)"-suffixed if the file was unlinked after the
-   * exec opened it. A d_path() failure leaves an empty string, which
+   * exec opened it. Because it follows symlinks, it is recorded
+   * alongside a second, lexical key (lex_path - see
+   * av_exec_lexical_path()) that matches how the unlink hook spells
+   * the same file. A d_path() failure leaves an empty string, which
    * av_behavior_check_unlink() never matches (it requires a leading
    * '/'), rather than a misleading partial path. */
   abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!abs_path) {
-    fput(aw->file);
-    put_pid(aw->target_pid);
-    kfree(aw);
-    av_work_release();
+    av_work_free(aw);
     return;
   }
   {
@@ -984,6 +1044,7 @@ static void av_work_fn(struct work_struct *w) {
     else
       memmove(abs_path, p, strlen(p) + 1);
   }
+  lex_path = av_exec_lexical_path(aw, abs_path);
 
   ret = hash_file_multi(aw->file, &digest, &ident);
   if (ret) {
@@ -1017,7 +1078,8 @@ static void av_work_fn(struct work_struct *w) {
    * immediately it'll never reach the unlink hook anyway, and this
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
-  av_behavior_record_exec(aw->tgid, abs_path, digest.sha256, aw->start_time);
+  av_behavior_record_exec(aw->tgid, abs_path, lex_path, digest.sha256,
+                          aw->start_time);
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
     snprintf(reason, sizeof(reason), "signature:%s", sig_name);
@@ -1091,10 +1153,8 @@ static void av_work_fn(struct work_struct *w) {
 
 out:
   kfree(abs_path);
-  fput(aw->file);
-  put_pid(aw->target_pid);
-  kfree(aw);
-  av_work_release();
+  kfree(lex_path);
+  av_work_free(aw);
 }
 
 /* Atomic context - the ONLY things allowed here: taking references,
@@ -1146,6 +1206,18 @@ static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
   }
 
   aw->file = get_file(bprm->file);
+  /* The lexical self-delete key (av_exec_lexical_path()). Both copies
+   * are atomic-safe: bprm->filename is already kernel memory, and
+   * get_fs_pwd() only takes fs->lock and bumps refcounts. A relative
+   * name needs the cwd it was relative to; execveat() with a real dfd
+   * arrives here as an absolute "/dev/fd/N/..." name, so cwd is only
+   * ever the right base. A failed copy only loses the second key. */
+  aw->exec_name = kstrdup(bprm->filename, GFP_ATOMIC);
+  aw->has_pwd = false;
+  if (aw->exec_name && aw->exec_name[0] != '/' && current->fs) {
+    get_fs_pwd(current->fs, &aw->pwd);
+    aw->has_pwd = true;
+  }
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
   aw->start_time = current->start_time;
