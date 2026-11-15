@@ -116,16 +116,20 @@ builds.
 ## Testing
 
 ```bash
-tests/run_all.sh
+sudo tests/run_all.sh
 ```
 
-Runs the six automated test scripts (two standalone, four needing a VM
-and root). See the wiki's **Testing** page for what each one checks and for
-manual, step-by-step walkthroughs of every detection layer (signatures,
-YARA, ELF analysis, entropy, fuzzy hashing, behavioral heuristics,
+Builds the components and runs the automated test suites orchestrated by
+`run_all.sh`. Some suites are no-root unit tests, while others are
+integration tests that load the kernel module and/or start `avd`, so a
+full run needs root in a VM (and some suites may report `SKIP` when
+optional dependencies or capabilities are unavailable). See the wiki's
+**Testing** page for what each suite covers and for manual,
+step-by-step walkthroughs of every detection layer (signatures, YARA,
+ELF analysis, entropy, fuzzy hashing, behavioral heuristics,
 quarantine/TOCTOU). The EICAR antivirus test file — a standard, harmless
-68-byte string every real AV vendor uses for exactly this purpose — is used
-throughout instead of real malware.
+68-byte string every real AV vendor uses for exactly this purpose — is
+used throughout instead of real malware.
 
 ## CI
 
