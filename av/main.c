@@ -262,15 +262,24 @@ module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
                  "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
-/* TEST ONLY, like av_toctou_test_delay_ms (same default, clamp and
- * read-once), but placed after av_work_fn()'s d_path() and before
- * av_exec_lexical_path(): the QEMU boot test renames the image in that
- * window to check that the lexical key is validated against the file's
- * current name, not the d_path() string. */
-static int av_lexkey_test_delay_ms; /* = 0: disabled unless a test sets it */
-module_param(av_lexkey_test_delay_ms, int, 0644);
-MODULE_PARM_DESC(av_lexkey_test_delay_ms,
-                 "TEST ONLY: ms to sleep between the exec work's d_path() and its lexical self-delete key check (default 0 = disabled; clamped to [0, 2000]); never set in production");
+/* TEST ONLY, like av_toctou_test_delay_ms (same default 0 = disabled),
+ * but a hold with a handshake rather than a fixed sleep, placed after
+ * av_work_fn()'s d_path() and before av_exec_lexical_path(): the QEMU
+ * boot test renames the image in that window to check that the lexical
+ * key is validated against the file's current name, not the d_path()
+ * string. A fixed sleep cannot say where the test's rename landed
+ * relative to the worker, so the worker instead logs
+ * "event=lexkey-parked pid=<pid> path=<d_path()>" once it is parked,
+ * then waits until the knob is written back to 0 (the release). The
+ * value is only the upper bound on the wait, clamped to
+ * AV_LEXKEY_TEST_HOLD_MAX_MS, so a test that dies or a bogus value
+ * cannot stall a worker indefinitely. */
+#define AV_LEXKEY_TEST_HOLD_MAX_MS 10000
+#define AV_LEXKEY_TEST_HOLD_POLL_MS 10
+static int av_lexkey_test_hold_ms; /* = 0: disabled unless a test sets it */
+module_param(av_lexkey_test_hold_ms, int, 0644);
+MODULE_PARM_DESC(av_lexkey_test_hold_ms,
+                 "TEST ONLY: hold the exec work between its d_path() and its lexical self-delete key check, logging event=lexkey-parked, until this is written back to 0 or the value (clamped to [0, 10000] ms) elapses (default 0 = disabled); never set in production");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1406,15 +1415,28 @@ static void av_work_fn(struct work_struct *w) {
       memmove(abs_path, p, strlen(p) + 1);
   }
   sd_key = av_exec_self_delete_key(aw->file, abs_path);
-  /* TEST-ONLY delay (see av_lexkey_test_delay_ms), between d_path() and
-   * the lexical key's check of the file's name and parent. */
+  /* TEST-ONLY hold (see av_lexkey_test_hold_ms), between d_path() and
+   * the lexical key's check of the file's name and parent. The parked
+   * line is logged after d_path() and before the wait, so a test that
+   * sees it knows the worker is past d_path() and has not yet looked
+   * at the file's name; it releases the worker by clearing the knob
+   * once its rename is done. A no-op at the default 0. */
   {
-    int delay_ms = READ_ONCE(av_lexkey_test_delay_ms);
+    int hold_ms = READ_ONCE(av_lexkey_test_hold_ms);
 
-    if (delay_ms > 0) {
-      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
-        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
-      msleep(delay_ms);
+    if (hold_ms > 0) {
+      char *esc_hold = av_log_escape(abs_path, GFP_KERNEL);
+      int held_ms = 0;
+
+      if (hold_ms > AV_LEXKEY_TEST_HOLD_MAX_MS)
+        hold_ms = AV_LEXKEY_TEST_HOLD_MAX_MS;
+      pr_info("kernel-av: event=lexkey-parked pid=%d path=\"%s\"\n",
+              pid_nr(aw->target_pid), av_log_str(esc_hold));
+      kfree(esc_hold);
+      while (held_ms < hold_ms && READ_ONCE(av_lexkey_test_hold_ms) > 0) {
+        msleep(AV_LEXKEY_TEST_HOLD_POLL_MS);
+        held_ms += AV_LEXKEY_TEST_HOLD_POLL_MS;
+      }
     }
   }
   lex_path = av_exec_lexical_path(aw, sd_key, &lex_parent);
