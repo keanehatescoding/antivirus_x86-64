@@ -160,6 +160,7 @@ static char *read_kernel_log(void) {
  * cases, and reset to 0 right after them. */
 #define TOCTOU_DELAY_PARAM "/sys/module/av/parameters/av_toctou_test_delay_ms"
 #define LEXKEY_HOLD_PARAM "/sys/module/av/parameters/av_lexkey_test_hold_ms"
+#define UNLINK_NOTIFY_PARAM "/sys/module/av/parameters/av_unlink_test_notify"
 
 /* Set an integer sysfs/module-param attribute. No O_CREAT/O_TRUNC: the
  * target is an existing kernel attribute, and a failure to open it is a
@@ -282,6 +283,23 @@ static void (*sd_before_record)(pid_t);
  * so the rename really landed between d_path() and the key check. */
 static int sd_x_parked;
 
+/* How long to wait for av.ko to say a child's unlink check has completed
+ * (event=unlink-checked, enabled by av_unlink_test_notify). That check
+ * runs on a work item the syscall does not wait for, so "the child was
+ * not killed" proves nothing until it has run: the child is held until
+ * this line shows, and a run that never sees it fails instead of being
+ * counted as a survival. */
+#define SELF_DELETE_UNLINK_WAIT_MS 10000
+
+static int count_needle(const char *hay, const char *needle) {
+  int n = 0;
+  size_t len = strlen(needle);
+
+  for (const char *p = strstr(hay, needle); p; p = strstr(p + len, needle))
+    n++;
+  return n;
+}
+
 static int run_self_delete_case(const char *exec_path, const char *mode,
                                 const char *recorded_path,
                                 const char *unlink_path,
@@ -294,6 +312,10 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
 
   if (pipe(sync_fd) != 0)
     die("pipe(self-delete sync)");
+  /* On before the fork, not before the release: the early mode's first
+   * unlink happens straight after exec, and its check must be logged
+   * too. Off again once the child is reaped, below. */
+  write_param_int(UNLINK_NOTIFY_PARAM, 1);
   pid = fork();
   if (pid < 0)
     die("fork(self-delete)");
@@ -339,8 +361,43 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
    * returns the error rather than killing init.) */
   if (write(sync_fd[1], "x", 1) != 1 && errno != EPIPE)
     die("write(self-delete sync)");
-  close(sync_fd[1]);
-  wait_for_exit(pid, 15000, exit_code, term_sig);
+
+  /* The child unlinks now and then blocks for a second byte. Release it
+   * only once av.ko has logged the completion of its unlink check(s): a
+   * kill is sent before that line, so a child still alive when it is
+   * released was really judged not to be a self-delete. The early mode
+   * unlinks twice, the first before the exec was recorded, and both
+   * checks produce a line. */
+  {
+    int want = !strcmp(mode, "--self-unlink-early") ? 2 : 1;
+    int unlink_waited = 0;
+    int checked = 0;
+
+    snprintf(needle, sizeof(needle), "event=unlink-checked pid=%d done=1",
+             (int)pid);
+    while (unlink_waited < SELF_DELETE_UNLINK_WAIT_MS) {
+      if (count_needle(read_kernel_log(), needle) >= want) {
+        checked = 1;
+        break;
+      }
+      sleep_ms(20);
+      unlink_waited += 20;
+    }
+    if (write(sync_fd[1], "y", 1) != 1 && errno != EPIPE)
+      die("write(self-delete release)");
+    close(sync_fd[1]);
+    wait_for_exit(pid, 15000, exit_code, term_sig);
+    write_param_int(UNLINK_NOTIFY_PARAM, 0);
+    if (!checked) {
+      outmsg("QEMU_TEST: FAIL: self-delete case %s: the unlink check for "
+             "pid %d never completed (no event=unlink-checked x%d in %d "
+             "ms), so a survival would prove nothing\n",
+             exec_path, (int)pid, want, SELF_DELETE_UNLINK_WAIT_MS);
+      outmsg("QEMU_TEST: --- dmesg dump ---\n%s\n", read_kernel_log());
+      reboot(RB_POWER_OFF);
+      _exit(1);
+    }
+  }
   return *term_sig == SIGKILL;
 }
 
@@ -394,9 +451,14 @@ int main(int argc, char *const argv[]) {
   }
   /* Child half of the self-delete case below, run as a COPY of this
    * binary: block until the parent writes one byte to fd 3 (it does so
-   * once av.ko has recorded this exec), unlink argv[2], then linger so
-   * the kernel's asynchronous self-delete kill has time to land. Exit
-   * 43 means it was NOT killed; 44/45 mean the helper itself broke. */
+   * once av.ko has recorded this exec), unlink argv[2], then block for a
+   * second byte. The parent sends that one only after av.ko has logged
+   * that the unlink check for this pid completed, and any self-delete
+   * kill goes out before that line, so a child that reads it was not
+   * killed. No fixed linger: the check is asynchronous, and a timer says
+   * nothing about whether it has run. Exit 43 means it was NOT killed;
+   * 44/45/46 mean the helper itself broke (46: the parent closed fd 3
+   * without releasing it). */
   if (argc > 2 && !strcmp(argv[1], "--self-unlink")) {
     char c;
 
@@ -404,7 +466,8 @@ int main(int argc, char *const argv[]) {
       _exit(44);
     if (unlink(argv[2]) != 0)
       _exit(45);
-    sleep(5);
+    if (read(3, &c, 1) != 1)
+      _exit(46);
     _exit(43);
   }
   /* Same, for the unlinked-before-d_path() cases: unlink argv[2] (this
@@ -423,7 +486,8 @@ int main(int argc, char *const argv[]) {
     if (read(3, &c, 1) != 1)
       _exit(44);
     (void)unlink(argv[2]);
-    sleep(5);
+    if (read(3, &c, 1) != 1)
+      _exit(46);
     _exit(43);
   }
 

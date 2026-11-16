@@ -281,6 +281,19 @@ module_param(av_lexkey_test_hold_ms, int, 0644);
 MODULE_PARM_DESC(av_lexkey_test_hold_ms,
                  "TEST ONLY: hold the exec work between its d_path() and its lexical self-delete key check, logging event=lexkey-parked, until this is written back to 0 or the value (clamped to [0, 10000] ms) elapses (default 0 = disabled); never set in production");
 
+/* TEST ONLY: when nonzero, av_unlink_work_fn() logs
+ * "event=unlink-checked pid=<pid> done=1" after av_behavior_check_unlink()
+ * has returned, which is also after any self-delete SIGKILL has been
+ * sent. The unlink check runs on a work item the syscall does not wait
+ * for, so a test that only sees "not killed" after a fixed time cannot
+ * tell a passed check from one still queued; this line is the
+ * per-process completion signal it waits for instead. Default 0 = no
+ * line, so production logs are unchanged. */
+static int av_unlink_test_notify; /* = 0: disabled unless a test sets it */
+module_param(av_unlink_test_notify, int, 0644);
+MODULE_PARM_DESC(av_unlink_test_notify,
+                 "TEST ONLY: log event=unlink-checked once each unlink check has completed (default 0 = disabled); never set in production");
+
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
     atomic_dec(&av_inflight_work);
@@ -1131,24 +1144,33 @@ static void av_work_free(struct av_work *aw) {
  * #110). Returns the key to record: `canonical` itself, or a
  * kmalloc()ed copy without the suffix that the caller kfree()s.
  *
- * Stripped only when d_unlinked() AND the suffix is present, so a file
- * whose real name ends in " (deleted)" is left alone, and so is the
- * window where the unlink lands between d_path() and the d_unlinked()
- * test (unlinked, but rendered without the suffix). Files on an
+ * Stripped only when the dentry was ALREADY unlinked before d_path()
+ * ran (`unlinked_before`, sampled by the caller just ahead of the
+ * call) AND the suffix is present. d_path() decides on the marker
+ * itself, from its own d_unlinked() test inside the call, and an
+ * unlinked dentry stays unlinked, so a dentry unlinked before the call
+ * was rendered with the marker and what ends the string is d_path()'s.
+ * Testing d_unlinked() afterwards instead let an unlink that landed
+ * during or after the call turn a file whose real name ends in
+ * " (deleted)" into a stripped key: /tmp/tool (deleted), rendered
+ * without a marker, then unlinked, became /tmp/tool, and an unlink of
+ * that unrelated file counted as a self-delete (CodeRabbit on #229).
+ * An unlink that lands after the sample keeps the key as d_path()
+ * returned it, which just loses the match for that window. Files on an
  * internal mount (memfd_create(), shmem/anon inodes) are never on a
  * path anything can unlink, so their "/memfd:x (deleted)" stays as is
  * rather than becoming a key that a real file named /memfd:x could
  * match. On kmalloc failure the suffixed string is returned, which
  * just loses the match - the behaviour before this helper existed. */
 static const char *av_exec_self_delete_key(const struct file *f,
-                                           const char *canonical) {
+                                           const char *canonical,
+                                           bool unlinked_before) {
   static const char sfx[] = " (deleted)";
   const size_t sfx_len = sizeof(sfx) - 1;
   size_t len = strlen(canonical);
 
   if (canonical[0] != '/' || len <= sfx_len ||
-      strcmp(canonical + len - sfx_len, sfx) ||
-      !d_unlinked(f->f_path.dentry) ||
+      strcmp(canonical + len - sfx_len, sfx) || !unlinked_before ||
       (f->f_path.mnt->mnt_flags & MNT_INTERNAL))
     return canonical;
   return kstrndup(canonical, len - sfx_len, GFP_KERNEL) ?: canonical;
@@ -1364,6 +1386,7 @@ static void av_work_fn(struct work_struct *w) {
   const struct inode *lex_dir = NULL;
   struct dentry *lex_parent = NULL;
   const char *sd_key;
+  bool unlinked_before;
   int ret;
 
   /* TEST-ONLY delay (see av_toctou_test_delay_ms): a no-op whenever the
@@ -1407,14 +1430,18 @@ static void av_work_fn(struct work_struct *w) {
     return;
   }
   {
-    char *p = d_path(&aw->file->f_path, abs_path, PATH_MAX);
+    /* Sampled BEFORE d_path(), which makes its own marker decision
+     * inside the call: see av_exec_self_delete_key(). */
+    char *p;
 
+    unlinked_before = d_unlinked(aw->file->f_path.dentry);
+    p = d_path(&aw->file->f_path, abs_path, PATH_MAX);
     if (IS_ERR(p))
       abs_path[0] = '\0';
     else
       memmove(abs_path, p, strlen(p) + 1);
   }
-  sd_key = av_exec_self_delete_key(aw->file, abs_path);
+  sd_key = av_exec_self_delete_key(aw->file, abs_path, unlinked_before);
   /* TEST-ONLY hold (see av_lexkey_test_hold_ms), between d_path() and
    * the lexical key's check of the file's name and parent. The parked
    * line is logged after d_path() and before the wait, so a test that
@@ -1867,6 +1894,10 @@ static void av_unlink_work_fn(struct work_struct *w) {
   av_behavior_check_unlink(uw->pid, abs_path, path_is_workers, lexical,
                            spelled, uw->has_root ? &uw->root : NULL,
                            uw->target_pid);
+  /* TEST-ONLY completion signal (see av_unlink_test_notify). */
+  if (READ_ONCE(av_unlink_test_notify))
+    pr_info("kernel-av: event=unlink-checked pid=%d done=1\n",
+            pid_nr(uw->target_pid));
 
   kfree(lexical);
   kfree(spelled_buf);

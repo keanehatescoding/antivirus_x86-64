@@ -1582,7 +1582,19 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
  * namespace) fails here, as it already does at exec time. Any failure
  * returns false, which only drops the lexical-key match. A process that retargets the
  * symlink between its unlink and this lookup also escapes the lexical
- * key; inode identity at unlink time (issue #230) closes that. */
+ * key.
+ *
+ * Known gap, shared with the d_path() key: this compares names and the
+ * parent directory, not which inode was unlinked. If another process
+ * replaces the file at the executed name (exec /tmp/alias/tool, someone
+ * swaps in a new /tmp/real/tool) and the process then unlinks it through
+ * the alias, the lexical hash and the parent both still match and the
+ * replacement is taken for the image. The same replacement unlinked by
+ * its real path already matched the d_path() key. Only the identity of
+ * the unlinked inode tells the two apart, and the unlink hook cannot see
+ * it: it probes the syscall in atomic context, before any lookup.
+ * Inode identity at unlink time (issue #230) closes this and the
+ * retargeting escape above. */
 static bool unlink_dir_is(const struct path *root, const char *spelled,
                           const struct inode *dir) {
   const char *slash = spelled ? strrchr(spelled, '/') : NULL;
