@@ -1340,7 +1340,7 @@ static bool is_extension_append_rename(const char *old_path,
  * av_kill - see its comment for why. */
 static void kill_with_reason(struct pid *target_pid, const char *path,
                              const char *reason) {
-  struct task_struct *task;
+  const struct task_struct *task; /* only tested: kill_pid() takes the pid */
   char *protected_path;
   /* av_log_escape() for path/protected_exe, not %s or %*pE (#166) -
    * same log-injection reasoning as av_kill() in main.c, see its
