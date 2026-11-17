@@ -366,8 +366,13 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
    * only once av.ko has logged the completion of its unlink check(s): a
    * kill is sent before that line, so a child still alive when it is
    * released was really judged not to be a self-delete. The early mode
-   * unlinks twice, the first before the exec was recorded, and both
-   * checks produce a line. */
+   * unlinks twice, the first before the exec was recorded, and while a
+   * live child produces a line for both, that first check runs
+   * asynchronously and can land after the record and kill the child
+   * before its second unlink. One completed check followed by a SIGKILL
+   * is therefore also a finished run: the kill is a correct detection,
+   * and the check that sent it logged its line. A live child still has
+   * to show every check. */
   {
     int want = !strcmp(mode, "--self-unlink-early") ? 2 : 1;
     int unlink_waited = 0;
@@ -376,7 +381,20 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
     snprintf(needle, sizeof(needle), "event=unlink-checked pid=%d done=1",
              (int)pid);
     while (unlink_waited < SELF_DELETE_UNLINK_WAIT_MS) {
-      if (count_needle(read_kernel_log(), needle) >= want) {
+      siginfo_t info;
+      int seen = count_needle(read_kernel_log(), needle);
+
+      if (seen >= want) {
+        checked = 1;
+        break;
+      }
+      /* WNOWAIT peeks at the exit status and leaves the child for
+       * wait_for_exit() to reap. */
+      memset(&info, 0, sizeof(info));
+      if (seen >= 1 &&
+          waitid(P_PID, pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+          info.si_pid == pid && info.si_code == CLD_KILLED &&
+          info.si_status == SIGKILL) {
         checked = 1;
         break;
       }
