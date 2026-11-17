@@ -803,6 +803,29 @@ int av_behavior_protect_del(const char *path) {
   return ret;
 }
 
+/* The address space of the process `task` belongs to. A group leader
+ * that has exited keeps its task_struct (and is what a tgid pid names)
+ * while other threads run, but has no mm of its own any more; the mm is
+ * shared, so any live thread's is the process's. Looking only at the
+ * leader would read "no mm" as "not protected" and let the kill through
+ * for a protected executable. Caller drops it with mmput(); NULL when
+ * the whole group is past exit_mm(). */
+static struct mm_struct *av_group_get_mm(struct task_struct *task) {
+  struct mm_struct *mm = get_task_mm(task);
+  struct task_struct *t;
+
+  if (mm)
+    return mm;
+  rcu_read_lock();
+  for_each_thread(task, t) {
+    mm = get_task_mm(t);
+    if (mm)
+      break;
+  }
+  rcu_read_unlock();
+  return mm;
+}
+
 /* Resolves target_pid's own exe path (task->mm->exe_file, i.e. what
  * ACTUALLY exec'd - not any path string a caller might be passing
  * around for logging) and checks it against the protected list.
@@ -838,7 +861,7 @@ bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
   if (!task)
     return false;
 
-  mm = get_task_mm(task);
+  mm = av_group_get_mm(task);
   put_task_struct(task);
   if (!mm)
     return false;
@@ -1297,9 +1320,11 @@ static bool is_extension_append_rename(const char *old_path,
   return new_base[old_len] == '.';
 }
 
-/* Shared kill-and-log helper - same pid_task/rcu_read_lock/send_sig
- * pattern used in main.c's execve path, duplicated here rather than
- * shared across modules to keep behavior.c self-contained.
+/* Shared kill-and-log helper - same pid_task/rcu_read_lock pattern as
+ * main.c's execve path (av_kill()), duplicated here rather than shared
+ * across modules to keep behavior.c self-contained. Unlike av_kill() it
+ * kills through kill_pid(), i.e. the whole thread group, so a tgid
+ * target works even when its leader has exited.
  *
  * SAFETY NET: never target PID 1, full stop, regardless of what
  * triggered detection. Killing init can panic the kernel outright.
@@ -1360,7 +1385,14 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
     pr_alert("kernel-av: event=detected action=kill type=behavioral "
              "path=\"%s\" reason=\"%s\" pid=%d\n",
              av_log_str(esc_path), reason, pid_nr(target_pid));
-    send_sig(SIGKILL, task, 0);
+    /* kill_pid(), not send_sig(): send_sig() is thread-scoped, and to a
+     * thread-group leader that has already exited (a zombie, still the
+     * task a tgid pid names while other threads run) it does not start a
+     * group exit at all, so the rest of the process would carry on.
+     * kill_pid() delivers to the group, picking a live thread. priv=1:
+     * this is the module acting, not a signal from user space, so no
+     * kill() permission check. */
+    kill_pid(target_pid, SIGKILL, 1);
   }
   rcu_read_unlock();
   kfree(esc_path);

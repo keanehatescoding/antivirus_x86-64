@@ -223,6 +223,18 @@ static struct workqueue_struct *av_wq;
  * non-exec traffic is quiet, it just can't be shut out entirely. */
 #define AV_EXEC_RESERVED_WORK 512
 static atomic_t av_inflight_work = ATOMIC_INIT(0);
+/* A separate budget for matched self-delete reports (see
+ * schedule_selfdel_work()), not a slice of av_inflight_work. A process
+ * whose image is already staged can have exec work filling
+ * AV_MAX_INFLIGHT_WORK around it, and admitting its report from that
+ * budget would drop the unlink or rename it was matched on, letting it
+ * remove its own image with no report and no kill. A match is rare (each
+ * one ends the process), so this stays small; what it bounds is the
+ * PATH_MAX buffer every item carries. It still has to be a bound: a
+ * process the kill is suppressed for (a protected exe) can repeat the
+ * attempt, and so can one that keeps going until the kill lands. */
+#define AV_MAX_INFLIGHT_SELFDEL 256
+static atomic_t av_inflight_selfdel = ATOMIC_INIT(0);
 
 /* Workqueue concurrency cap - see the comment beside its use in
  * av_init() below. A module param (not just a compile-time constant)
@@ -306,6 +318,21 @@ static inline bool av_work_admit_nonexec(void) {
 
 static inline void av_work_release(void) {
   atomic_dec(&av_inflight_work);
+}
+
+/* Same contract as av_work_admit(), against the self-delete budget only:
+ * paired with exactly one av_selfdel_release() on every path after a true
+ * return. */
+static inline bool av_selfdel_admit(void) {
+  if (atomic_inc_return(&av_inflight_selfdel) > AV_MAX_INFLIGHT_SELFDEL) {
+    atomic_dec(&av_inflight_selfdel);
+    return false;
+  }
+  return true;
+}
+
+static inline void av_selfdel_release(void) {
+  atomic_dec(&av_inflight_selfdel);
 }
 
 /* Resolves a syscall's `dfd` argument into a struct path suitable as
@@ -1316,7 +1343,14 @@ static void av_selfdel_work_fn(struct work_struct *w) {
   kfree(sw->path);
   put_pid(sw->target_pid);
   kfree(sw);
-  av_work_release();
+  av_selfdel_release();
+}
+
+/* A matched self-delete whose report could not be queued: the process
+ * removes its image unobserved, so say so. Atomic context. */
+static void selfdel_missed(const char *why) {
+  pr_warn_ratelimited("kernel-av: event=skip reason=%s pid=%d\n", why,
+                      task_tgid_nr(current));
 }
 
 /* Called from the two inode-level probes below with the dentry about to
@@ -1334,27 +1368,41 @@ static void av_selfdel_work_fn(struct work_struct *w) {
  * the dentry's filesystem. The report replaces it with the exec-time
  * d_path() when that was recorded.
  *
- * av_work_admit(), not the _nonexec budget: a self-delete is a kill
- * path, matches are rare (each one ends the process), and a flood of
- * unrelated unlinks filling the non-exec budget must not hide it. */
+ * Admitted from av_selfdel_admit()'s own budget, not av_work_admit()
+ * (shared with exec work) or the _nonexec one: a self-delete is a kill
+ * path and the process is already matched, so neither a burst of exec
+ * work nor a flood of unrelated unlinks may crowd its report out. A
+ * report that is still dropped (budget or memory) is logged by
+ * selfdel_missed().
+ *
+ * The report targets the thread GROUP (task_tgid()), not the calling
+ * thread: the thread that unlinks can exit before the work runs, and a
+ * thread pid that no longer names a task would skip the kill while the
+ * rest of the process carried on. kill_with_reason() then kills the
+ * group through that pid, which also works when the leader is already a
+ * zombie. */
 static void schedule_selfdel_work(struct dentry *dentry, bool overwrite) {
   struct av_selfdel_work *sw;
   char *p;
 
   if (!av_behavior_exec_ident_match(dentry))
     return;
-  if (!av_work_admit())
+  if (!av_selfdel_admit()) {
+    selfdel_missed("selfdel-budget-full");
     return;
+  }
 
   sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
   if (!sw) {
-    av_work_release();
+    av_selfdel_release();
+    selfdel_missed("selfdel-alloc-failed");
     return;
   }
   sw->path = kmalloc(PATH_MAX, GFP_ATOMIC);
   if (!sw->path) {
     kfree(sw);
-    av_work_release();
+    av_selfdel_release();
+    selfdel_missed("selfdel-alloc-failed");
     return;
   }
   p = dentry_path_raw(dentry, sw->path, PATH_MAX);
@@ -1366,7 +1414,7 @@ static void schedule_selfdel_work(struct dentry *dentry, bool overwrite) {
   sw->cookie = dentry;
   sw->overwrite = overwrite;
   sw->tgid = task_tgid_nr(current);
-  sw->target_pid = get_task_pid(current, PIDTYPE_PID);
+  sw->target_pid = get_pid(task_tgid(current));
   INIT_WORK(&sw->work, av_selfdel_work_fn);
   queue_work(av_wq, &sw->work);
 }
