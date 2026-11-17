@@ -1612,14 +1612,30 @@ struct av_exec_ident {
 
 #define EXEC_IDENT_BITS 12
 /* One ~100-byte node per live process that has exec'd since load. A
- * full table is first swept for dead thread groups inline; if it is
- * still full, a new process's exec is not recorded (its self-delete is
- * then missed) and a warning says so. 65536 live processes is above
- * any realistic system and costs ~6.5 MiB at most. */
+ * full table is first swept for dead thread groups inline, at most once
+ * per EXEC_IDENT_SWEEP_MIN_INTERVAL; if it is still full, a new
+ * process's exec is not recorded (its self-delete is then missed) and a
+ * warning says so. 65536 live processes is above any realistic system
+ * and costs ~6.5 MiB at most. */
 #define MAX_EXEC_IDENTS 65536
+/* The inline sweep walks every node and pid_task()s each, under
+ * exec_ident_lock with IRQs off, inside the exec kprobe. With a table
+ * full of live processes it frees nothing, so repeating it for every new
+ * process's first exec would stall each one for nothing. The periodic GC
+ * sweeps as well; a full table that has just been swept (by either) is
+ * left alone until this has passed. The cost: a new process can go
+ * unrecorded for up to this long after the table fills, even if a thread
+ * group has exited since. */
+#define EXEC_IDENT_SWEEP_MIN_INTERVAL HZ
 static DEFINE_HASHTABLE(exec_ident_table, EXEC_IDENT_BITS);
 static DEFINE_SPINLOCK(exec_ident_lock);
-static unsigned int exec_ident_count; /* under exec_ident_lock */
+static unsigned int exec_ident_count;       /* under exec_ident_lock */
+static unsigned long exec_ident_last_sweep; /* under exec_ident_lock */
+/* Separate from the timestamp: jiffies starts about five minutes before
+ * wraparound (INITIAL_JIFFIES), so a zero timestamp would make
+ * time_after() false for the first ~300 s of uptime and the inline sweep
+ * would never run in that window. */
+static bool exec_ident_swept; /* under exec_ident_lock */
 
 static void exec_ident_free_rcu(struct rcu_head *rcu) {
   struct av_exec_ident *n = container_of(rcu, struct av_exec_ident, rcu);
@@ -1669,6 +1685,8 @@ static unsigned int exec_ident_sweep_dead_locked(void) {
   unsigned int removed = 0;
   int bkt;
 
+  exec_ident_last_sweep = jiffies;
+  exec_ident_swept = true;
   hash_for_each_safe(exec_ident_table, bkt, tmp, n, node) {
     if (!pid_task(n->tgid, PIDTYPE_TGID)) {
       /* cppcheck-suppress uninitvar
@@ -1716,7 +1734,10 @@ void av_behavior_exec_ident_stage(const struct file *file) {
     n->staged = id;
     n->has_staged = true;
   } else if (fresh) {
-    if (exec_ident_count >= MAX_EXEC_IDENTS)
+    if (exec_ident_count >= MAX_EXEC_IDENTS &&
+        (!exec_ident_swept ||
+         time_after(jiffies, exec_ident_last_sweep +
+                                 EXEC_IDENT_SWEEP_MIN_INTERVAL)))
       exec_ident_sweep_dead_locked();
     if (exec_ident_count >= MAX_EXEC_IDENTS) {
       full = true;
