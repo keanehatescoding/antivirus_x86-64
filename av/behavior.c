@@ -37,6 +37,7 @@
 #include <linux/dcache.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/hashtable.h>
 #include <linux/jiffies.h>
 #include <linux/mm.h>
@@ -301,6 +302,21 @@ struct av_behavior_entry {
    * pre-check behaviour. Valid when exec_lexical_set. */
   const struct inode *exec_lexical_dir;
   bool exec_lexical_set;
+
+  /* Third self-delete key: the executed file's own identity
+   * (i_ino/i_sb->s_dev/i_generation, captured by main.c from the
+   * bprm->file it hashed). Compared against the inode vfs_unlink() is
+   * about to remove, so the check survives every spelling the two
+   * path-string keys miss: an alias for the real directory, a bind
+   * mount, a /proc/.../root prefix, or an exec through one view and an
+   * unlink through another (issue #230). It also closes the
+   * rename-over case those keys cannot: a replacement file at the same
+   * name has a different inode, so it is never mistaken for the image.
+   * Values only - no inode reference held. Valid when exec_inode_set. */
+  u64 exec_ino;
+  u32 exec_dev;
+  u32 exec_gen;
+  bool exec_inode_set;
 
   /* Dedup ring buffer for the rapid-write-open heuristic - counts
    * DISTINCT paths written in a TRUE trailing window (see
@@ -1435,6 +1451,7 @@ static void behavior_gc_fn(struct work_struct *w) {
       e->start_time = cur_start;
       e->exec_path[0] = '\0';
       e->exec_lexical_set = false;
+      e->exec_inode_set = false;
       e->trusted = false;
       e->recent_path_next = 0;
       e->recent_path_filled = 0;
@@ -1462,6 +1479,7 @@ static u64 lexical_key_hash(const char *path) {
 void av_behavior_record_exec(pid_t pid, const char *path,
                              const char *lexical_path,
                              const struct inode *lexical_dir,
+                             u64 ino, u32 dev, u32 gen,
                              const char *sha256_hex, u64 start_time) {
   struct av_behavior_entry *e;
   /* cppcheck-suppress knownConditionTrueFalse
@@ -1482,6 +1500,14 @@ void av_behavior_record_exec(pid_t pid, const char *path,
     e->exec_lexical_hash =
         e->exec_lexical_set ? lexical_key_hash(lexical_path) : 0;
     e->exec_lexical_dir = e->exec_lexical_set ? lexical_dir : NULL;
+    /* The inode-identity key. Unlike the lexical key it never needs a
+     * path, so it is set whenever main.c could identify the hashed
+     * file. Cleared on an exec that somehow reports no identity, so a
+     * re-exec never inherits the previous image's. */
+    e->exec_inode_set = dev || ino;
+    e->exec_ino = e->exec_inode_set ? ino : 0;
+    e->exec_dev = e->exec_inode_set ? dev : 0;
+    e->exec_gen = e->exec_inode_set ? gen : 0;
     e->trusted = trusted;
     /* A reused pid can land on a stale entry left behind by a
      * previous, unrelated process (get_or_create_entry() matches on
@@ -1619,6 +1645,48 @@ static bool unlink_dir_is(const struct path *root, const char *spelled,
   same = d_inode(p.dentry) == dir;
   path_put(&p);
   return same;
+}
+
+/* Inode-identity self-delete key (issue #230).
+ *
+ * The d_path() and lexical keys above are strings; every unlink target
+ * they miss is still the same inode whenever the path merely spelled
+ * it differently - an alias for the real directory, a bind mount or
+ * another mount-namespace view, a /proc/self/root prefix, or a
+ * rename-over replacement. This key compares the identity main.c
+ * recorded for the exec'd file against the inode vfs_unlink() is about
+ * to remove, so none of those spellings matter. Called from the
+ * vfs_unlink() kprobe pre-handler, i.e. atomic context: mutex_trylock
+ * only, never a sleeping lock. A contended lock reports false; the
+ * string keys in av_behavior_check_unlink() still run for that unlink,
+ * and the window is a few instructions wide. */
+bool av_behavior_unlink_inode_matches(pid_t pid, const struct inode *inode) {
+  const struct av_behavior_entry *e;
+  bool match = false;
+
+  if (!inode)
+    return false;
+  /* Removing one of several hardlinks does not delete the running
+   * image, so it is not a self-delete. vfs_unlink()'s pre-handler runs
+   * before the link is dropped, so nlink still counts it: exactly one
+   * left means this unlink really is the image's last name. */
+  if (inode->i_nlink != 1)
+    return false;
+  if (!mutex_trylock(&behavior_lock))
+    return false;
+  e = find_entry(pid);
+  if (e && e->exec_inode_set && e->exec_ino == inode->i_ino &&
+      e->exec_dev == (u32)inode->i_sb->s_dev &&
+      e->exec_gen == (u32)inode->i_generation)
+    match = true;
+  mutex_unlock(&behavior_lock);
+  return match;
+}
+
+void av_behavior_report_self_delete(const char *path,
+                                     struct pid *target_pid) {
+  kill_with_reason(target_pid, path,
+                   "self-deleting binary (possible dropper/backdoor)");
 }
 
 void av_behavior_check_unlink(pid_t pid, const char *path,

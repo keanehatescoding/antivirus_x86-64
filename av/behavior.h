@@ -81,11 +81,32 @@ void av_behavior_exit(void);
  * in (the lexical key's directory, as main.c verified at exec time).
  * An unlink that matches only the lexical key must still name that
  * directory when it is checked - see av_behavior_check_unlink(). It
- * is compared, never dereferenced, so no reference is held. */
+ * is compared, never dereferenced, so no reference is held.
+ *
+ * `ino`/`dev`/`gen` are the identity of the file itself (the exec's
+ * bprm->file, as main.c hashed it): i_ino, i_sb->s_dev and
+ * i_generation. They are the third self-delete key, compared against
+ * the inode vfs_unlink() is about to remove, so aliases, bind mounts
+ * and /proc-spelled paths all correlate even when no path string
+ * matches (issue #230). Stored as values, so no reference is held. */
 void av_behavior_record_exec(pid_t pid, const char *path,
                               const char *lexical_path,
                               const struct inode *lexical_dir,
+                              u64 ino, u32 dev, u32 gen,
                               const char *sha256_hex, u64 start_time);
+
+/* Called from the vfs_unlink() kprobe pre-handler with the inode about
+ * to be unlinked: true when it is the image this process exec'd.
+ * Atomic-context safe (mutex_trylock, never sleeps); a contended lock
+ * reports false, since av_behavior_check_unlink()'s string keys still
+ * run for the same unlink. */
+bool av_behavior_unlink_inode_matches(pid_t pid, const struct inode *inode);
+
+/* Reports the self-delete kill for an inode-identity match established
+ * by av_behavior_unlink_inode_matches(). Sleepable (workqueue only):
+ * `path` is for logging and `target_pid` is the unlinking task. */
+void av_behavior_report_self_delete(const char *path,
+                                     struct pid *target_pid);
 
 /* Called from the openat work handler. If the open is write-intent
  * (flags indicate O_WRONLY/O_RDWR/O_CREAT/O_TRUNC) this updates the

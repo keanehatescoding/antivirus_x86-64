@@ -736,6 +736,31 @@ int main(int argc, char *const argv[]) {
         failed = 1;
       }
     }
+    /* I: exec via the REAL path, unlink via the alias. Neither string
+     * key matches (/tmp/sd_real/i vs /tmp/sd_alias/i), which is exactly
+     * the first gap in #230: the d_path() key is the real path, the
+     * lexical key is the real spelling, and the unlink spells neither.
+     * Only the inode-identity key (vfs_unlink()'s victim inode against
+     * the exec image's) catches it. */
+    if (!failed) {
+      int code, sig, saw_record, killed;
+
+      copy_file("/init", "/tmp/sd_real/i");
+      killed = run_self_delete_case("/tmp/sd_real/i", "--self-unlink",
+                                    "/tmp/sd_real/i", "/tmp/sd_alias/i",
+                                    NULL, &code, &sig, &saw_record);
+      outmsg("QEMU_TEST: self-delete case i (exec real, unlink alias): "
+             "exec /tmp/sd_real/i, unlink /tmp/sd_alias/i -> %s "
+             "(exit=%d sig=%d, exec record %s)\n",
+             killed ? "killed" : "not killed", code, sig,
+             saw_record ? "seen" : "not seen in log");
+      if (!saw_record || !killed) {
+        outmsg("QEMU_TEST: FAIL: self-delete case i expected a seen exec "
+               "record and a kill (the inode-identity key, #230)\n");
+        failed = 1;
+      }
+    }
+
     /* Image unlinked before av.ko's d_path() (CodeRabbit on #110).
      * d_path() of an unlinked dentry ends in " (deleted)", so before the
      * fix the d_path() key was recorded with that suffix and the lexical

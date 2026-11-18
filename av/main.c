@@ -85,6 +85,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #include "behavior.h"
@@ -171,6 +172,15 @@ static struct kprobe kp_unlink = {
 static struct kprobe kp_unlinkat = {
     .symbol_name = "__x64_sys_unlinkat",
 };
+/* The victim dentry is not available at syscall entry, but it is at
+ * vfs_unlink() - the inode-identity self-delete key (issue #230) reads
+ * it there. Registration failure only drops that key: the string keys
+ * in av_behavior_check_unlink() still run, so this is a soft
+ * dependency, not a load-time requirement. */
+static struct kprobe kp_vfs_unlink = {
+    .symbol_name = "vfs_unlink",
+};
+static bool vfs_unlink_hook_active;
 static struct kprobe kp_rename = {
     .symbol_name = "__x64_sys_rename",
 };
@@ -776,6 +786,7 @@ static void av_crypto_exit(void) {
 struct av_file_identity {
   dev_t dev;
   unsigned long ino;
+  u32 generation;
   loff_t size;
 };
 
@@ -852,6 +863,7 @@ static int hash_file_multi(struct file *f, struct av_digest *out,
 
     ident_out->dev = inode->i_sb->s_dev;
     ident_out->ino = inode->i_ino;
+    ident_out->generation = inode->i_generation;
     ident_out->size = i_size_read(inode);
   }
 
@@ -1508,6 +1520,7 @@ static void av_work_fn(struct work_struct *w) {
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
   av_behavior_record_exec(aw->tgid, sd_key, lex_path, lex_dir,
+                          (u64)ident.ino, (u32)ident.dev, ident.generation,
                           digest.sha256, aw->start_time);
   dput(lex_parent);
   lex_parent = NULL;
@@ -1987,6 +2000,83 @@ static int handler_pre_unlinkat(struct kprobe *p, struct pt_regs *regs) {
                               (int)real_regs->di);
 }
 
+/* ---- vfs_unlink: inode-identity self-delete (issue #230) ----
+ *
+ * The syscall pre-handlers above see only the pathname the caller
+ * spelled, so an exec and an unlink that name the same inode through
+ * different spellings (alias, bind mount, /proc/<pid>/root prefix)
+ * correlate through neither string key. vfs_unlink() is called with
+ * the already-resolved victim dentry, so its pre-handler can compare
+ * the victim's inode against the identity main.c recorded for the
+ * exec'd file. Only an exact match allocates anything: the common case
+ * is a trylock plus three integer compares in
+ * av_behavior_unlink_inode_matches(), and work is queued only for the
+ * (rare) self-delete it confirms, so routine unlink traffic is not
+ * turned into extra workqueue items. */
+struct av_unlink_inode_work {
+  struct work_struct work;
+  struct dentry *dentry; /* pinned with dget() at kprobe time */
+  struct pid *target_pid;
+};
+
+static void av_unlink_inode_work_fn(struct work_struct *w) {
+  struct av_unlink_inode_work *iw =
+      container_of(w, struct av_unlink_inode_work, work);
+  char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  const char *path = "(unknown)";
+
+  /* The unlink has landed by now, so this is only for the log line:
+   * dentry_path_raw() has no mount prefix to attach, but the dentry is
+   * pinned and its parent chain is still walkable. */
+  if (buf) {
+    char *p = dentry_path_raw(iw->dentry, buf, PATH_MAX);
+
+    if (!IS_ERR(p))
+      path = p;
+  }
+  av_behavior_report_self_delete(path, iw->target_pid);
+
+  kfree(buf);
+  dput(iw->dentry);
+  put_pid(iw->target_pid);
+  kfree(iw);
+  av_work_release();
+}
+
+/* `struct dentry *dentry` is the third argument of vfs_unlink() since
+ * the idmapped-mount signature change (5.12); it was the second before
+ * that (the module still advertises 5.7+). 330752 is KERNEL_VERSION(5,
+ * 12, 0) spelled numerically - a literal avoids cppcheck failing to
+ * expand the macro without kernel headers. */
+static int handler_pre_vfs_unlink(struct kprobe *p, struct pt_regs *regs) {
+#if LINUX_VERSION_CODE >= 330752
+  struct dentry *dentry = (struct dentry *)regs->dx;
+#else
+  struct dentry *dentry = (struct dentry *)regs->si;
+#endif
+  struct av_unlink_inode_work *iw;
+
+  if (!dentry || !d_inode(dentry))
+    return 0;
+  if (!av_behavior_unlink_inode_matches(task_tgid_nr(current),
+                                        d_inode(dentry)))
+    return 0;
+
+  if (!av_work_admit_nonexec())
+    return 0;
+  iw = kmalloc(sizeof(*iw), GFP_ATOMIC);
+  if (!iw) {
+    av_work_release();
+    return 0;
+  }
+  dget(dentry);
+  iw->dentry = dentry;
+  iw->target_pid = get_task_pid(current, PIDTYPE_PID);
+  INIT_WORK(&iw->work, av_unlink_inode_work_fn);
+  queue_work(av_wq, &iw->work);
+  return 0;
+}
+
 /* ---- rename/renameat/renameat2: extension-append burst + sensitive-
  * path rename tracking. Same atomic-context discipline as every other
  * hook here: pre-handlers only copy TWO path strings (GFP_ATOMIC) and
@@ -2393,6 +2483,19 @@ static int __init av_init(void) {
     goto err_kp_renameat;
   }
 
+  /* Soft dependency, registered last so no later failure needs to
+   * unwind it: without it self-deletes are still caught by the
+   * path-string keys above, just not through the spellings those miss
+   * (issue #230). */
+  kp_vfs_unlink.pre_handler = handler_pre_vfs_unlink;
+  ret = register_kprobe(&kp_vfs_unlink);
+  if (ret < 0)
+    pr_warn("kernel-av: register_kprobe(vfs_unlink) failed: %d - "
+            "self-delete detection falls back to path-string matching\n",
+            ret);
+  else
+    vfs_unlink_hook_active = true;
+
   pr_info("kernel-av: loaded, %zu signature(s) active\n", av_sigtable_count());
   return 0;
 
@@ -2431,6 +2534,8 @@ static void __exit av_exit(void) {
   unregister_kprobe(&kp_renameat);
   unregister_kprobe(&kp_rename);
   unregister_kprobe(&kp_unlinkat);
+  if (vfs_unlink_hook_active)
+    unregister_kprobe(&kp_vfs_unlink);
   unregister_kprobe(&kp_unlink);
   unregister_kprobe(&kp_openat);
   unregister_kprobe(&kp_bprm_check);
