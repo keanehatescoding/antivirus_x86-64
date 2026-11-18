@@ -146,6 +146,11 @@ jobs:
           # automatically by CONFIG_KPROBES (kprobes register by
           # symbol name), so it doesn't need to be listed explicitly.
           ./scripts/config --enable CONFIG_BINFMT_ELF
+          # "#!" scripts: init.c's interpreted-image self-delete cases
+          # exec a script whose interpreter is a copy of init itself.
+          # Without this the kernel answers ENOEXEC for them. The
+          # ENOEXEC cases are unaffected: their file has no "#!" line.
+          ./scripts/config --enable CONFIG_BINFMT_SCRIPT
           ./scripts/config --enable CONFIG_BLK_DEV_INITRD
           ./scripts/config --enable CONFIG_DEVTMPFS
           ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT

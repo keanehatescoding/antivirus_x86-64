@@ -161,6 +161,12 @@ static char *read_kernel_log(void) {
  * av/main.c). Used only by the unlinked-before-d_path() self-delete
  * cases, and reset to 0 right after them. */
 #define TOCTOU_DELAY_PARAM "/sys/module/av/parameters/av_toctou_test_delay_ms"
+/* av.ko's test-only knob that makes the exec identity skip its
+ * dentry-pointer comparison, simulating a reclaimed script dentry (see
+ * av_exec_ident_test_no_dentry in av/behavior.c). tmpfs pins every
+ * dentry, so this is the only way the script cases below can reach the
+ * by-value comparison. Set around those cases, reset right after. */
+#define NO_DENTRY_PARAM "/sys/module/av/parameters/av_exec_ident_test_no_dentry"
 
 /* Set an integer sysfs/module-param attribute. No O_CREAT/O_TRUNC: the
  * target is an existing kernel attribute, and a failure to open it is a
@@ -359,6 +365,15 @@ static void retarget_sd_ralias(void) {
     die("symlink /tmp/sd_ralias -> /tmp/sd_other");
 }
 
+/* Script case s4's on_record hook: put a different file where the
+ * script was, once av.ko has recorded the exec. The name is the same,
+ * the inode is not. */
+static void replace_sd_script(void) {
+  if (unlink("/tmp/sd_sc/s4") != 0)
+    die("unlink /tmp/sd_sc/s4");
+  write_file("/tmp/sd_sc/s4", "a different file at the same name\n");
+}
+
 /* Case X's on_record hook: move the image to /tmp/sd_xb/renamed, point
  * /tmp/sd_x/alias at /tmp/sd_xb, and put an unrelated "x" there. */
 static void move_sd_x_image(void) {
@@ -390,6 +405,22 @@ int main(int argc, char *const argv[]) {
     if (read(3, &c, 1) != 1)
       _exit(44);
     if (unlink(argv[2]) != 0)
+      _exit(45);
+    sleep(5);
+    _exit(43);
+  }
+  /* --self-unlink-last: unlink(the LAST argument). For the script cases:
+   * a script "#!<this binary> --self-unlink-last" run as
+   * `script mode arg2 arg3` reaches main() as {this binary,
+   * "--self-unlink-last", script, mode, arg2, arg3}, so the path to
+   * delete is whatever the case passed last - the script itself, a hard
+   * link to it, or anything else - while argv[2] is always the script. */
+  if (argc > 2 && !strcmp(argv[1], "--self-unlink-last")) {
+    char c;
+
+    if (read(3, &c, 1) != 1)
+      _exit(44);
+    if (unlink(argv[argc - 1]) != 0)
       _exit(45);
     sleep(5);
     _exit(43);
@@ -1194,6 +1225,105 @@ int main(int argc, char *const argv[]) {
         outmsg("QEMU_TEST: FAIL: self-delete case x's unlink did not "
                "remove /tmp/sd_xb/x and leave /tmp/sd_xb/renamed\n");
         failed = 1;
+      }
+    }
+    /* Interpreted images: a "#!" script whose dentry has been reclaimed
+     * (CodeRabbit on #233). The process runs the interpreter, so nothing
+     * pins the script's dentry; once reclaimed, the next lookup of the
+     * name allocates a new one and the dentry-pointer comparison cannot
+     * match. The identity therefore also records the entry by value
+     * (filesystem, inode number and generation, parent directory, name
+     * hash) for interpreted images. tmpfs never reclaims a dentry, so
+     * av_exec_ident_test_no_dentry makes the matcher skip the pointer
+     * comparison, which is the state reclamation leaves it in; the
+     * by-value comparison alone then has to decide.
+     *
+     *   s0: dentry intact, unlink the script                  -> killed
+     *       (an interpreted exec is recorded and matched at all)
+     *   s1: reclaimed, unlink the script                      -> killed
+     *   s2: reclaimed, unlink another hard link to it         -> NOT killed
+     *   s3: reclaimed, hard link kept, unlink the exec'd name -> killed
+     *   s4: reclaimed, a different file put at the name, and
+     *       the child unlinks that                            -> NOT killed
+     *
+     * s2 and s4 are the controls that keep the by-value key from turning
+     * into the pathname matching this branch replaced: another name of
+     * the same file, and another file at the same name, must still not
+     * count. s1 proves they are controls, not vacuous. */
+    if (!failed) {
+      static const struct {
+        const char *name; /* /tmp/sd_sc/<name> is the script */
+        int no_dentry;    /* skip the dentry comparison */
+        const char *link; /* hard link to make to the script, or NULL */
+        const char *unlink; /* what the child unlinks */
+        void (*on_record)(void);
+        const char *reason;   /* expected kill reason, NULL = not killed */
+        const char *survivor; /* must still exist afterwards, or NULL */
+        const char *what;
+      } sc[] = {
+          {"s0", 0, NULL, "/tmp/sd_sc/s0", NULL, "self-deleting binary", NULL,
+           "dentry intact: unlink the script"},
+          {"s1", 1, NULL, "/tmp/sd_sc/s1", NULL, "self-deleting binary", NULL,
+           "dentry reclaimed: unlink the script"},
+          {"s2", 1, "/tmp/sd_sc/s2_link", "/tmp/sd_sc/s2_link", NULL, NULL,
+           "/tmp/sd_sc/s2", "dentry reclaimed, unlink the OTHER hard link"},
+          {"s3", 1, "/tmp/sd_sc/s3_keep", "/tmp/sd_sc/s3", NULL,
+           "self-deleting binary", "/tmp/sd_sc/s3_keep",
+           "dentry reclaimed, unlink the exec'd name, other link kept"},
+          {"s4", 1, NULL, "/tmp/sd_sc/s4", replace_sd_script, NULL, NULL,
+           "dentry reclaimed, different file put at the name"},
+      };
+
+      if (mkdir("/tmp/sd_sc", 0755) != 0)
+        die("mkdir /tmp/sd_sc");
+      copy_file("/init", "/tmp/sd_sc/interp");
+
+      for (size_t i = 0; i < sizeof(sc) / sizeof(sc[0]) && !failed; i++) {
+        char script[64];
+        int code, sig, saw_record, killed;
+        pid_t child;
+        struct stat st;
+
+        snprintf(script, sizeof(script), "/tmp/sd_sc/%s", sc[i].name);
+        write_file(script, "#!/tmp/sd_sc/interp --self-unlink-last\n");
+        if (sc[i].link && link(script, sc[i].link) != 0)
+          die("link script case image");
+        write_param_int(NO_DENTRY_PARAM, sc[i].no_dentry);
+        killed = run_self_delete_case(script, "--script", "-", sc[i].unlink,
+                                      script, sc[i].on_record, &code, &sig,
+                                      &saw_record, &child);
+        write_param_int(NO_DENTRY_PARAM, 0);
+        outmsg("QEMU_TEST: self-delete script case %s (%s): unlink %s -> %s "
+               "(exit=%d sig=%d, exec record %s)\n",
+               sc[i].name, sc[i].what, sc[i].unlink,
+               killed ? "killed" : "not killed", code, sig,
+               saw_record ? "seen" : "not seen in log");
+        if (!saw_record) {
+          outmsg("QEMU_TEST: FAIL: self-delete script case %s never logged "
+                 "its exec record\n",
+                 sc[i].name);
+          failed = 1;
+        } else if (killed != (sc[i].reason != NULL)) {
+          outmsg("QEMU_TEST: FAIL: self-delete script case %s expected %s\n",
+                 sc[i].name, sc[i].reason ? "a kill" : "no kill");
+          failed = 1;
+        } else if (!killed && code != 43) {
+          outmsg("QEMU_TEST: FAIL: self-delete script case %s exited %d, not "
+                 "43 - the helper itself broke (44 = sync read, 45 = the "
+                 "deletion)\n",
+                 sc[i].name, code);
+          failed = 1;
+        } else if (killed && !saw_kill_reason(child, sc[i].reason)) {
+          outmsg("QEMU_TEST: FAIL: self-delete script case %s was killed but "
+                 "dmesg has no reason=\"%s ...\" pid=%d line\n",
+                 sc[i].name, sc[i].reason, (int)child);
+          failed = 1;
+        } else if (sc[i].survivor && stat(sc[i].survivor, &st) != 0) {
+          outmsg("QEMU_TEST: FAIL: self-delete script case %s's unlink did "
+                 "not leave %s in place\n",
+                 sc[i].name, sc[i].survivor);
+          failed = 1;
+        }
       }
     }
     if (failed) {

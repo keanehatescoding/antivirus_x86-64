@@ -107,10 +107,13 @@ void av_behavior_check_unlink(const char *path, struct pid *target_pid);
  * probe, first binfmt level only - remembers `file` as the exec in
  * flight. av_behavior_exec_ident_commit(): from
  * security_bprm_committing_creds(), past exec's point of no return -
- * makes the staged file the one the process is running.
+ * makes the staged file the one the process is running. `final` is the
+ * file the exec ended up running (bprm->file); when it is not the staged
+ * file the image is interpreted, and its identity also keeps the
+ * directory entry by value (see struct av_exec_ident in behavior.c).
  * av_behavior_exec_ident_match(): from security_inode_unlink() /
- * security_inode_rename() - true when `dentry` (positive) is the
- * directory entry the running image was exec'd from.
+ * security_inode_rename() - true when `dentry` (positive, an entry of
+ * `dir`) is the directory entry the running image was exec'd from.
  *
  * av_behavior_report_self_delete(): sleepable, from the work item a
  * match queues. Logs and kills target_pid (subject to the protected
@@ -119,8 +122,9 @@ void av_behavior_check_unlink(const char *path, struct pid *target_pid);
  * replaced by the exec-time d_path() when that was recorded for
  * `cookie`. `overwrite` selects the rename-over-own-binary reason. */
 void av_behavior_exec_ident_stage(const struct file *file);
-void av_behavior_exec_ident_commit(void);
-bool av_behavior_exec_ident_match(const struct dentry *dentry);
+void av_behavior_exec_ident_commit(const struct file *final);
+bool av_behavior_exec_ident_match(const struct inode *dir,
+                                  struct dentry *dentry);
 void av_behavior_report_self_delete(pid_t pid, const struct dentry *cookie,
                                     char *path, size_t path_len,
                                     bool overwrite, struct pid *target_pid);

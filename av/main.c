@@ -1312,15 +1312,20 @@ static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
 }
 
 /* Probes security_bprm_committing_creds(), which begin_new_exec()
- * calls once per exec, after the point of no return. No argument is
- * needed: it promotes whatever handler_pre_bprm_check() staged for this
- * thread group to the identity of the image now running (see struct
- * av_exec_ident in behavior.c for why staging and committing are
- * separate). Atomic context, like every pre-handler here. Neither
- * argument is used, but the signature is struct kprobe's pre_handler. */
+ * calls once per exec, after the point of no return. It promotes
+ * whatever handler_pre_bprm_check() staged for this thread group to the
+ * identity of the image now running (see struct av_exec_ident in
+ * behavior.c for why staging and committing are separate). bprm->file
+ * is passed along: by now it is the file the exec will actually run, the
+ * interpreter when a script or binfmt_misc handler replaced the staged
+ * file, and the identity records the difference. Atomic context, like
+ * every pre-handler here. */
 /* cppcheck-suppress constParameterCallback */
 static int handler_pre_bprm_committing(struct kprobe *p, struct pt_regs *regs) {
-  av_behavior_exec_ident_commit();
+  const struct linux_binprm *bprm =
+      (const struct linux_binprm *)regs_get_kernel_argument(regs, 0);
+
+  av_behavior_exec_ident_commit(bprm ? bprm->file : NULL);
   return 0;
 }
 
@@ -1381,11 +1386,12 @@ static void selfdel_missed(const char *why) {
  * rest of the process carried on. kill_with_reason() then kills the
  * group through that pid, which also works when the leader is already a
  * zombie. */
-static void schedule_selfdel_work(struct dentry *dentry, bool overwrite) {
+static void schedule_selfdel_work(const struct inode *dir,
+                                  struct dentry *dentry, bool overwrite) {
   struct av_selfdel_work *sw;
   char *p;
 
-  if (!av_behavior_exec_ident_match(dentry))
+  if (!av_behavior_exec_ident_match(dir, dentry))
     return;
   if (!av_selfdel_admit()) {
     selfdel_missed("selfdel-budget-full");
@@ -1430,10 +1436,12 @@ static void schedule_selfdel_work(struct dentry *dentry, bool overwrite) {
  * filesystem refusing); the attempt is what is flagged, as with the
  * syscall-level hook before. */
 static int handler_pre_inode_unlink(struct kprobe *p, struct pt_regs *regs) {
+  const struct inode *dir =
+      (const struct inode *)regs_get_kernel_argument(regs, 0);
   struct dentry *dentry = (struct dentry *)regs_get_kernel_argument(regs, 1);
 
   if (dentry)
-    schedule_selfdel_work(dentry, false);
+    schedule_selfdel_work(dir, dentry, false);
   return 0;
 }
 
@@ -1452,12 +1460,14 @@ static int handler_pre_inode_unlink(struct kprobe *p, struct pt_regs *regs) {
  * a dropper replaces itself with a decoy; the protected-exe list is the
  * per-binary escape hatch, as for every behavioral kill. */
 static int handler_pre_inode_rename(struct kprobe *p, struct pt_regs *regs) {
+  const struct inode *new_dir =
+      (const struct inode *)regs_get_kernel_argument(regs, 2);
   struct dentry *new_dentry = (struct dentry *)regs_get_kernel_argument(regs, 3);
   unsigned int flags = (unsigned int)regs_get_kernel_argument(regs, 4);
 
   if (!new_dentry || (flags & RENAME_EXCHANGE) || !d_is_positive(new_dentry))
     return 0;
-  schedule_selfdel_work(new_dentry, true);
+  schedule_selfdel_work(new_dir, new_dentry, true);
   return 0;
 }
 

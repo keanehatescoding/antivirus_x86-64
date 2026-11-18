@@ -1615,18 +1615,43 @@ void av_behavior_check_unlink(const char *path, struct pid *target_pid) {
  * could execve() a non-executable file (ENOEXEC) and then delete itself
  * unnoticed.
  *
- * Known gaps, unchanged from the string check: a forked child (no exec)
- * deleting its parent's image is a different thread group with no
- * identity; and for an interpreted script nothing pins the script's
- * dentry after exec, so under memory pressure it can be evicted and a
- * later lookup of the same name allocates a new one, which no longer
- * matches (fail-open). A native binary is pinned by mm->exe_file. */
+ * An interpreted image (a "#!" script, binfmt_misc) is different: nothing
+ * pins the script's dentry after exec - the process holds the
+ * interpreter, not the script - so under memory pressure it can be
+ * reclaimed, and the next lookup of the same name allocates a new
+ * dentry that the pointer comparison above no longer recognises. A
+ * script's identity therefore also records the directory entry by
+ * value, which reclamation cannot change: the filesystem, the file's
+ * inode number and generation, the parent directory's inode number and
+ * generation, and a hash of the entry's name. An unlink that misses the
+ * dentry comparison is still a self-delete if all of that matches. That
+ * keeps the dentry policy: another hard link has the same file but a
+ * different name (or directory); a file put in the exec'd name's place
+ * has a different inode, whose number and generation differ (a freed
+ * inode number can be handed out again, its generation is what tells the
+ * two files apart); neither matches. The name is compared by hash, which
+ * can only add a match between two names of the same file in the same
+ * directory, never lose one. A native binary does not need this: it is
+ * pinned by mm->exe_file, so its dentry is the one every lookup of the
+ * name finds, and it keeps the exact comparison alone.
+ *
+ * Known gaps: a forked child (no exec) deleting its parent's image is a
+ * different thread group with no identity; and a script renamed after
+ * exec whose dentry is then reclaimed is looked up under its new name,
+ * which the recorded one no longer describes (fail-open). */
 
 struct av_exec_file_id {
   const struct dentry *dentry;
   const struct inode *inode;
   const struct super_block *sb;
   unsigned long ino;
+  /* The reclamation-stable name, for interpreted images only (see
+   * above). Valid only when `stable`. */
+  bool stable;
+  u32 gen;               /* the file's i_generation */
+  unsigned long dir_ino; /* the parent directory's inode number... */
+  u32 dir_gen;           /* ...and generation */
+  u32 name_hash;         /* full_name_hash() of the entry's name */
 };
 
 struct av_exec_ident {
@@ -1680,16 +1705,52 @@ static void exec_ident_free_rcu(struct rcu_head *rcu) {
   kfree(n);
 }
 
+/* Atomic context. Fills in both the dentry cookies and the
+ * reclamation-stable name; the stable part is only kept for interpreted
+ * images, see av_behavior_exec_ident_commit(). The parent is read under
+ * the dentry's d_lock, which holds d_parent and d_name still, and a
+ * dentry keeps a reference on its parent, so the parent (and its inode)
+ * cannot go away while `file` pins the child. */
 static void exec_ident_file_id(const struct file *file,
                                struct av_exec_file_id *id) {
-  const struct dentry *dentry = file->f_path.dentry;
+  struct dentry *dentry = file->f_path.dentry;
   const struct inode *inode = d_inode(dentry);
+  const struct inode *dir;
 
+  /* Everything, so a node never carries stack leftovers in the stable
+   * fields it does not use. */
+  memset(id, 0, sizeof(*id));
   id->dentry = dentry;
   id->inode = inode;
   id->sb = dentry->d_sb;
   id->ino = inode ? inode->i_ino : 0;
+  if (!inode)
+    return;
+
+  spin_lock(&dentry->d_lock);
+  dir = d_inode(dentry->d_parent);
+  if (dir) {
+    id->gen = inode->i_generation;
+    id->dir_ino = dir->i_ino;
+    id->dir_gen = dir->i_generation;
+    id->name_hash =
+        full_name_hash(NULL, dentry->d_name.name, dentry->d_name.len);
+    id->stable = true;
+  }
+  spin_unlock(&dentry->d_lock);
 }
+
+/* TEST ONLY: when nonzero, av_behavior_exec_ident_match() skips the
+ * dentry-pointer comparison, as if the exec'd script's dentry had been
+ * reclaimed and the name looked up afresh. tmpfs pins every dentry, so
+ * the QEMU boot test cannot make the kernel reclaim one; this puts the
+ * matcher in the state reclamation leaves it in, so the by-value
+ * comparison is the only thing that can match. Default 0 = disabled, so
+ * production matching is untouched. */
+static int av_exec_ident_test_no_dentry; /* = 0: disabled unless a test sets it */
+module_param(av_exec_ident_test_no_dentry, int, 0644);
+MODULE_PARM_DESC(av_exec_ident_test_no_dentry,
+                 "TEST ONLY: skip the exec identity's dentry-pointer comparison, simulating a reclaimed script dentry (default 0 = disabled); never set in production");
 
 /* exec_ident_lock held. */
 static struct av_exec_ident *exec_ident_find_locked(struct pid *tgid) {
@@ -1792,7 +1853,7 @@ void av_behavior_exec_ident_stage(const struct file *file) {
                         pid_nr(tgid));
 }
 
-void av_behavior_exec_ident_commit(void) {
+void av_behavior_exec_ident_commit(const struct file *final) {
   struct pid *tgid = task_tgid(current);
   struct av_exec_ident *n, *next;
   unsigned long flags;
@@ -1807,6 +1868,14 @@ void av_behavior_exec_ident_commit(void) {
     if (next) {
       next->tgid = get_pid(tgid);
       next->active = n->staged;
+      /* The staged file is the first binfmt level; `final` is what the
+       * exec ended up running. They differ exactly when a script or
+       * binfmt_misc handler swapped in an interpreter, i.e. when nothing
+       * pins the staged file's dentry. Otherwise mm->exe_file does, the
+       * dentry comparison is exact, and the by-value name is dropped so
+       * a native image keeps exactly that policy. */
+      if (!final || final->f_path.dentry == n->staged.dentry)
+        next->active.stable = false;
       next->has_active = true;
       hlist_replace_rcu(&n->node, &next->node);
       call_rcu(&n->rcu, exec_ident_free_rcu);
@@ -1822,7 +1891,37 @@ void av_behavior_exec_ident_commit(void) {
   kfree(next);
 }
 
-bool av_behavior_exec_ident_match(const struct dentry *dentry) {
+/* The by-value comparison for an interpreted image whose dentry the
+ * pointer comparison missed: true when `dentry`, in `dir`, is the
+ * directory entry `a` recorded, whatever dentry now represents it. The
+ * cheap fields are compared first - this runs for every unlink and
+ * rename of a process that has an identity, nearly all of which are
+ * unrelated files - and only a file that already agrees on filesystem,
+ * inode number and generation, and parent directory has its name read.
+ * Atomic context: the unlink and rename paths hold the directory's
+ * i_rwsem, so the name is stable, and d_lock is taken anyway to read it
+ * the way every other reader does. */
+static bool exec_ident_stable_match(const struct av_exec_file_id *a,
+                                    const struct inode *dir,
+                                    struct dentry *dentry,
+                                    const struct inode *inode) {
+  bool same;
+
+  if (!a->stable || !dir)
+    return false;
+  if (a->sb != dentry->d_sb || a->ino != inode->i_ino ||
+      a->gen != inode->i_generation || a->dir_ino != dir->i_ino ||
+      a->dir_gen != dir->i_generation)
+    return false;
+  spin_lock(&dentry->d_lock);
+  same = a->name_hash ==
+         full_name_hash(NULL, dentry->d_name.name, dentry->d_name.len);
+  spin_unlock(&dentry->d_lock);
+  return same;
+}
+
+bool av_behavior_exec_ident_match(const struct inode *dir,
+                                  struct dentry *dentry) {
   const struct pid *tgid = task_tgid(current);
   const struct inode *inode = d_inode(dentry);
   const struct av_exec_ident *n;
@@ -1837,9 +1936,15 @@ bool av_behavior_exec_ident_match(const struct dentry *dentry) {
      * which assigns n before running the body. */
     if (n->tgid != tgid)
       continue;
-    match = n->has_active && n->active.dentry == dentry &&
-            n->active.inode == inode && n->active.sb == dentry->d_sb &&
-            n->active.ino == inode->i_ino;
+    if (n->has_active) {
+      const struct av_exec_file_id *a = &n->active;
+
+      match = !READ_ONCE(av_exec_ident_test_no_dentry) &&
+              a->dentry == dentry && a->inode == inode &&
+              a->sb == dentry->d_sb && a->ino == inode->i_ino;
+      if (!match)
+        match = exec_ident_stable_match(a, dir, dentry, inode);
+    }
     break;
   }
   rcu_read_unlock();
