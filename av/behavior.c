@@ -1920,6 +1920,25 @@ static bool exec_ident_stable_match(const struct av_exec_file_id *a,
   return same;
 }
 
+/* Whether `dentry` (an entry of `dir`, with inode `inode`) is the
+ * directory entry the image recorded in `n` was exec'd from: the exact
+ * dentry first, then, for an interpreted image, the entry by value.
+ * Split out of av_behavior_exec_ident_match() so that function's
+ * table-walk loop variable is touched on one line only. */
+static bool exec_ident_node_match(const struct av_exec_ident *n,
+                                  const struct inode *dir,
+                                  struct dentry *dentry,
+                                  const struct inode *inode) {
+  const struct av_exec_file_id *a = &n->active;
+
+  if (!n->has_active)
+    return false;
+  if (!READ_ONCE(av_exec_ident_test_no_dentry) && a->dentry == dentry &&
+      a->inode == inode && a->sb == dentry->d_sb && a->ino == inode->i_ino)
+    return true;
+  return exec_ident_stable_match(a, dir, dentry, inode);
+}
+
 bool av_behavior_exec_ident_match(const struct inode *dir,
                                   struct dentry *dentry) {
   const struct pid *tgid = task_tgid(current);
@@ -1936,15 +1955,9 @@ bool av_behavior_exec_ident_match(const struct inode *dir,
      * which assigns n before running the body. */
     if (n->tgid != tgid)
       continue;
-    if (n->has_active) {
-      const struct av_exec_file_id *a = &n->active;
-
-      match = !READ_ONCE(av_exec_ident_test_no_dentry) &&
-              a->dentry == dentry && a->inode == inode &&
-              a->sb == dentry->d_sb && a->ino == inode->i_ino;
-      if (!match)
-        match = exec_ident_stable_match(a, dir, dentry, inode);
-    }
+    /* cppcheck-suppress uninitvar
+     * Same false positive: n is the loop variable assigned above. */
+    match = exec_ident_node_match(n, dir, dentry, inode);
     break;
   }
   rcu_read_unlock();
