@@ -828,6 +828,22 @@ static struct mm_struct *av_group_get_mm(struct task_struct *task) {
   return mm;
 }
 
+/* Whether the dentry's own name ends in " (deleted)", i.e. the suffix
+ * d_path() appends for an unlinked file could be part of the real name
+ * instead. See target_is_protected(). Sleepable. */
+static bool dentry_name_ends_deleted(struct dentry *dentry) {
+  static const char suffix[] = " (deleted)";
+  const size_t slen = sizeof(suffix) - 1;
+  struct name_snapshot snap;
+  bool ends;
+
+  take_dentry_name_snapshot(&snap, dentry);
+  ends = snap.name.len >= slen &&
+         !memcmp(snap.name.name + snap.name.len - slen, suffix, slen);
+  release_dentry_name_snapshot(&snap);
+  return ends;
+}
+
 /* Resolves target_pid's own exe path (task->mm->exe_file, i.e. what
  * ACTUALLY exec'd - not any path string a caller might be passing
  * around for logging) and checks it against the protected list.
@@ -852,11 +868,24 @@ static struct mm_struct *av_group_get_mm(struct task_struct *task) {
  * the exe as "/usr/sbin/sshd (deleted)", which no exact-path entry
  * matches, and the protected list would be bypassed exactly when a
  * protected service updates itself. With the flag set, a genuinely
- * unlinked exe has that suffix cut before the lookup. Whether the suffix
- * is the kernel's is decided from d_unlinked(), sampled BEFORE d_path()
- * (d_path() decides on the marker inside the call; sampling after could
- * disagree), so a file really named "x (deleted)" is never mangled, and
- * an internal mount's "pseudo" names are left alone. Only paths that
+ * unlinked exe has that suffix cut before the lookup.
+ *
+ * Whether the suffix is the kernel's is decided from d_unlinked(),
+ * sampled AFTER d_path(). The marker is only ever added for a dentry that
+ * is unlinked when d_path() looks, and an unlinked dentry stays so, so a
+ * marked path implies d_unlinked() here. Sampling before would miss a
+ * rename that lands between the sample and d_path() - the self-delete
+ * probe fires before the rename completes, so the worker can run right
+ * across it - and the exact allow-list lookup would then fail for a
+ * protected service that has just updated itself. Sampling after has the
+ * opposite hazard: an unlink landing between d_path() and the sample
+ * leaves a path with no marker, which is harmless unless the file's own
+ * name ends in " (deleted)". That name is read from the dentry
+ * (dentry_name_ends_deleted()) and a file named that way is never
+ * stripped, so a binary called "/opt/x/updater (deleted)" cannot borrow
+ * the allow-list entry of "/opt/x/updater". Such a file that really was
+ * unlinked misses the allow-list and is killed, the safe direction.
+ * An internal mount's "pseudo" names are left alone. Only paths that
  * start with '/' are looked up: the fallback renderings for names with
  * no mount path are never allow-list keys. */
 static bool target_is_protected(struct pid *target_pid, char *path_out,
@@ -890,12 +919,14 @@ static bool target_is_protected(struct pid *target_pid, char *path_out,
 
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (buf) {
-    const bool unlinked =
-        strip_deleted && d_unlinked(exe_file->f_path.dentry) &&
-        !(exe_file->f_path.mnt->mnt_flags & MNT_INTERNAL);
+    struct dentry *exe_dentry = exe_file->f_path.dentry;
     char *resolved = d_path(&exe_file->f_path, buf, PATH_MAX);
 
-    if (unlinked && !IS_ERR(resolved) && resolved[0] == '/') {
+    /* d_unlinked() after d_path(), see above. */
+    if (strip_deleted && !IS_ERR(resolved) && resolved[0] == '/' &&
+        d_unlinked(exe_dentry) &&
+        !(exe_file->f_path.mnt->mnt_flags & MNT_INTERNAL) &&
+        !dentry_name_ends_deleted(exe_dentry)) {
       static const char suffix[] = " (deleted)";
       size_t len = strlen(resolved);
 
