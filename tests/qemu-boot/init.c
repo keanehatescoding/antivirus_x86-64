@@ -783,9 +783,11 @@ int main(int argc, char *const argv[]) {
       }
     }
     /* av.ko keeps the exec'd dentry only as a compared cookie, never a
-     * reference: a held dentry or vfsmount would make this -EBUSY. The
-     * exec worker's own file reference is dropped just after it logs
-     * the record, so allow it a moment. */
+     * reference: a held vfsmount would make this -EBUSY. That is all this
+     * checks - umount() looks at the mount's reference count, so a leaked
+     * dentry reference alone would still unmount. The exec worker's own
+     * file reference is dropped just after it logs the record, so allow
+     * it a moment. */
     if (!failed) {
       int tries = 0;
 

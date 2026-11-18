@@ -1421,18 +1421,25 @@ static bool kill_target(struct pid *target_pid, const char *path,
   rcu_read_lock();
   task = pid_task(target_pid, PIDTYPE_PID);
   if (task) {
-    found = true;
-    pr_alert("kernel-av: event=detected action=kill type=behavioral "
-             "path=\"%s\" reason=\"%s\" pid=%d\n",
-             av_log_str(esc_path), reason, pid_nr(target_pid));
     /* kill_pid(), not send_sig(): send_sig() is thread-scoped, and to a
      * thread-group leader that has already exited (a zombie, still the
      * task a tgid pid names while other threads run) it does not start a
      * group exit at all, so the rest of the process would carry on.
      * kill_pid() delivers to the group, picking a live thread. priv=1:
      * this is the module acting, not a signal from user space, so no
-     * kill() permission check. */
-    kill_pid(target_pid, SIGKILL, 1);
+     * kill() permission check.
+     *
+     * The record is written after the call, from its result: the task
+     * can be reaped between pid_task() above and the signal, and
+     * kill_pid() then returns -ESRCH. That is "no longer exists", not a
+     * kill, so it must not log action=kill and must let a self-delete
+     * caller write its own detection-only record. */
+    if (kill_pid(target_pid, SIGKILL, 1) != -ESRCH) {
+      found = true;
+      pr_alert("kernel-av: event=detected action=kill type=behavioral "
+               "path=\"%s\" reason=\"%s\" pid=%d\n",
+               av_log_str(esc_path), reason, pid_nr(target_pid));
+    }
   }
   rcu_read_unlock();
   kfree(esc_path);
@@ -1689,14 +1696,30 @@ void av_behavior_check_unlink(const char *path, struct pid *target_pid) {
  * holds a copy at the same inode number and generation, under the same
  * parent number and basename, on the same superblock: an unlink of the
  * copy would be taken for a self-delete. Those filesystems keep the
- * exact dentry comparison alone (exec_ident_tuple_is_unique()).
+ * exact dentry comparison alone (exec_ident_tuple_is_unique()); so does
+ * FUSE, whose reported inode numbers need not tell nodes apart.
  *
  * Known gaps: a forked child (no exec) deleting its parent's image is a
  * different thread group with no identity; an image renamed after exec
  * whose dentry is then reclaimed or invalidated is looked up under its
  * new name, which the recorded one no longer describes; and on btrfs or
  * bcachefs an image whose dentry is reclaimed or invalidated is not
- * recognised. All fail open. */
+ * recognised. All fail open.
+ *
+ * The opposite error - a kill for an unlink that does not remove the
+ * image - is possible where hard links to the image exist, and only when
+ * the process shuffles them itself:
+ *  - exec /tmp/app, which has another link /tmp/app.other; move /tmp/app
+ *    to /tmp/app.saved and /tmp/app.other to /tmp/app; unlink /tmp/app.
+ *    The dentries moved with their names, so the exact comparison
+ *    rejects the entry at /tmp/app, but the by-value comparison takes it
+ *    for the entry recorded at exec (same inode, parent and name).
+ *  - the image's dentry is reclaimed and the dentry allocated for a
+ *    lookup of another link of the same inode lands at the same address,
+ *    so the exact comparison matches it.
+ * Telling these apart needs a fresh lookup of the image's current entry,
+ * which an atomic-context probe cannot do. The kill lands on the process
+ * that is rearranging its own image's links, so it is left as is. */
 
 struct av_exec_file_id {
   const struct dentry *dentry;
@@ -1770,6 +1793,9 @@ static void exec_ident_free_rcu(struct rcu_head *rcu) {
 /* Spelled here: bcachefs has come and gone from <linux/magic.h> across
  * the kernels this module builds against. */
 #define AV_BCACHEFS_SUPER_MAGIC 0xca451a4eUL
+#ifndef FUSE_SUPER_MAGIC
+#define FUSE_SUPER_MAGIC 0x65735546UL
+#endif
 
 /* True when (superblock, inode number, generation) plus the parent and
  * name identify one directory entry on `sb`, i.e. its inode numbers are
@@ -1777,12 +1803,16 @@ static void exec_ident_free_rcu(struct rcu_head *rcu) {
  * and a snapshot keeps a copy of a file at the same tuple; the subvolume
  * is not available to a module (and the mount is no substitute: a bind
  * mount of the same entry must still match), so those two are left out
- * rather than risk taking the copy for the image. Unknown filesystems
- * are included: the by-value match is what a reclaimed or invalidated
- * dentry needs, and the ones known to break the assumption are few. */
+ * rather than risk taking the copy for the image. FUSE is left out too:
+ * the kernel tells its inodes apart by the server's node ID, but i_ino
+ * and i_generation are whatever the server reports, and distinct nodes
+ * can report the same pair. Unknown filesystems are included: the
+ * by-value match is what a reclaimed or invalidated dentry needs, and the
+ * ones known to break the assumption are few. */
 static bool exec_ident_tuple_is_unique(const struct super_block *sb) {
   return sb->s_magic != BTRFS_SUPER_MAGIC &&
-         sb->s_magic != AV_BCACHEFS_SUPER_MAGIC;
+         sb->s_magic != AV_BCACHEFS_SUPER_MAGIC &&
+         sb->s_magic != FUSE_SUPER_MAGIC;
 }
 
 /* Atomic context. Fills in both the dentry cookies and the

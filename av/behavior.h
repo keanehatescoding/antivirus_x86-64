@@ -107,10 +107,12 @@ void av_behavior_check_unlink(const char *path, struct pid *target_pid);
  * probe, first binfmt level only - remembers `file` as the exec in
  * flight. av_behavior_exec_ident_commit(): from
  * security_bprm_committing_creds(), past exec's point of no return -
- * makes the staged file the one the process is running. Every image's
- * identity also keeps its directory entry by value, so a match survives
- * the dentry being reclaimed or invalidated (see struct av_exec_ident in
- * behavior.c).
+ * makes the staged file the one the process is running. Where the
+ * filesystem's inode numbers are unique per superblock, the identity also
+ * keeps the directory entry by value - the name and parent as they were at
+ * exec - so a match survives the dentry being reclaimed or invalidated.
+ * btrfs, bcachefs and FUSE are left out and keep the exact dentry
+ * comparison alone (see struct av_exec_ident in behavior.c).
  * av_behavior_exec_ident_match(): from security_inode_unlink() /
  * security_inode_rename() - true when `dentry` (positive, an entry of
  * `dir`) is the directory entry the running image was exec'd from.
