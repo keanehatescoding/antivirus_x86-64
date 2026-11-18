@@ -279,6 +279,33 @@ static void wait_for_exit(pid_t pid, int timeout_ms, int *exit_code,
  * path are then spelled from inside that root. Cases R and S. */
 static const char *sd_chroot_dir;
 
+/* Whether dmesg has av.ko's SUCCESSFUL exec record for `path` and `pid`:
+ * a line holding both "event=clean " and `path="<path>" pid=<pid> `. The
+ * bare path/pid pair is not enough, since the exec worker also logs
+ * failures (a hash error, say) with the same shape, and a case that goes
+ * on to assert "not killed" must not pass on an exec av.ko never vetted.
+ * Both clean variants (type=daemon, type=fail-open) have the shape;
+ * the hash-error line does not carry event=clean. */
+static int saw_clean_exec_record(const char *path, pid_t pid) {
+  const char *log = read_kernel_log();
+  char needle[256];
+  const char *p = log;
+
+  snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", path, (int)pid);
+  while ((p = strstr(p, needle)) != NULL) {
+    const char *line = p;
+    const char *clean;
+
+    while (line > log && line[-1] != '\n')
+      line--;
+    clean = strstr(line, "event=clean ");
+    if (clean && clean < p)
+      return 1;
+    p += strlen(needle);
+  }
+  return 0;
+}
+
 static int run_self_delete_case(const char *exec_path, const char *mode,
                                 const char *arg2, const char *arg3,
                                 const char *recorded_path,
@@ -287,7 +314,6 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
                                 pid_t *child_pid) {
   int sync_fd[2];
   pid_t pid;
-  char needle[256];
   int waited = 0;
 
   if (pipe(sync_fd) != 0)
@@ -313,11 +339,9 @@ static int run_self_delete_case(const char *exec_path, const char *mode,
   close(sync_fd[0]);
   *child_pid = pid;
 
-  snprintf(needle, sizeof(needle), "path=\"%s\" pid=%d ", recorded_path,
-           (int)pid);
   *saw_record = 0;
   while (waited < SELF_DELETE_RECORD_WAIT_MS) {
-    if (strstr(read_kernel_log(), needle)) {
+    if (saw_clean_exec_record(recorded_path, pid)) {
       *saw_record = 1;
       break;
     }
@@ -1233,7 +1257,7 @@ int main(int argc, char *const argv[]) {
      * name allocates a new one and the dentry-pointer comparison cannot
      * match. The identity therefore also records the entry by value
      * (filesystem, inode number and generation, parent directory, name
-     * hash) for interpreted images. tmpfs never reclaims a dentry, so
+     * hash) for every image. tmpfs never reclaims a dentry, so
      * av_exec_ident_test_no_dentry makes the matcher skip the pointer
      * comparison, which is the state reclamation leaves it in; the
      * by-value comparison alone then has to decide.
@@ -1245,6 +1269,9 @@ int main(int argc, char *const argv[]) {
      *   s3: reclaimed, hard link kept, unlink the exec'd name -> killed
      *   s4: reclaimed, a different file put at the name, and
      *       the child unlinks that                            -> NOT killed
+     *   s5: reclaimed, unlink a same-named hard link in
+     *       another directory                                 -> NOT killed
+     *   n0: a native image, dentry skipped, unlink it         -> killed
      *
      * s2 and s4 are the controls that keep the by-value key from turning
      * into the pathname matching this branch replaced: another name of
@@ -1254,6 +1281,7 @@ int main(int argc, char *const argv[]) {
       static const struct {
         const char *name; /* /tmp/sd_sc/<name> is the script */
         int no_dentry;    /* skip the dentry comparison */
+        int native;       /* a copy of /init run directly, not a script */
         const char *link; /* hard link to make to the script, or NULL */
         const char *unlink; /* what the child unlinks */
         void (*on_record)(void);
@@ -1261,21 +1289,32 @@ int main(int argc, char *const argv[]) {
         const char *survivor; /* must still exist afterwards, or NULL */
         const char *what;
       } sc[] = {
-          {"s0", 0, NULL, "/tmp/sd_sc/s0", NULL, "self-deleting binary", NULL,
-           "dentry intact: unlink the script"},
-          {"s1", 1, NULL, "/tmp/sd_sc/s1", NULL, "self-deleting binary", NULL,
-           "dentry reclaimed: unlink the script"},
-          {"s2", 1, "/tmp/sd_sc/s2_link", "/tmp/sd_sc/s2_link", NULL, NULL,
+          {"s0", 0, 0, NULL, "/tmp/sd_sc/s0", NULL, "self-deleting binary",
+           NULL, "dentry intact: unlink the script"},
+          {"s1", 1, 0, NULL, "/tmp/sd_sc/s1", NULL, "self-deleting binary",
+           NULL, "dentry reclaimed: unlink the script"},
+          {"s2", 1, 0, "/tmp/sd_sc/s2_link", "/tmp/sd_sc/s2_link", NULL, NULL,
            "/tmp/sd_sc/s2", "dentry reclaimed, unlink the OTHER hard link"},
-          {"s3", 1, "/tmp/sd_sc/s3_keep", "/tmp/sd_sc/s3", NULL,
+          {"s3", 1, 0, "/tmp/sd_sc/s3_keep", "/tmp/sd_sc/s3", NULL,
            "self-deleting binary", "/tmp/sd_sc/s3_keep",
            "dentry reclaimed, unlink the exec'd name, other link kept"},
-          {"s4", 1, NULL, "/tmp/sd_sc/s4", replace_sd_script, NULL, NULL,
+          {"s4", 1, 0, NULL, "/tmp/sd_sc/s4", replace_sd_script, NULL, NULL,
            "dentry reclaimed, different file put at the name"},
+          /* Same basename, other directory: only the parent differs, so
+           * this is the control for the parent-directory part of the key. */
+          {"s5", 1, 0, "/tmp/sd_sc2/s5", "/tmp/sd_sc2/s5", NULL, NULL,
+           "/tmp/sd_sc/s5",
+           "dentry reclaimed, unlink a same-named link in ANOTHER directory"},
+          /* A native image gets the same fallback: its dentry can be
+           * invalidated by the filesystem even though mm->exe_file pins it. */
+          {"n0", 1, 1, NULL, "/tmp/sd_sc/n0", NULL, "self-deleting binary",
+           NULL, "native image, dentry invalidated: unlink the image"},
       };
 
       if (mkdir("/tmp/sd_sc", 0755) != 0)
         die("mkdir /tmp/sd_sc");
+      if (mkdir("/tmp/sd_sc2", 0755) != 0)
+        die("mkdir /tmp/sd_sc2");
       copy_file("/init", "/tmp/sd_sc/interp");
 
       for (size_t i = 0; i < sizeof(sc) / sizeof(sc[0]) && !failed; i++) {
@@ -1285,13 +1324,21 @@ int main(int argc, char *const argv[]) {
         struct stat st;
 
         snprintf(script, sizeof(script), "/tmp/sd_sc/%s", sc[i].name);
-        write_file(script, "#!/tmp/sd_sc/interp --self-unlink-last\n");
+        if (sc[i].native)
+          copy_file("/init", script);
+        else
+          write_file(script, "#!/tmp/sd_sc/interp --self-unlink-last\n");
         if (sc[i].link && link(script, sc[i].link) != 0)
           die("link script case image");
         write_param_int(NO_DENTRY_PARAM, sc[i].no_dentry);
-        killed = run_self_delete_case(script, "--script", "-", sc[i].unlink,
-                                      script, sc[i].on_record, &code, &sig,
-                                      &saw_record, &child);
+        if (sc[i].native)
+          killed = run_self_delete_case(script, "--self-unlink", sc[i].unlink,
+                                        NULL, script, sc[i].on_record, &code,
+                                        &sig, &saw_record, &child);
+        else
+          killed = run_self_delete_case(script, "--script", "-", sc[i].unlink,
+                                        script, sc[i].on_record, &code, &sig,
+                                        &saw_record, &child);
         write_param_int(NO_DENTRY_PARAM, 0);
         outmsg("QEMU_TEST: self-delete script case %s (%s): unlink %s -> %s "
                "(exit=%d sig=%d, exec record %s)\n",

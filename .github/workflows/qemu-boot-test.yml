@@ -168,7 +168,9 @@ jobs:
           set -euxo pipefail
           KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-qemu-boot"
           make -C av KDIR="$KDIR" clean
-          make -C av KDIR="$KDIR"
+          # AV_TEST_KNOBS compiles in the test-only module parameter the
+          # script/native fallback cases need; no shipped build sets it.
+          make -C av KDIR="$KDIR" KCFLAGS=-DAV_TEST_KNOBS
 
       - name: Build the static test init and assemble the initramfs
         run: |

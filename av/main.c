@@ -1315,17 +1315,12 @@ static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
  * calls once per exec, after the point of no return. It promotes
  * whatever handler_pre_bprm_check() staged for this thread group to the
  * identity of the image now running (see struct av_exec_ident in
- * behavior.c for why staging and committing are separate). bprm->file
- * is passed along: by now it is the file the exec will actually run, the
- * interpreter when a script or binfmt_misc handler replaced the staged
- * file, and the identity records the difference. Atomic context, like
- * every pre-handler here. */
+ * behavior.c for why staging and committing are separate). No argument
+ * is needed: it promotes whatever handler_pre_bprm_check() staged. Atomic
+ * context, like every pre-handler here. */
 /* cppcheck-suppress constParameterCallback */
 static int handler_pre_bprm_committing(struct kprobe *p, struct pt_regs *regs) {
-  const struct linux_binprm *bprm =
-      (const struct linux_binprm *)regs_get_kernel_argument(regs, 0);
-
-  av_behavior_exec_ident_commit(bprm ? bprm->file : NULL);
+  av_behavior_exec_ident_commit();
   return 0;
 }
 
