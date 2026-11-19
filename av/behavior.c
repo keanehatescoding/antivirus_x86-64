@@ -828,22 +828,6 @@ static struct mm_struct *av_group_get_mm(struct task_struct *task) {
   return mm;
 }
 
-/* Whether the dentry's own name ends in " (deleted)", i.e. the suffix
- * d_path() appends for an unlinked file could be part of the real name
- * instead. See target_is_protected(). Sleepable. */
-static bool dentry_name_ends_deleted(struct dentry *dentry) {
-  static const char suffix[] = " (deleted)";
-  const size_t slen = sizeof(suffix) - 1;
-  struct name_snapshot snap;
-  bool ends;
-
-  take_dentry_name_snapshot(&snap, dentry);
-  ends = snap.name.len >= slen &&
-         !memcmp(snap.name.name + snap.name.len - slen, suffix, slen);
-  release_dentry_name_snapshot(&snap);
-  return ends;
-}
-
 /* Resolves target_pid's own exe path (task->mm->exe_file, i.e. what
  * ACTUALLY exec'd - not any path string a caller might be passing
  * around for logging) and checks it against the protected list.
@@ -871,20 +855,21 @@ static bool dentry_name_ends_deleted(struct dentry *dentry) {
  * unlinked exe has that suffix cut before the lookup.
  *
  * Whether the suffix is the kernel's is decided from d_unlinked(),
- * sampled AFTER d_path(). The marker is only ever added for a dentry that
- * is unlinked when d_path() looks, and an unlinked dentry stays so, so a
- * marked path implies d_unlinked() here. Sampling before would miss a
- * rename that lands between the sample and d_path() - the self-delete
- * probe fires before the rename completes, so the worker can run right
- * across it - and the exact allow-list lookup would then fail for a
- * protected service that has just updated itself. Sampling after has the
- * opposite hazard: an unlink landing between d_path() and the sample
- * leaves a path with no marker, which is harmless unless the file's own
- * name ends in " (deleted)". That name is read from the dentry
- * (dentry_name_ends_deleted()) and a file named that way is never
- * stripped, so a binary called "/opt/x/updater (deleted)" cannot borrow
- * the allow-list entry of "/opt/x/updater". Such a file that really was
- * unlinked misses the allow-list and is killed, the safe direction.
+ * sampled on both sides of d_path(). d_path() adds the marker exactly
+ * when the dentry is unlinked at the moment it looks, and an unlinked
+ * dentry never becomes linked again, so:
+ *  - unlinked before and after: the marker is there. Exactly one
+ *    " (deleted)" is cut, and only that one, so a file whose real name
+ *    ends in " (deleted)" and that has been unlinked is looked up under
+ *    its real name, and still matches its allow-list entry.
+ *  - linked before and after: there is no marker, nothing is cut, and a
+ *    literal " (deleted)" in a still-linked file's name stays, so
+ *    "/opt/x/updater (deleted)" cannot borrow the entry of
+ *    "/opt/x/updater".
+ *  - linked before, unlinked after: the unlink (or the rename of a
+ *    self-update, which the probe reports before it completes) landed
+ *    inside the call, so whether d_path() saw it is unknown. Render again;
+ *    the dentry is unlinked now, so the second pass is the first case.
  * An internal mount's "pseudo" names are left alone. Only paths that
  * start with '/' are looked up: the fallback renderings for names with
  * no mount path are never allow-list keys. */
@@ -920,13 +905,21 @@ static bool target_is_protected(struct pid *target_pid, char *path_out,
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (buf) {
     struct dentry *exe_dentry = exe_file->f_path.dentry;
-    char *resolved = d_path(&exe_file->f_path, buf, PATH_MAX);
+    bool before, after;
+    char *resolved;
 
-    /* d_unlinked() after d_path(), see above. */
-    if (strip_deleted && !IS_ERR(resolved) && resolved[0] == '/' &&
-        d_unlinked(exe_dentry) &&
-        !(exe_file->f_path.mnt->mnt_flags & MNT_INTERNAL) &&
-        !dentry_name_ends_deleted(exe_dentry)) {
+    /* Linked before and unlinked after means the unlink landed inside
+     * d_path(), so repeat: the dentry is unlinked now, the second pass
+     * has before == after, and the loop cannot run a third time. */
+    do {
+      before = d_unlinked(exe_dentry);
+      resolved = d_path(&exe_file->f_path, buf, PATH_MAX);
+      after = d_unlinked(exe_dentry);
+    } while (!before && after);
+
+    if (strip_deleted && before && after && !IS_ERR(resolved) &&
+        resolved[0] == '/' &&
+        !(exe_file->f_path.mnt->mnt_flags & MNT_INTERNAL)) {
       static const char suffix[] = " (deleted)";
       size_t len = strlen(resolved);
 
