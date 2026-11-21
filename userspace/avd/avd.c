@@ -4696,8 +4696,9 @@ static void cmd_quarantine_restore(int fd, const char *id) {
        * on different filesystems), and losing the recovery record
        * here would be strictly worse than a restore that has to be
        * retried. */
+      int saved_errno = errno;
       close(qfd);
-      if (errno == EEXIST)
+      if (saved_errno == EEXIST)
         send_err(fd, "original path is occupied - move or remove it first");
       else
         send_err(fd, "rename failed (different filesystem? check "
