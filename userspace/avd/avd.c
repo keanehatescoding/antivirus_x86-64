@@ -4682,16 +4682,27 @@ static void cmd_quarantine_restore(int fd, const char *id) {
               "will be restored under avd's own uid/gid instead)\n",
               dest, strerror(errno));
 
-    if (rename(dest, meta.original_path) != 0) {
-      /* Leave it chmod'd/chown'd back to original but still under
-       * quarantine_dir rather than deleting the .meta - the operator
-       * can still recover it manually (e.g. the two directories are
-       * on different filesystems), and losing the recovery record
-       * here would be strictly worse than a restore that has to be
-       * retried. */
+    /* RENAME_NOREPLACE: close the lstat()-then-rename() TOCTOU window
+     * above. The lstat() check is only advisory - something can occupy
+     * meta.original_path between it and here - and a plain rename()
+     * would silently clobber that occupant. renameat2() with
+     * RENAME_NOREPLACE makes the kernel refuse (EEXIST) instead, so a
+     * concurrent creation can never be overwritten. On failure the file
+     * stays at dest (quarantine); re-lock it to mode 0000 through qfd
+     * below so any surviving hard link to the inode cannot be reached
+     * with the restored permissions, while keeping the quarantine entry
+     * and .meta in place for manual recovery. */
+    if (renameat2(AT_FDCWD, dest, AT_FDCWD, meta.original_path,
+                  RENAME_NOREPLACE) != 0) {
+      int saved_errno = errno;
+      if (fchmod(qfd, 0000) != 0)
+        fprintf(stderr, "avd: quarantine restore: could not re-lock \"%s\": %s\n", dest, strerror(errno));
       close(qfd);
-      send_err(fd, "rename failed (different filesystem? check "
-                  "/var/lib/av-quarantine manually)");
+      if (saved_errno == EEXIST)
+        send_err(fd, "original path is occupied - move or remove it first");
+      else
+        send_err(fd, "rename failed (different filesystem? check "
+                    "/var/lib/av-quarantine manually)");
       return;
     }
     close(qfd);
