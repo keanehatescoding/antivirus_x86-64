@@ -161,6 +161,7 @@ EOF
 cat > "$BUILD_DIR/ipc.c" <<'EOF'
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include "privsep_worker.h"
 #include "common.h"
@@ -213,7 +214,7 @@ static bool want_plain(int nr) {
     switch (nr) {
     case SYS_read: case SYS_pread64: case SYS_lseek: case SYS_fstat:
     case SYS_fstatfs:
-    case SYS_mmap: case SYS_munmap: case SYS_mprotect: case SYS_mremap:
+    case SYS_munmap: case SYS_mprotect: case SYS_mremap:
     case SYS_brk: case SYS_madvise: case SYS_futex: case SYS_dup:
     case SYS_close: case SYS_clock_gettime: case SYS_clock_nanosleep:
     case SYS_rt_sigaction: case SYS_rt_sigprocmask: case SYS_rt_sigreturn:
@@ -278,7 +279,7 @@ static void test_bpf(void) {
         }
     }
     CHECK(bad == 0, "only the allowlist is allowed, for syscall 0..1023");
-    CHECK(plain_ok == 21, "all twenty-one plain entries are exercised");
+    CHECK(plain_ok == 20, "all twenty plain entries are exercised (mmap is conditional)");
 
     /* The explicit never-list, with every argument shape that might help. */
     bad = 0;
@@ -327,6 +328,53 @@ static void test_bpf(void) {
     CHECK(!allowed(prog, n, AUDIT_ARCH_X86_64, SYS_newfstatat, 5,
                    AT_SYMLINK_NOFOLLOW), "newfstatat(NOFOLLOW) alone is killed");
     (void)sdone;
+
+    /* mmap only with MAP_PRIVATE and nothing outside the flags a scan needs.
+     * The expected set is written out here, not taken from the header: private
+     * memory, optionally anonymous, fixed or unreserved. mmap's flags are arg 3
+     * and an unsigned long, so all 64 bits count. */
+    {
+        const uint64_t OK = 0x2 /* PRIVATE */ | 0x10 /* FIXED */ |
+                            0x20 /* ANONYMOUS */ | 0x4000 /* NORESERVE */;
+        int mbad = 0;
+
+        for (uint64_t f = 0; f < 0x10000; f++) {
+            bool want = (f & 0x2) && !(f & ~OK);
+
+            if (allowed(prog, n, AUDIT_ARCH_X86_64, SYS_mmap, 0, f) != want)
+                mbad++;
+        }
+        for (int b = 16; b < 64; b++) {
+            uint64_t f = 1ull << b;
+
+            if (allowed(prog, n, AUDIT_ARCH_X86_64, SYS_mmap, 0, f) ||
+                allowed(prog, n, AUDIT_ARCH_X86_64, SYS_mmap, 0, f | 0x2) ||
+                allowed(prog, n, AUDIT_ARCH_X86_64, SYS_mmap, 0, f | 0x22))
+                mbad++;
+        }
+        CHECK(mbad == 0,
+              "mmap is allowed exactly for MAP_PRIVATE plus ANONYMOUS, FIXED, "
+              "NORESERVE (all 65536 low flag values and every higher bit)");
+
+#define MM(flags) allowed(prog, n, AUDIT_ARCH_X86_64, SYS_mmap, 0, (flags))
+        CHECK(MM(MAP_PRIVATE | MAP_ANONYMOUS) && MM(MAP_PRIVATE) &&
+              MM(MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE) &&
+              MM(MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED),
+              "what glibc's allocator and libyara's file mapping use is allowed");
+        CHECK(!MM(0) && !MM(MAP_ANONYMOUS),
+              "mmap with no MAP_PRIVATE is killed");
+        CHECK(!MM(MAP_SHARED) && !MM(MAP_SHARED | MAP_ANONYMOUS) &&
+              !MM(MAP_SHARED_VALIDATE | MAP_ANONYMOUS),
+              "shared mappings are killed: RLIMIT_DATA does not count them");
+        CHECK(!MM(MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN),
+              "MAP_GROWSDOWN is killed: the kernel treats it as a stack and "
+              "RLIMIT_DATA does not count it either");
+        CHECK(!MM(MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB) &&
+              !MM(MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK) &&
+              !MM(MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED),
+              "other flags outside the four are killed");
+#undef MM
+    }
 
     /* A different ipc fd number gives a different program. */
     {
@@ -671,7 +719,7 @@ static pid_t spawn_worker(int *parent_end, int fail_step, bool serve,
         struct ps_harden_cfg cfg = {
             .uid = uid, .gid = uid, .ipc_fd = sv[1], .log_fd = -1,
             .expect_ppid = me + ppid_skew,
-            .as_bytes = 1ull << 30, .cpu_seconds = 60, .nofile = WORKER_NOFILE,
+            .data_bytes = 1ull << 30, .cpu_seconds = 60, .nofile = WORKER_NOFILE,
         };
         struct report r;
         int step, my_pid = getpid(); /* getpid() is not allowed once hardened */
@@ -763,6 +811,7 @@ enum act {
     A_ALLOWED, A_OPEN, A_OPENAT, A_SOCKET, A_EXECVE, A_FORK, A_WRITE, A_KILL,
     A_PTRACE, A_SENDMSG_OTHER, A_RECVMSG_OTHER, A_STAT_BY_PATH, A_X32,
     A_I386, A_PRCTL, A_SETUID, A_CONNECT_UNIX, A_UNLINK,
+    A_MMAP_SHARED_ANON, A_MMAP_SHARED_FILE, A_MMAP_GROWSDOWN, A_MMAP_HUGETLB,
 };
 
 static const struct { enum act a; const char *name; } acts[] = {
@@ -774,6 +823,10 @@ static const struct { enum act a; const char *name; } acts[] = {
     {A_STAT_BY_PATH, "newfstatat() by path"}, {A_X32, "an x32-ABI syscall"},
     {A_I386, "an int 0x80 (32-bit ABI) syscall"}, {A_PRCTL, "prctl()"},
     {A_SETUID, "setuid()"}, {A_CONNECT_UNIX, "connect()"}, {A_UNLINK, "unlink()"},
+    {A_MMAP_SHARED_ANON, "mmap(MAP_SHARED|MAP_ANONYMOUS)"},
+    {A_MMAP_SHARED_FILE, "mmap(MAP_SHARED) of the scan file"},
+    {A_MMAP_GROWSDOWN, "mmap(MAP_PRIVATE|MAP_ANONYMOUS|MAP_GROWSDOWN)"},
+    {A_MMAP_HUGETLB, "mmap(MAP_HUGETLB)"},
 };
 
 /* Run `a` in a child that has only NO_NEW_PRIVS + the filter. Returns the
@@ -802,7 +855,7 @@ static int seccomp_child(enum act a, int *report_ok) {
 
         switch (a) {
         case A_ALLOWED: {
-            void *p;
+            void *p, *q;
             struct timespec ts;
             int d;
 
@@ -816,6 +869,12 @@ static int seccomp_child(enum act a, int *report_ok) {
             if (p == MAP_FAILED) _exit(46);
             if (mprotect(p, 4096, PROT_READ) < 0) _exit(47);
             if (munmap(p, 1 << 20) < 0) _exit(48);
+            /* what libyara does with the scan fd, and glibc's reserve flag */
+            q = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (q == MAP_FAILED || munmap(q, 4096) < 0) _exit(52);
+            q = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (q == MAP_FAILED || munmap(q, 1 << 20) < 0) _exit(53);
             if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) _exit(49);
             if (syscall(SYS_getrandom, buf, 8, 0) != 8) _exit(50);
             d = dup(fd);
@@ -845,6 +904,23 @@ static int seccomp_child(enum act a, int *report_ok) {
         case A_SETUID:  res = (int)syscall(SYS_setuid, 0); break;
         case A_CONNECT_UNIX: res = (int)syscall(SYS_connect, sv[1], NULL, 0); break;
         case A_UNLINK:  res = (int)syscall(SYS_unlink, "/tmp/nonexistent-x"); break;
+        case A_MMAP_SHARED_ANON:
+            res = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED;
+            break;
+        case A_MMAP_SHARED_FILE:
+            res = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0) == MAP_FAILED;
+            break;
+        case A_MMAP_GROWSDOWN:
+            res = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0) ==
+                  MAP_FAILED;
+            break;
+        case A_MMAP_HUGETLB:
+            res = mmap(NULL, 2 << 20, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0) ==
+                  MAP_FAILED;
+            break;
         }
         /* Survived a syscall that must have been fatal. */
         (void)res;
@@ -893,6 +969,75 @@ static void test_seccomp_kernel(void) {
         snprintf(label, sizeof(label), "%s kills the worker with SIGSYS",
                  acts[i].name);
         CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS, label);
+    }
+}
+
+/* The reason the two go together. Under RLIMIT_DATA a huge read-only mapping
+ * of the scanned file works (the old RLIMIT_AS made it fail, which was a
+ * fail-open for any file larger than the headroom), the memory a scan can
+ * fill stays bounded, and the two mapping kinds RLIMIT_DATA does not count
+ * are refused by the filter (checked as acts above). The limit is set from the
+ * child's own VmData so the test does not depend on how big this binary is. */
+static void test_data_limit(void) {
+    int sv[2], st;
+    pid_t pid;
+
+    printf("\nRLIMIT_DATA with the mmap rule, in a real kernel (no root needed):\n");
+    socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv);
+    pid = fork();
+    if (pid == 0) {
+        const size_t FILE_SZ = 1ull << 30;       /* sparse, bigger than the limit */
+        const size_t HEADROOM = 64ull << 20;
+        char tmpl[] = "/tmp/av_privsep_big_XXXXXX", vm[64];
+        int fd = mkstemp(tmpl);
+        struct rlimit rl;
+        void *big, *p;
+
+        if (fd < 0) _exit(10);
+        unlink(tmpl);
+        if (ftruncate(fd, (off_t)FILE_SZ) < 0) _exit(11);
+        if (!status_line(getpid(), "VmData", vm, sizeof(vm))) _exit(12);
+        rl.rlim_cur = rl.rlim_max = (rlim_t)strtoull(vm, NULL, 10) * 1024 + HEADROOM;
+        if (setrlimit(RLIMIT_DATA, &rl) < 0) _exit(13);
+        close(sv[0]);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+            ps_seccomp_install(sv[1]) < 0)
+            _exit(14);
+
+        /* What libyara does with the scan fd: the whole file, read-only. */
+        big = mmap(NULL, FILE_SZ, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (big == MAP_FAILED) _exit(20);
+        if (((volatile char *)big)[0] != 0 || ((volatile char *)big)[FILE_SZ - 1] != 0)
+            _exit(21);
+        /* Memory a scan can fill is still bounded... */
+        p = mmap(NULL, 2 * HEADROOM, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED || errno != ENOMEM) _exit(22);
+        /* ...also by turning the read-only mapping into writable memory... */
+        if (mprotect(big, FILE_SZ, PROT_READ | PROT_WRITE) == 0 || errno != ENOMEM)
+            _exit(23);
+        /* ...while memory inside the headroom is fine. */
+        p = mmap(NULL, HEADROOM / 4, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) _exit(24);
+        _exit(0);
+    }
+    close(sv[1]);
+    waitpid(pid, &st, 0);
+    close(sv[0]);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 11) {
+        SKIPT("this filesystem has no sparse files for the 1 GiB test file");
+        return;
+    }
+    {
+        char label[200];
+
+        snprintf(label, sizeof(label),
+                 "a file far over the data limit maps and reads, while memory "
+                 "the scan could fill stays bounded (%s %d)",
+                 WIFSIGNALED(st) ? "signal" : "exit status",
+                 WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, label);
     }
 }
 
@@ -986,8 +1131,17 @@ static void test_hardening(void) {
         CHECK(limit_of(pid, "Max file size") == 0, "RLIMIT_FSIZE is 0");
         CHECK(limit_of(pid, "Max open files") == WORKER_NOFILE,
               "RLIMIT_NOFILE is the small configured value");
-        CHECK(limit_of(pid, "Max address space") == (1l << 30),
-              "RLIMIT_AS is the configured value");
+        CHECK(limit_of(pid, "Max data size") == (1l << 30),
+              "RLIMIT_DATA is the configured value");
+        {
+            struct rlimit mine;
+            long want;
+
+            getrlimit(RLIMIT_AS, &mine);
+            want = mine.rlim_cur == RLIM_INFINITY ? -1 : (long)mine.rlim_cur;
+            CHECK(limit_of(pid, "Max address space") == want,
+                  "RLIMIT_AS is left alone: it would fail the mapping of a big file");
+        }
         CHECK(limit_of(pid, "Max cpu time") == 60, "RLIMIT_CPU is the configured value");
         {
             DIR *d;
@@ -1063,7 +1217,7 @@ static void test_pdeathsig(void) {
         if (wk == 0) {
             struct ps_harden_cfg cfg = {
                 .uid = WORKER_UID, .gid = WORKER_UID, .ipc_fd = sv[1],
-                .log_fd = -1, .expect_ppid = sp, .as_bytes = 1ull << 30,
+                .log_fd = -1, .expect_ppid = sp, .data_bytes = 1ull << 30,
                 .cpu_seconds = 60, .nofile = WORKER_NOFILE,
             };
             struct report rr;
@@ -1100,6 +1254,7 @@ int main(void) {
     alarm(180);
     printf("privsep worker: hardening and seccomp against the real kernel\n");
     test_seccomp_kernel();
+    test_data_limit();
     test_hardening();
     test_pdeathsig();
     SUMMARY("privsep_worker (kernel)");

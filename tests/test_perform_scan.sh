@@ -267,6 +267,10 @@ int main(int argc, char **argv) {
    * nobody, as in the spawner and client tests. Needs root; the shell side
    * only sets this when it is root. */
   if (getenv("HARNESS_PRIVSEP")) {
+    /* HARNESS_BIG=1 (below): a small headroom, so that a file of a few hundred
+     * MB is several times over the worker's whole data limit. */
+    if (getenv("HARNESS_BIG"))
+      privsep_data_headroom_mb = 64;
     if (privsep_start(65534, 65534) != 0) {
       fprintf(stderr, "privsep_start failed\n");
       return 2;
@@ -310,6 +314,31 @@ int main(int argc, char **argv) {
       privsep_stop();
       return 0;
     }
+  }
+
+  /* HARNESS_BIG=1: only the case that used to fail open in a worker. A sparse
+   * file far bigger than the worker's data limit, with an override-rule marker
+   * at the start. libyara maps a file whole, so under RLIMIT_AS (the worker's
+   * limit before this was RLIMIT_DATA) the mapping failed and the worker
+   * answered CLEAN plus inconclusive, where the in-process scan convicts. The
+   * two modes must now agree. */
+  if (getenv("HARNESS_BIG")) {
+    FILE *bf;
+
+    snprintf(p, sizeof(p), "%s/big.bin", w);
+    bf = fopen(p, "w");
+    if (!bf || fputs("MARK_OVERRIDE\n", bf) == EOF || fflush(bf) != 0 ||
+        ftruncate(fileno(bf), 256L << 20) != 0) {
+      perror("big file");
+      return 2;
+    }
+    fclose(bf);
+    run_case("big_over_data_limit", p, false);
+    count_quarantine(qdir);
+    if (privsep_enabled)
+      printf("WORKER_DATA_LIMIT_MB %llu\n", privsep_data_limit_mb);
+    privsep_stop();
+    return 0;
   }
 
   /* Exact-signature snapshot for sigfile.txt (normally fanotify-only). */
@@ -762,6 +791,45 @@ else
         startup_case user-valid   "hyprav-scan:x:65534:65534::/:/usr/sbin/nologin"          proceed
         startup_case default-off  ""                                                        off     ""
         startup_case privsep-zero ""                                                        off     "0"
+    fi
+fi
+
+# A file far bigger than a worker's data limit must get the same verdict in a
+# worker as in process. libyara maps the scanned file whole; the worker's old
+# RLIMIT_AS counted that mapping, so a file over the limit failed to map and
+# the worker answered CLEAN plus inconclusive where the in-process scan
+# convicts it. The file is 256 MiB sparse and the worker's limit is its
+# inherited data plus 64 MiB.
+echo
+echo "== a file bigger than the worker's data limit =="
+BIG_WANT='verdict=1 rule="T_Override" score=10 inconclusive=0 still_at_path=0'
+run_mode big-inproc HARNESS_BIG=1
+got="$(grep -F 'CASE big_over_data_limit ' "$OUT" | sed -E 's/ sha=[0-9a-f]*//')"
+if [ "$got" = "CASE big_over_data_limit $BIG_WANT" ]; then
+    pass "in process: the 256 MiB file is convicted"
+else
+    fail "in process: the 256 MiB file ($got)"
+fi
+if [ "$(id -u)" -ne 0 ]; then
+    echo "  SKIP: the worker half needs root"
+else
+    run_mode big-privsep HARNESS_BIG=1 HARNESS_PRIVSEP=1
+    lim="$(sed -n 's/^WORKER_DATA_LIMIT_MB //p' "$OUT")"
+    if [ -n "$lim" ] && [ "$lim" -lt 200 ]; then
+        pass "the worker's whole data limit ($lim MiB) is below the file's size (256 MiB)"
+    else
+        fail "the test file is not over the worker's data limit (limit: ${lim:-unknown} MiB)"
+    fi
+    got="$(grep -F 'CASE big_over_data_limit ' "$OUT" | sed -E 's/ sha=[0-9a-f]*//')"
+    if [ "$got" = "CASE big_over_data_limit $BIG_WANT" ]; then
+        pass "in a worker: the same file gets the same verdict, rule and score"
+    else
+        fail "in a worker: the file over the data limit differs from in process ($got)"
+    fi
+    if grep -qx 'QDIR files=1 metas=1' "$OUT"; then
+        pass "in a worker: it was quarantined"
+    else
+        fail "in a worker: quarantine ($(grep '^QDIR' "$OUT"))"
     fi
 fi
 

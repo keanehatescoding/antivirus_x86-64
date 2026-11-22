@@ -366,7 +366,7 @@ static struct ps_spawner_cfg base_cfg(void) {
     memset(&c, 0, sizeof(c));
     c.harden.uid = 65534;
     c.harden.gid = 65534;
-    c.harden.as_bytes = 1ull << 30;
+    c.harden.data_bytes = 1ull << 30;
     c.harden.cpu_seconds = 60;
     c.harden.nofile = 16;
     c.scan = scan_cb;

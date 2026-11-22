@@ -373,8 +373,8 @@ its socket; the spawner then replies `FAILED`, so no request is ever sent to
 a worker that has not reported ready.
 
 1. close every inherited fd except the IPC socket (and one log fd if used)
-2. rlimits: `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE=0` and a small
-   `RLIMIT_NOFILE` (not `RLIMIT_NPROC`: seccomp already forbids `fork`, and a
+2. rlimits: `RLIMIT_DATA` (not `RLIMIT_AS`, see "The memory limit" below),
+   `RLIMIT_CPU`, `RLIMIT_FSIZE=0` and a small `RLIMIT_NOFILE` (not `RLIMIT_NPROC`: seccomp already forbids `fork`, and a
    low NPROC set before `setuid` is a known way to make `setuid` misbehave)
 3. empty the bounding set
 4. `setgroups(0)`, then `setresgid` and `setresuid` to the dedicated user
@@ -511,7 +511,8 @@ spawner from the multithreaded main process, so it needs its own design.
 #### Seccomp allowlist (worker)
 
 Default action kill. Expected contents: `read`, `pread64`, `lseek`,
-`fstat`, `fstatfs`, `newfstatat` with `AT_EMPTY_PATH`, `mmap`, `munmap`, `mprotect`,
+`fstat`, `fstatfs`, `newfstatat` with `AT_EMPTY_PATH`, `mmap` (private
+mappings only, below), `munmap`, `mprotect`,
 `mremap`, `brk`, `madvise`, `futex`, `dup`, `close`, `recvmsg`/`sendmsg` on
 the IPC socket, `clock_gettime`, `clock_nanosleep`, `rt_sig*`, `getrandom`,
 `exit_group`. Explicitly absent: `open*`, `socket`, `connect`, `execve*`,
@@ -541,7 +542,7 @@ a dependency-free, auditable program of about 40 instructions
 (`ps_seccomp_build()`), and which is what lets it be tested exhaustively in
 userspace: the tests run it through a small classic-BPF interpreter for every
 syscall number on several architecture values. It is tighter than a plain
-name list in three ways:
+name list in four ways:
 
 - the architecture must be x86-64 and the x32 bit clear; anything else is
   killed (x86-64 only for now, see #105)
@@ -558,6 +559,71 @@ name list in three ways:
   which is what the optional `chroot` to an empty directory below is for; it
   is not implemented, so this is a known residual exposure of metadata, not of
   file contents
+- `mmap` is allowed only with `MAP_PRIVATE` and no flag outside `MAP_FIXED`,
+  `MAP_ANONYMOUS` and `MAP_NORESERVE` (all 64 bits of the argument are checked).
+  This is the other half of the worker's memory limit, see "The memory limit".
+  A real worker scanning a 32 MB ELF with the shipped rules issued only
+  `MAP_PRIVATE` (libyara's mapping of the scan file), and one run out of
+  memory on a symbol-heavy ELF only `MAP_PRIVATE|MAP_ANONYMOUS`, so the rule
+  does not cost a legitimate scan anything. A flag a future libc starts to use
+  would kill the worker with `SIGSYS`, like any other gap in the list
+
+#### The memory limit
+
+A worker's memory is bounded by `RLIMIT_DATA`, set to the data the spawner had
+when it was forked (the compiled rules and corpora every worker inherits, read
+as `VmData` from `/proc/self/status`) plus a headroom, 1024 MiB by default and
+`AVD_PRIVSEP_DATA_HEADROOM_MB` to change it (accepted range 256 to 65536; a
+value outside it is rejected with a warning and the default is used, not
+clamped). Startup logs the resulting limit.
+
+It was `RLIMIT_AS` plus 2 GiB. libyara maps the scanned file whole, and
+`RLIMIT_AS` counts a read-only mapping of a file, so a file larger than the
+headroom failed to map and the worker answered `CLEAN` plus `inconclusive`
+where the in-process scan convicts it: a way to evade a verdict by padding a
+sample. `RLIMIT_DATA` does not count that mapping, so a file of any size is
+scanned exactly as in process. `tests/test_perform_scan.sh` has the regression
+case (a 256 MiB sparse file with an override-rule marker, over a limit of
+about 77 MiB, must be convicted in a worker as in process) and was checked to
+fail on the old limit with exactly the old symptom (`verdict=0
+inconclusive=1`, not quarantined).
+
+What `RLIMIT_DATA` does not count, checked on a live kernel (6.18) with a
+256 MiB limit, is the reason for the `mmap` rule above. The kernel counts a
+mapping as data only if it is writable, private and not stack-flagged, so two
+kinds of writable mapping escape it entirely: `MAP_SHARED|MAP_ANONYMOUS` and
+`MAP_PRIVATE|MAP_ANONYMOUS|MAP_GROWSDOWN` (1 GiB mapped and written under a
+256 MiB limit). The filter refuses both. Checked and found bounded: growing
+the heap, `mremap`, making a read-only private mapping writable with
+`mprotect` (stopped at the limit even from a 3 GiB mapping, in 16 MiB steps),
+a writable private file mapping, and `MAP_SHARED` with `PROT_WRITE` on the
+read-only scan descriptor (`EACCES`). The worker's stack is not data either;
+it is bounded only by the `RLIMIT_STACK` the worker inherited (8 MiB unless the
+service raises it), which it cannot raise (`setrlimit` and `prlimit64` are not
+in its list). Hardening does not set it, and the stack bound was not tested
+here; setting it explicitly in the hardening sequence is a cheap follow-up. The limit and the rule go
+together, and `tests/test_privsep_worker.sh` exercises them in a real kernel.
+
+What the headroom bounds is what the scan itself allocates. With the shipped
+rules (libyara 4.5.0, measured as the smallest headroom at which a scan
+completes) a 1 GiB file of zeros needs under 1 MiB, a 32 MB gcc binary 28 MiB,
+a 75 MB Go executable 78 MiB, and an ELF with 65535 sections or program headers
+under 1 MiB. The one input that grows is libyara's `elf` module, which uses
+about 0.8 KiB per symbol: an ELF of 24 MB with a million symbol-table entries
+needs about 833 MiB, and one of 96 MB with four million about 3.3 GiB. A scan
+that runs out of memory fails open (`CLEAN` plus `inconclusive`), exactly as one
+that reaches YARA's timeout does, and the parent logs the file size and the
+limit when a worker returns an inconclusive result. The reply carries no
+reason, so the log cannot say that memory was the cause; giving the reply one
+(there is a `reserved` word) is a protocol change and not done here. The
+default of 1024 MiB covers every real binary measured with more than ten times
+the margin and bounds each worker's memory, which is the point of containing
+the parser. An operator who prefers parity with the in-process scan up to the
+timeout can raise it (about 4096 MiB covers the four-million-symbol case, which
+takes 9.4 s of YARA's 10 s on the machine measured).
+
+The in-process scan has no such bound: with `AVD_PRIVSEP` off, a crafted
+symbol table can take several GiB of the root daemon's memory per scan thread.
 
 The default action is `SECCOMP_RET_KILL_PROCESS`.
 
@@ -1037,22 +1103,10 @@ fanotify 29 and 34). Two limits:
   plus a second, 13056 s, which a worker cannot reach before it is recycled.
   The recycle count itself is still unmeasured and to be revisited with the
   latency numbers (open question 3). `RLIMIT_NOFILE` is 32; and
-  `RLIMIT_AS` is the spawner's virtual size at fork plus 2 GiB, because the
-  compiled rules and corpora count against it and libyara maps the scanned
-  file whole. A file too large to map comes back inconclusive (fail open)
-  instead of being scanned. That is a behaviour difference from the
-  in-process path, and a real one: shown with a 256 MiB headroom and a 1 GiB
-  file that an override rule convicts, the in-process scan returns MALICIOUS
-  and the worker returns CLEAN plus inconclusive. With the shipped 2 GiB
-  headroom the window is narrow, since YARA's own 10 s timeout also fails open
-  (a 3 GiB file took 19 s to scan here and timed out in both paths), so it
-  covers files above the headroom that still scan inside the timeout. It is
-  still an evasion of the fail-open kind (pad a sample past the headroom), and
-  it is not closed. The obvious fix, `RLIMIT_DATA` instead of `RLIMIT_AS`,
-  does let the worker scan that file, but `RLIMIT_DATA` does not count shared
-  mappings (checked: a 1 GiB `MAP_SHARED|MAP_ANONYMOUS` succeeds under a
-  256 MiB `RLIMIT_DATA` and fails under `RLIMIT_AS`), so a compromised worker
-  could then exhaust memory. Open question 6 below.
+  `RLIMIT_DATA` is the spawner's data size at fork plus a headroom (see "The
+  memory limit"). It was `RLIMIT_AS`, under which a file larger than the
+  headroom failed to map and came back inconclusive: a fail-open that the
+  in-process path does not have, closed by this change.
 - `tests/test_perform_scan.sh` runs the whole case table twice, in process and
   in workers, and requires identical verdicts, rule names, scores, quarantine
   contents and metrics. As root it also reads a live worker back from `/proc`
@@ -1172,14 +1226,12 @@ cannot lock itself down stops avd at startup.
 5. Whether to kill a worker whose scan has already missed the fanotify
    deadline, instead of letting it finish and only logging the late result as
    today.
-6. Files too large for the worker's address-space limit fail open, where the
-   in-process scan would convict them (see "As wired into avd"). Options:
-   keep `RLIMIT_AS` and accept the gap; move to `RLIMIT_DATA` and bound the
-   worker's memory another way (shared mappings are not counted by it), for
-   example a cgroup memory limit on the unit or a seccomp rule that rejects
-   `MAP_SHARED` on anonymous mappings; or have the parent refuse to send
-   files above the limit and treat them by policy (for example a size-only
-   verdict, or quarantine-on-doubt).
+6. ~~Files too large for the worker's address-space limit fail open.~~
+   Resolved: `RLIMIT_DATA` plus a `mmap` flag rule (see "The memory limit").
+   What remains is the choice of headroom: memory-hungry ELFs (about 1.2
+   million symbols and up at the default) fail open in a worker, as they would
+   at YARA's timeout, and the cause is not in the reply (see "The memory
+   limit").
 7. The spawner holds `CAP_KILL`, which the filter cannot limit to its
    workers, and `CAP_SETUID`/`CAP_SETGID`, which let it clear its own
    parent-death signal (see "Residual risk: the spawner can signal any

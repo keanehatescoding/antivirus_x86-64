@@ -128,7 +128,9 @@ static bool sp_ok(int nr, uint64_t a0, uint64_t a1, uint64_t a3) {
 
 /* An independent statement of what the spawner may do with NO argument
  * constraint, deliberately not derived from the header's tables: the worker's
- * twenty-one plus what only the spawner needs. */
+ * twenty unconditional entries, mmap (which the worker allows only with
+ * constrained flags but this filter allows whole), and what only the spawner
+ * needs. */
 static bool want_plain(int nr) {
     switch (nr) {
     /* the worker list */
@@ -198,11 +200,15 @@ static void test_exhaustive(void) {
     struct sock_filter wk[PS_BPF_MAX];
     const int FD = 7;
     size_t wn = ps_seccomp_build(wk, FD);
-    int bad = 0, plain = 0, super_bad = 0, super_seen = 0;
+    int bad = 0, plain = 0, super_bad = 0, super_seen = 0, mmap_seen = 0;
     static const uint64_t a0s[] = {0, FD, FD + 1, 3, ~0ull, (1ull << 32) | FD};
     static const uint64_t a1s[] = {0, 9, 15};
+    /* The last four are mmap flags the worker filter accepts (MAP_PRIVATE,
+     * plus ANONYMOUS, NORESERVE, FIXED), so the superset comparison below
+     * reaches the worker's conditional mmap and does not pass vacuously. */
     static const uint64_t a3s[] = {0, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW,
-                                   AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW};
+                                   AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                                   0x2, 0x22, 0x4022, 0x32};
 
     printf("\nwhat the spawner may and may not do:\n");
 
@@ -236,10 +242,16 @@ static void test_exhaustive(void) {
                 for (size_t j = 0; j < sizeof(a3s) / sizeof(a3s[0]); j++)
                     if (ok_args(wk, wn, AUDIT_ARCH_X86_64, nr, a0s[i], a1s[k], a3s[j])) {
                         super_seen++;
+                        if (nr == SYS_mmap) mmap_seen++;
                         if (!sp_ok(nr, a0s[i], a1s[k], a3s[j])) super_bad++;
                     }
     CHECK(super_seen > 0 && super_bad == 0,
           "every call the worker filter allows is allowed here too (a superset)");
+    CHECK(mmap_seen > 0,
+          "the superset check reaches the worker's flag-constrained mmap");
+    CHECK(sp_ok(SYS_mmap, 0, 0, 0) && sp_ok(SYS_mmap, 0, 0, 0x22) &&
+              sp_ok(SYS_mmap, 0, 0, 0x1 | 0x20),
+          "the spawner allows mmap whole, whatever the flags");
 
     /* Things a compromised spawner must not be able to do, with every
      * argument shape that might help. None of these has an argument check. */
@@ -665,7 +677,7 @@ static struct ps_spawner_cfg base_cfg(void) {
     memset(&c, 0, sizeof(c));
     c.harden.uid = WORKER_UID;
     c.harden.gid = WORKER_UID;
-    c.harden.as_bytes = 1ull << 30;
+    c.harden.data_bytes = 1ull << 30;
     c.harden.cpu_seconds = 60;
     c.harden.nofile = 16;
     c.scan = scan_cb;

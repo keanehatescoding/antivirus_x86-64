@@ -2499,11 +2499,25 @@ static void analyze_content(int fd, const char *path, const char *hash,
 #define AVD_PRIVSEP_CPU_SECONDS                                                \
   (AVD_PRIVSEP_MAX_SCANS * (AVD_PRIVSEP_SCAN_WAIT_MS / 1000 + 1))
 #define AVD_PRIVSEP_NOFILE 32
-/* RLIMIT_AS counts the compiled rules and corpora a worker inherits, and
- * libyara maps the scanned file whole, so the limit is "what the spawner had
- * when it was forked" plus this much. A larger file fails the mapping and
- * comes back inconclusive instead of being scanned. */
-#define AVD_PRIVSEP_AS_HEADROOM (2ULL << 30)
+/* A worker's RLIMIT_DATA is "the data the spawner had when it was forked"
+ * (the compiled rules and corpora every worker inherits) plus this much.
+ * RLIMIT_DATA counts memory a worker can actually fill, and not the read-only
+ * mapping of the scanned file that libyara makes whole, so a file of any size
+ * is scanned exactly as in process (this replaced an RLIMIT_AS headroom under
+ * which a file bigger than the headroom came back inconclusive). What the
+ * headroom bounds is what the scan itself allocates, and the one thing that
+ * grows with the input is libyara's ELF module: about 0.8 KiB per symbol, so a
+ * crafted symbol table of a few tens of MB can ask for GiB. A scan that runs
+ * out fails open (inconclusive), exactly as one that hits YARA's timeout does.
+ * Measured with the shipped rules: real binaries (a 75 MB Go executable, a
+ * 32 MB gcc) need under 100 MiB; 1M symbols need about 833 MiB. Set by
+ * AVD_PRIVSEP_DATA_HEADROOM_MB. The floor keeps a typo (say "1" for GiB) from
+ * making nearly every scan fail open; the helper rejects, it does not clamp. */
+#define AVD_PRIVSEP_DATA_HEADROOM_MB_DEFAULT 1024
+#define AVD_PRIVSEP_DATA_HEADROOM_MB_MIN 256
+#define AVD_PRIVSEP_DATA_HEADROOM_MB_MAX 65536
+static int privsep_data_headroom_mb = AVD_PRIVSEP_DATA_HEADROOM_MB_DEFAULT;
+static unsigned long long privsep_data_limit_mb; /* the limit workers got */
 
 /* Each scan thread holds one worker and a replacement can briefly coexist
  * with its predecessor, so the spawner's table must cover twice the pool. */
@@ -2574,8 +2588,10 @@ static void privsep_on_dead(void *ctx) {
   _exit(1);
 }
 
-/* Current virtual size of this process in bytes, 0 if it cannot be read. */
-static unsigned long long privsep_vmsize_bytes(void) {
+/* Private writable memory of this process in bytes (VmData), 0 if it cannot be
+ * read. This is the number the kernel checks RLIMIT_DATA against, and a forked
+ * worker starts with the same figure, so limit = this + headroom. */
+static unsigned long long privsep_vmdata_bytes(void) {
   FILE *f = fopen("/proc/self/status", "re");
   char line[256];
   unsigned long long kb = 0;
@@ -2583,7 +2599,7 @@ static unsigned long long privsep_vmsize_bytes(void) {
   if (!f)
     return 0;
   while (fgets(line, sizeof(line), f)) {
-    if (sscanf(line, "VmSize: %llu kB", &kb) == 1)
+    if (sscanf(line, "VmData: %llu kB", &kb) == 1)
       break;
     kb = 0;
   }
@@ -2597,7 +2613,9 @@ static unsigned long long privsep_vmsize_bytes(void) {
  * opened (it inherits nothing but its own channel). Returns 0 on success. */
 static int privsep_start(uid_t uid, gid_t gid) {
   struct ps_spawner_cfg cfg;
-  unsigned long long vm = privsep_vmsize_bytes();
+  unsigned long long vm = privsep_vmdata_bytes();
+  unsigned long long headroom = (unsigned long long)privsep_data_headroom_mb
+                                << 20;
   pid_t spawner_pid;
   int ctl_fd;
 
@@ -2606,8 +2624,10 @@ static int privsep_start(uid_t uid, gid_t gid) {
   cfg.harden.gid = gid;
   cfg.harden.ipc_fd = -1; /* filled in per worker */
   cfg.harden.log_fd = -1;
-  cfg.harden.as_bytes =
-      (rlim_t)(vm ? vm + AVD_PRIVSEP_AS_HEADROOM : 8ULL << 30);
+  /* If VmData cannot be read there is no base to add to, so use a flat limit
+   * that is generous rather than none. */
+  cfg.harden.data_bytes = (rlim_t)(vm ? vm + headroom : 8ULL << 30);
+  privsep_data_limit_mb = (unsigned long long)cfg.harden.data_bytes >> 20;
   cfg.harden.cpu_seconds = AVD_PRIVSEP_CPU_SECONDS;
   cfg.harden.nofile = AVD_PRIVSEP_NOFILE;
   cfg.scan = privsep_worker_scan;
@@ -2688,6 +2708,9 @@ static int privsep_start(uid_t uid, gid_t gid) {
   printf("avd: privilege separation on: scans run in workers as uid %u gid "
          "%u (spawner pid %d)\n",
          (unsigned)uid, (unsigned)gid, (int)spawner_pid);
+  printf("avd: privsep: worker data limit %llu MiB (inherited %llu MiB + "
+         "headroom %d MiB, AVD_PRIVSEP_DATA_HEADROOM_MB)\n",
+         privsep_data_limit_mb, vm >> 20, privsep_data_headroom_mb);
   return 0;
 }
 
@@ -2799,8 +2822,22 @@ static void analyze_in_worker(int fd, const char *path, const char *hash,
   }
 
   out->score = v.score;
-  if (v.inconclusive)
+  if (v.inconclusive) {
+    struct stat st;
+
     out->inconclusive = true;
+    /* The worker's own log output is discarded (it cannot write), and the
+     * reply carries no reason, so the cause is not known here. Name the
+     * likeliest one's inputs, so that an operator who finds a large file
+     * fail open can tell a memory limit from a timeout. */
+    if (fstat(fd, &st) == 0)
+      fprintf(stderr,
+              "avd: privsep: scan of \"%s\" inconclusive in the worker (file "
+              "%llu MiB, worker data limit %llu MiB; if the worker ran out of "
+              "memory, raise AVD_PRIVSEP_DATA_HEADROOM_MB)\n",
+              path, (unsigned long long)st.st_size >> 20,
+              privsep_data_limit_mb);
+  }
   if (v.verdict == PS_VERDICT_MALICIOUS) {
     out->verdict = AV_VERDICT_MALICIOUS;
     snprintf(out->rule_name, sizeof(out->rule_name), "%s", v.rule_name);
@@ -5482,6 +5519,9 @@ int main(int argc, char **argv) {
 
     privsep_requested = ps_env && strcmp(ps_env, "1") == 0;
   }
+  privsep_data_headroom_mb = parse_tunable_env(
+      "AVD_PRIVSEP_DATA_HEADROOM_MB", AVD_PRIVSEP_DATA_HEADROOM_MB_DEFAULT,
+      AVD_PRIVSEP_DATA_HEADROOM_MB_MIN, AVD_PRIVSEP_DATA_HEADROOM_MB_MAX);
   /* Unset or "kill": enforce. "log": log what the filter would have killed
    * and let it through. Anything else is refused, so a typo cannot quietly
    * leave the filter in a mode nobody asked for. */
