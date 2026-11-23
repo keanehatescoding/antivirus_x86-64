@@ -12,8 +12,9 @@
 # are the regression tests). New coverage found while fuzzing goes to
 # work/<target>/, which is not tracked.
 #
-# fuzz_control_line includes userspace/avd/avd.c itself, so it needs the
-# same libraries avd does (libnl-genl-3, yara, libfuzzer-compatible link).
+# fuzz_control_line and fuzz_netlink_msg include userspace/avd/avd.c itself, so
+# they need the same libraries avd does (libnl-genl-3, yara, libfuzzer-compatible
+# link).
 
 CLANG   ?= clang
 PKG_CONFIG ?= pkg-config
@@ -32,7 +33,7 @@ PC_LIBS   := $(shell $(PKG_CONFIG) --libs libnl-genl-3.0 yara 2>/dev/null) \
 AVD_HEADERS    := $(wildcard $(AVD_DIR)/*.h)
 
 HEADER_TARGETS := fuzz_fan_parse fuzz_control_parse fuzz_privsep_reply
-AVD_TARGETS    := fuzz_control_line
+AVD_TARGETS    := fuzz_control_line fuzz_netlink_msg
 TARGETS        := $(HEADER_TARGETS) $(AVD_TARGETS)
 
 all: $(TARGETS)

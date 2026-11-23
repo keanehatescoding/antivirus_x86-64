@@ -9,7 +9,8 @@
 # The targets cover avd's externally reachable parsers: control-socket
 # line reading and dispatch (control_parse.h, avd.c) and the fanotify
 # mountinfo / signature parsers (fan_parse.h), and the validation of
-# replies from the unprivileged scan worker (privsep_proto.h, #103). See
+# replies from the unprivileged scan worker (privsep_proto.h, #103), and avd's
+# netlink receive callback (msg_handler(), the kernel -> daemon SCAN_REQUEST). See
 # tests/fuzz/Makefile for how to fuzz for real.
 #
 # Pure userspace, no root or kernel module. Needs clang with the libFuzzer
@@ -65,7 +66,7 @@ fi
 
 PASS=0
 FAIL=0
-for target in fuzz_fan_parse fuzz_control_parse fuzz_privsep_reply fuzz_control_line; do
+for target in fuzz_fan_parse fuzz_control_parse fuzz_privsep_reply fuzz_control_line fuzz_netlink_msg; do
     seeds="$(find "$FUZZ_DIR/corpus/$target" -type f 2>/dev/null | wc -l)"
     if [ "$seeds" -eq 0 ]; then
         echo "  FAIL: $target has no seed corpus"
