@@ -10,9 +10,9 @@
 #   - netlink verdict validation (av/netlink_chan.c av_nl_verdict_doit()):
 #     only AV_VERDICT_CLEAN (0) / AV_VERDICT_MALICIOUS (1) accepted.
 #
-# Neither parser has fuzz coverage today; this is the deterministic,
-# rootless first half of that bullet (fixed adversarial vectors, no
-# libFuzzer dependency). The harness includes the production headers
+# These parsers also have libFuzzer targets (tests/fuzz/); this is the
+# deterministic, rootless half (fixed adversarial vectors, no libFuzzer
+# dependency). The harness includes the production headers
 # directly (control_parse.h, netlink_proto.h), so it exercises the
 # exact code the daemon/kernel enforce - a regression fails here
 # instead of passing against a stale copy.
