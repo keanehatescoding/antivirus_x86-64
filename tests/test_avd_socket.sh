@@ -343,22 +343,25 @@ fi
 section "STATUS reports scan metrics after a completed scan"
 # Issue #105 (observability): STATUS appends scans_total,
 # scans_malicious, scan_avg_ms, scan_max_ms, last_scan_ms after the
-# original six fields, and #176 adds fanotify_active, fan_events,
-# fan_cache_hits, fan_denied, fan_fallbacks after those (all 0 here -
-# AVD_FANOTIFY is unset). The clean SCAN above already completed, so
-# scans_total must be >= 1 and scans_malicious <= scans_total; every
-# field must parse as a non-negative integer. Same best-effort socat
-# stance as the STATUS/VERDICTS section above.
+# original six fields, #176 adds fanotify_active, fan_events,
+# fan_cache_hits, fan_denied, fan_fallbacks after those, and this PR
+# adds pending_total, pending_max, pending_avg_ms after fan_fallbacks
+# (all fanotify fields are 0 here - AVD_FANOTIFY is unset, and pending
+# fields are 0 because there was no queue contention in this test). The
+# clean SCAN above already completed, so scans_total must be >= 1 and
+# scans_malicious <= scans_total; every field must parse as a
+# non-negative integer. Same best-effort socat stance as the
+# STATUS/VERDICTS section above.
 if command -v socat >/dev/null 2>&1; then
     METRICS_RESP="$(printf 'STATUS\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>"$SOCAT_LOG")"
     # NR==3 is the data row (OK/COUNT 1/row/END). n==0 default when the
     # response is short/empty keeps a wedged-daemon empty reply from
     # passing vacuously (awk exits 0 when a bare NR==3 pattern never
     # fires - END must re-check).
-    if echo "$METRICS_RESP" | awk -F'\t' 'NR==3{n=NF} END{exit (n==16?0:1)}'; then
-        pass "STATUS reports 16 fields (6 base + 5 scan metrics + 5 fanotify)"
+    if echo "$METRICS_RESP" | awk -F'\t' 'NR==3{n=NF} END{exit (n==19?0:1)}'; then
+        pass "STATUS reports 19 fields (6 base + 5 scan metrics + 5 fanotify + 3 pending)"
     else
-        fail "STATUS row does not carry the 5 scan-metric + 5 fanotify fields: $METRICS_RESP"
+        fail "STATUS row does not carry the expected 19 fields: $METRICS_RESP"
     fi
     if echo "$METRICS_RESP" | awk -F'\t' 'NR==3{for(i=1;i<=NF;i++) if($i !~ /^[0-9]+$/) bad=1; t=$7; m=$8; n=NR} END{exit (n==3 && !bad && t>=1 && m<=t ? 0 : 1)}'; then
         pass "scan metrics parse and scans_total >= 1 with malicious <= total"
