@@ -3198,11 +3198,6 @@ static bool queue_push(struct scan_task *task, bool may_block) {
     return false;
 
   task->next = NULL;
-  /* Record enqueue timestamp for pending latency metrics (issue #105).
-   * Taken before the queue lock to avoid including lock wait time in
-   * the pending measurement (pending is "time waiting in queue", not
-   * "time waiting to enqueue"). */
-  clock_gettime(CLOCK_MONOTONIC, &task->enqueue_time);
 
   pthread_mutex_lock(&queue_lock);
   while (may_block && queue_len >= (size_t)avd_scan_queue_max &&
@@ -3218,6 +3213,9 @@ static bool queue_push(struct scan_task *task, bool may_block) {
     return false;
   }
 
+  /* Enqueue timestamp for pending latency metrics (issue #105), taken
+   * after any wait for capacity so admission delay isn't counted. */
+  clock_gettime(CLOCK_MONOTONIC, &task->enqueue_time);
   if (queue_tail)
     queue_tail->next = task;
   else
