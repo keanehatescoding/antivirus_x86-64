@@ -412,6 +412,10 @@ struct scan_task {
    * fd and every other field live in the pending record, which the
    * listener shares - see struct fan_pending. */
   struct fan_pending *fan;
+  /* Timestamp when this task was enqueued, for pending latency metrics
+   * (issue #105). Filled by queue_push() before the task is linked into
+   * the queue. */
+  struct timespec enqueue_time;
 };
 
 struct scan_completion {
@@ -444,6 +448,12 @@ static uint64_t scans_malicious;
 static uint64_t scan_time_total_ms;
 static uint64_t scan_time_max_ms;
 static uint64_t last_scan_ms;
+/* Pending latency metrics (time from enqueue to dequeue) for STATUS
+ * (issue #105). Updated once per scan at the point it is dequeued in
+ * scan_worker_main(), guarded by metrics_lock like the scan metrics above. */
+static uint64_t pending_time_total_ms;
+static uint64_t pending_time_max_ms;
+static uint64_t pending_count;
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
@@ -3203,6 +3213,9 @@ static bool queue_push(struct scan_task *task, bool may_block) {
     return false;
   }
 
+  /* Enqueue timestamp for pending latency metrics (issue #105), taken
+   * after any wait for capacity so admission delay isn't counted. */
+  clock_gettime(CLOCK_MONOTONIC, &task->enqueue_time);
   if (queue_tail)
     queue_tail->next = task;
   else
@@ -4129,6 +4142,7 @@ static void *scan_worker_main(void *arg) {
   serve = serve_wait();
   for (;;) {
     struct scan_task *task;
+    struct timespec dequeue_time;
 
     pthread_mutex_lock(&queue_lock);
     while (!queue_head && !shutting_down)
@@ -4145,8 +4159,36 @@ static void *scan_worker_main(void *arg) {
       queue_tail = NULL;
     queue_len--;
     scan_in_flight++;
+    /* Sample the clock while still holding queue_lock: reading it after
+     * unlocking can include time the worker was descheduled, inflating
+     * the reported queue latency. */
+    clock_gettime(CLOCK_MONOTONIC, &dequeue_time);
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
+
+    /* Record pending latency: time from enqueue to dequeue (issue #105).
+     * The clock was sampled at dequeue, under queue_lock; the arithmetic
+     * below does not need the lock and can run afterwards. */
+    {
+      int64_t pending_ms;
+
+      /* Same borrow-one-second logic as scan_time in perform_scan(). */
+      pending_ms = (int64_t)(dequeue_time.tv_sec - task->enqueue_time.tv_sec) * 1000;
+      if (dequeue_time.tv_nsec < task->enqueue_time.tv_nsec)
+        pending_ms -= 1000;
+      pending_ms += (dequeue_time.tv_nsec - task->enqueue_time.tv_nsec +
+                     (dequeue_time.tv_nsec < task->enqueue_time.tv_nsec ? 1000000000L : 0)) /
+                    1000000L;
+      if (pending_ms < 0)
+        pending_ms = 0;
+
+      pthread_mutex_lock(&metrics_lock);
+      pending_count++;
+      pending_time_total_ms += (uint64_t)pending_ms;
+      if ((uint64_t)pending_ms > pending_time_max_ms)
+        pending_time_max_ms = (uint64_t)pending_ms;
+      pthread_mutex_unlock(&metrics_lock);
+    }
 
     if (!serve) {
       if (task->fan) {
@@ -4396,6 +4438,7 @@ static void cmd_status(int fd) {
    * scan_threads, so field indices 0-5 are byte-stable for existing
    * parsers (notably tests/test_avd_socket.sh's $5 queueing poll). */
   uint64_t total, malicious, time_total, time_max, last_ms, avg_ms;
+  uint64_t pending_total, pending_max, pending_avg_ms, pending_count_snap;
   uint64_t f_events, f_hits, f_denied, f_fallbacks;
 
   pthread_mutex_lock(&queue_lock);
@@ -4408,27 +4451,34 @@ static void cmd_status(int fd) {
   time_total = scan_time_total_ms;
   time_max = scan_time_max_ms;
   last_ms = last_scan_ms;
+  pending_total = pending_time_total_ms;
+  pending_max = pending_time_max_ms;
+  pending_count_snap = pending_count;
   f_events = fan_events_total;
   f_hits = fan_cache_hits;
   f_denied = fan_denied;
   f_fallbacks = fan_fallbacks;
   pthread_mutex_unlock(&metrics_lock);
   avg_ms = total ? time_total / total : 0;
+  pending_avg_ms = pending_count_snap ? pending_total / pending_count_snap : 0;
 
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
   /* fanotify fields (#176) appended after last_scan_ms for the same
-   * byte-stability reason as the scan metrics above. */
+   * byte-stability reason as the scan metrics above. Pending latency
+   * metrics (issue #105) appended after fan_fallbacks for the same reason. */
   snprintf(row, sizeof(row),
            "%ld\t%d\t%zu\t%zu\t%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu"
-           "\t%d\t%llu\t%llu\t%llu\t%llu\n",
+           "\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
            (long)(time(NULL) - start_time), compiled_rules ? 1 : 0,
            fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads,
            (unsigned long long)total, (unsigned long long)malicious,
            (unsigned long long)avg_ms, (unsigned long long)time_max,
            (unsigned long long)last_ms, atomic_load(&fan_active) ? 1 : 0,
            (unsigned long long)f_events, (unsigned long long)f_hits,
-           (unsigned long long)f_denied, (unsigned long long)f_fallbacks);
+           (unsigned long long)f_denied, (unsigned long long)f_fallbacks,
+           (unsigned long long)pending_total, (unsigned long long)pending_max,
+           (unsigned long long)pending_avg_ms);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
 }
