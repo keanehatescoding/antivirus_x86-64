@@ -4142,6 +4142,7 @@ static void *scan_worker_main(void *arg) {
   serve = serve_wait();
   for (;;) {
     struct scan_task *task;
+    struct timespec dequeue_time;
 
     pthread_mutex_lock(&queue_lock);
     while (!queue_head && !shutting_down)
@@ -4158,23 +4159,25 @@ static void *scan_worker_main(void *arg) {
       queue_tail = NULL;
     queue_len--;
     scan_in_flight++;
+    /* Sample the clock while still holding queue_lock: reading it after
+     * unlocking can include time the worker was descheduled, inflating
+     * the reported queue latency. */
+    clock_gettime(CLOCK_MONOTONIC, &dequeue_time);
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
 
     /* Record pending latency: time from enqueue to dequeue (issue #105).
-     * Computed immediately after dropping the queue lock, using the
-     * enqueue_time set in queue_push() and the current monotonic clock. */
+     * The clock was sampled at dequeue, under queue_lock; the arithmetic
+     * below does not need the lock and can run afterwards. */
     {
-      struct timespec now;
       int64_t pending_ms;
 
-      clock_gettime(CLOCK_MONOTONIC, &now);
       /* Same borrow-one-second logic as scan_time in perform_scan(). */
-      pending_ms = (int64_t)(now.tv_sec - task->enqueue_time.tv_sec) * 1000;
-      if (now.tv_nsec < task->enqueue_time.tv_nsec)
+      pending_ms = (int64_t)(dequeue_time.tv_sec - task->enqueue_time.tv_sec) * 1000;
+      if (dequeue_time.tv_nsec < task->enqueue_time.tv_nsec)
         pending_ms -= 1000;
-      pending_ms += (now.tv_nsec - task->enqueue_time.tv_nsec +
-                     (now.tv_nsec < task->enqueue_time.tv_nsec ? 1000000000L : 0)) /
+      pending_ms += (dequeue_time.tv_nsec - task->enqueue_time.tv_nsec +
+                     (dequeue_time.tv_nsec < task->enqueue_time.tv_nsec ? 1000000000L : 0)) /
                     1000000L;
       if (pending_ms < 0)
         pending_ms = 0;
