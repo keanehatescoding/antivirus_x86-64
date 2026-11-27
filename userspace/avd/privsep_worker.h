@@ -90,7 +90,7 @@ struct ps_harden_cfg {
   int ipc_fd;      /* the worker's end of its socketpair; kept open */
   int log_fd;      /* kept open too, or -1 for none (the worker logs nothing) */
   pid_t expect_ppid; /* the spawner's pid, recorded before it forks */
-  rlim_t as_bytes;   /* RLIMIT_AS */
+  rlim_t data_bytes; /* RLIMIT_DATA, not RLIMIT_AS: see ps_worker_harden() */
   rlim_t cpu_seconds; /* RLIMIT_CPU */
   rlim_t nofile;      /* RLIMIT_NOFILE: small, a leak must fail fast */
 };
@@ -294,11 +294,15 @@ static inline int ps_clear_capabilities(void) {
  * only with AT_EMPTY_PATH (below), which does NOT stop it resolving a
  * non-empty path: a seccomp filter cannot inspect the path argument, so a
  * compromised worker can stat any path its uid can reach (metadata only).
- * See docs/privilege-separation.md, "Seccomp allowlist (worker)". */
+ * See docs/privilege-separation.md, "Seccomp allowlist (worker)".
+ *
+ * `mmap` is deliberately not here: it is allowed only with constrained flags
+ * (ps_seccomp_build(), below). The spawner's filter, which has to allow
+ * everything a worker may do, lists it in its own extras instead. */
 static const int ps_allow_plain[] = {
     SYS_read,          SYS_pread64,        SYS_lseek,        SYS_fstat,
     SYS_fstatfs, /* libyara calls it on the scan fd; descriptor only, no path */
-    SYS_mmap,          SYS_munmap,         SYS_mprotect,     SYS_mremap,
+    SYS_munmap,        SYS_mprotect,       SYS_mremap,
     SYS_brk,           SYS_madvise,        SYS_futex,        SYS_dup,
     SYS_close,         SYS_clock_gettime,  SYS_clock_nanosleep,
     SYS_rt_sigaction,  SYS_rt_sigprocmask, SYS_rt_sigreturn, SYS_getrandom,
@@ -318,6 +322,20 @@ static const int ps_allow_plain[] = {
 
 #define PS_X32_BIT 0x40000000u
 
+/* mmap() flag values on x86-64, stable kernel ABI (spelled out because some of
+ * them need _GNU_SOURCE in <sys/mman.h>). A worker may use exactly these:
+ * private memory, anonymous or file-backed, optionally fixed or unreserved.
+ * Everything else, MAP_SHARED and MAP_GROWSDOWN above all, is refused because
+ * RLIMIT_DATA does not count it (see ps_worker_harden()). Checked against a
+ * real libyara scan and the glibc allocator; a flag a future libc starts
+ * using shows up as a worker killed by SIGSYS, which the parent logs. */
+#define PS_MAP_PRIVATE 0x00000002u
+#define PS_MAP_FIXED 0x00000010u
+#define PS_MAP_ANONYMOUS 0x00000020u
+#define PS_MAP_NORESERVE 0x00004000u
+#define PS_MMAP_FLAGS_OK                                                       \
+  (PS_MAP_PRIVATE | PS_MAP_FIXED | PS_MAP_ANONYMOUS | PS_MAP_NORESERVE)
+
 /* Build the filter into `prog` (room for PS_BPF_MAX entries) and return its
  * length, or 0 if it does not fit.
  *
@@ -325,10 +343,13 @@ static const int ps_allow_plain[] = {
  *   plain list                    -> allow
  *   recvmsg / sendmsg             -> allow only on exactly `ipc_fd`
  *   newfstatat                    -> allow only with AT_EMPTY_PATH set
+ *   mmap                          -> allow only with MAP_PRIVATE and no flag
+ *                                    outside PS_MMAP_FLAGS_OK
  *   anything else                 -> SECCOMP_RET_KILL_PROCESS
  *
  * The fd comparison checks all 64 bits of the argument, so a caller cannot
- * hide a different descriptor in the upper half.
+ * hide a different descriptor in the upper half. The mmap flags are an
+ * unsigned long and are checked whole for the same reason.
  *
  * Layout (P = number of plain entries):
  *    0  ld arch
@@ -341,18 +362,22 @@ static const int ps_allow_plain[] = {
  *   +P  jeq recvmsg -> fdchk
  *       jeq sendmsg -> fdchk
  *       jeq newfstatat -> statchk
+ *       jeq mmap -> mmapchk
  *       ret KILL                       (nothing matched)
  *   fdchk:   ld arg0.hi; jeq 0 (else kill); ld arg0.lo; jeq ipc_fd
  *   statchk: ld arg3.lo; jset AT_EMPTY_PATH
+ *   mmapchk: ld arg3.hi; jeq 0 (else kill); ld arg3.lo;
+ *            jset ~PS_MMAP_FLAGS_OK -> kill; jset MAP_PRIVATE (else kill)
  *   allow:   ret ALLOW
  *   kill:    ret KILL
  * Every jump goes forward, as BPF requires. */
 static inline size_t ps_seccomp_build(struct sock_filter *prog, int ipc_fd) {
   const size_t P = PS_ALLOW_PLAIN_N;
   const size_t first_plain = 6;
-  const size_t fdchk = first_plain + P + 4;
+  const size_t fdchk = first_plain + P + 5;
   const size_t statchk = fdchk + 4;
-  const size_t allow = statchk + 2;
+  const size_t mmapchk = statchk + 2;
+  const size_t allow = mmapchk + 5;
   const size_t kill = allow + 1;
   const size_t total = kill + 1;
   size_t n = 0;
@@ -383,6 +408,9 @@ static inline size_t ps_seccomp_build(struct sock_filter *prog, int ipc_fd) {
   prog[n] = PS_BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)SYS_newfstatat,
                         PS_JT(statchk), 0);
   n++;
+  prog[n] = PS_BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)SYS_mmap,
+                        PS_JT(mmapchk), 0);
+  n++;
   prog[n++] = PS_BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
 
   /* fdchk */
@@ -397,6 +425,22 @@ static inline size_t ps_seccomp_build(struct sock_filter *prog, int ipc_fd) {
   /* statchk */
   prog[n++] = PS_BPF_STMT(BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_LO(3));
   prog[n] = PS_BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, AT_EMPTY_PATH, PS_JT(allow),
+                        PS_JT(kill));
+  n++;
+
+  /* mmapchk: mmap(addr, len, prot, flags, fd, off), flags is arg 3. Any bit in
+   * the upper half or outside PS_MMAP_FLAGS_OK kills; then MAP_PRIVATE must be
+   * present. A JSET does not touch the accumulator, so the last test still
+   * sees the low half of the flags. MAP_SHARED (1), MAP_SHARED_VALIDATE (3)
+   * and MAP_GROWSDOWN (0x100) all fail the first of those tests. */
+  prog[n++] = PS_BPF_STMT(BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_HI(3));
+  prog[n] = PS_BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, PS_JT(kill));
+  n++;
+  prog[n++] = PS_BPF_STMT(BPF_LD | BPF_W | BPF_ABS, PS_SD_ARG_LO(3));
+  prog[n] = PS_BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, ~(uint32_t)PS_MMAP_FLAGS_OK,
+                        PS_JT(kill), 0);
+  n++;
+  prog[n] = PS_BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, PS_MAP_PRIVATE, PS_JT(allow),
                         PS_JT(kill));
   n++;
 
@@ -440,8 +484,24 @@ static inline int ps_worker_harden(const struct ps_harden_cfg *c) {
   if (ps_close_all_but(c->ipc_fd, c->log_fd) < 0)
     return PS_H_CLOSE_FDS;
 
+  /* RLIMIT_DATA bounds the memory a worker can actually consume, and unlike
+   * RLIMIT_AS it does not count a read-only mapping of the file being scanned.
+   * libyara maps that file whole, so under RLIMIT_AS a file larger than the
+   * headroom failed to map and came back inconclusive (fail open), where the
+   * in-process scan would have convicted it.
+   *
+   * The kernel counts a mapping as data only if it is writable, private and
+   * not stack-flagged. Two kinds of writable mapping therefore escape this
+   * limit: MAP_SHARED (shared anonymous memory) and MAP_GROWSDOWN (a private
+   * mapping the kernel treats as a stack). Both were checked on a live kernel.
+   * The seccomp filter below closes them by allowing mmap() only with
+   * MAP_PRIVATE and no flag outside PS_MMAP_FLAGS_OK, so this limit and that
+   * rule go together: do not weaken one without the other. The worker's stack
+   * is not data either: it is bounded only by the RLIMIT_STACK the worker
+   * inherited (8 MiB unless the service raises it; not tightened here), which
+   * it cannot raise because setrlimit and prlimit64 are not in its list. */
   PS_HOOK(PS_H_RLIMITS);
-  if (ps_set_rlimit(RLIMIT_AS, c->as_bytes) < 0 ||
+  if (ps_set_rlimit(RLIMIT_DATA, c->data_bytes) < 0 ||
       ps_set_rlimit(RLIMIT_CPU, c->cpu_seconds) < 0 ||
       ps_set_rlimit(RLIMIT_FSIZE, 0) < 0 ||
       ps_set_rlimit(RLIMIT_NOFILE, c->nofile) < 0)

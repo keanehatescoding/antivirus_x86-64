@@ -146,6 +146,11 @@ jobs:
           # automatically by CONFIG_KPROBES (kprobes register by
           # symbol name), so it doesn't need to be listed explicitly.
           ./scripts/config --enable CONFIG_BINFMT_ELF
+          # "#!" scripts: init.c's interpreted-image self-delete cases
+          # exec a script whose interpreter is a copy of init itself.
+          # Without this the kernel answers ENOEXEC for them. The
+          # ENOEXEC cases are unaffected: their file has no "#!" line.
+          ./scripts/config --enable CONFIG_BINFMT_SCRIPT
           ./scripts/config --enable CONFIG_BLK_DEV_INITRD
           ./scripts/config --enable CONFIG_DEVTMPFS
           ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT
@@ -163,7 +168,9 @@ jobs:
           set -euxo pipefail
           KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-qemu-boot"
           make -C av KDIR="$KDIR" clean
-          make -C av KDIR="$KDIR"
+          # AV_TEST_KNOBS compiles in the test-only module parameter the
+          # script/native fallback cases need; no shipped build sets it.
+          make -C av KDIR="$KDIR" KCFLAGS=-DAV_TEST_KNOBS
 
       - name: Build the static test init and assemble the initramfs
         run: |

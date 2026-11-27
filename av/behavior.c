@@ -39,9 +39,12 @@
 #include <linux/file.h>
 #include <linux/hashtable.h>
 #include <linux/jiffies.h>
+#include <linux/magic.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>
 #include <linux/pid.h>
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
@@ -50,6 +53,7 @@
 #include <linux/sched/signal.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/stringhash.h>
 #include <linux/uaccess.h>
@@ -281,6 +285,12 @@ struct av_behavior_entry {
   struct hlist_node node;
   pid_t pid; /* tgid (process ID), not a thread id - see behavior.h */
   char exec_path[PATH_MAX]; /* recorded at execve time, empty if unknown */
+  /* The executed file's dentry when exec_path was recorded. Only a
+   * cookie, compared and never dereferenced: it tells
+   * av_behavior_report_self_delete() whether exec_path still describes
+   * the file a self-delete match was made on, or belongs to some other
+   * exec (a later one, or the record has not landed yet). */
+  const struct dentry *exec_dentry;
 
   /* Dedup ring buffer for the rapid-write-open heuristic - counts
    * DISTINCT paths written in a TRUE trailing window (see
@@ -795,6 +805,29 @@ int av_behavior_protect_del(const char *path) {
   return ret;
 }
 
+/* The address space of the process `task` belongs to. A group leader
+ * that has exited keeps its task_struct (and is what a tgid pid names)
+ * while other threads run, but has no mm of its own any more; the mm is
+ * shared, so any live thread's is the process's. Looking only at the
+ * leader would read "no mm" as "not protected" and let the kill through
+ * for a protected executable. Caller drops it with mmput(); NULL when
+ * the whole group is past exit_mm(). */
+static struct mm_struct *av_group_get_mm(struct task_struct *task) {
+  struct mm_struct *mm = get_task_mm(task);
+  struct task_struct *t;
+
+  if (mm)
+    return mm;
+  rcu_read_lock();
+  for_each_thread(task, t) {
+    mm = get_task_mm(t);
+    if (mm)
+      break;
+  }
+  rcu_read_unlock();
+  return mm;
+}
+
 /* Resolves target_pid's own exe path (task->mm->exe_file, i.e. what
  * ACTUALLY exec'd - not any path string a caller might be passing
  * around for logging) and checks it against the protected list.
@@ -813,8 +846,35 @@ int av_behavior_protect_del(const char *path) {
  * context here, same as everything else that calls kill_with_reason()/
  * av_kill()). `path_out` (optional) is filled with the resolved path
  * on a match, for logging. */
-bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
-                                     size_t path_out_len) {
+/* `strip_deleted`: the caller is reporting that the target removed or
+ * replaced its own image (self-delete / self-update rename). The unlink
+ * has usually already happened by the time this runs, so d_path() renders
+ * the exe as "/usr/sbin/sshd (deleted)", which no exact-path entry
+ * matches, and the protected list would be bypassed exactly when a
+ * protected service updates itself. With the flag set, a genuinely
+ * unlinked exe has that suffix cut before the lookup.
+ *
+ * Whether the suffix is the kernel's is decided from d_unlinked(),
+ * sampled on both sides of d_path(). d_path() adds the marker exactly
+ * when the dentry is unlinked at the moment it looks, and an unlinked
+ * dentry never becomes linked again, so:
+ *  - unlinked before and after: the marker is there. Exactly one
+ *    " (deleted)" is cut, and only that one, so a file whose real name
+ *    ends in " (deleted)" and that has been unlinked is looked up under
+ *    its real name, and still matches its allow-list entry.
+ *  - linked before and after: there is no marker, nothing is cut, and a
+ *    literal " (deleted)" in a still-linked file's name stays, so
+ *    "/opt/x/updater (deleted)" cannot borrow the entry of
+ *    "/opt/x/updater".
+ *  - linked before, unlinked after: the unlink (or the rename of a
+ *    self-update, which the probe reports before it completes) landed
+ *    inside the call, so whether d_path() saw it is unknown. Render again;
+ *    the dentry is unlinked now, so the second pass is the first case.
+ * An internal mount's "pseudo" names are left alone. Only paths that
+ * start with '/' are looked up: the fallback renderings for names with
+ * no mount path are never allow-list keys. */
+static bool target_is_protected(struct pid *target_pid, char *path_out,
+                                size_t path_out_len, bool strip_deleted) {
   struct task_struct *task;
   struct mm_struct *mm;
   struct file *exe_file;
@@ -830,7 +890,7 @@ bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
   if (!task)
     return false;
 
-  mm = get_task_mm(task);
+  mm = av_group_get_mm(task);
   put_task_struct(task);
   if (!mm)
     return false;
@@ -844,7 +904,29 @@ bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
 
   buf = kmalloc(PATH_MAX, GFP_KERNEL);
   if (buf) {
-    char *resolved = d_path(&exe_file->f_path, buf, PATH_MAX);
+    struct dentry *exe_dentry = exe_file->f_path.dentry;
+    bool before, after;
+    char *resolved;
+
+    /* Linked before and unlinked after means the unlink landed inside
+     * d_path(), so repeat: the dentry is unlinked now, the second pass
+     * has before == after, and the loop cannot run a third time. */
+    do {
+      before = d_unlinked(exe_dentry);
+      resolved = d_path(&exe_file->f_path, buf, PATH_MAX);
+      after = d_unlinked(exe_dentry);
+    } while (!before && after);
+
+    if (strip_deleted && before && after && !IS_ERR(resolved) &&
+        resolved[0] == '/' &&
+        !(exe_file->f_path.mnt->mnt_flags & MNT_INTERNAL)) {
+      static const char suffix[] = " (deleted)";
+      size_t len = strlen(resolved);
+
+      if (len > sizeof(suffix) - 1 &&
+          !strcmp(resolved + len - (sizeof(suffix) - 1), suffix))
+        resolved[len - (sizeof(suffix) - 1)] = '\0';
+    }
 
     /* cppcheck-suppress knownConditionTrueFalse
      * Same false positive as hash_is_trusted()'s call site above -
@@ -862,6 +944,11 @@ bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
   fput(exe_file);
 
   return protected;
+}
+
+bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
+                                     size_t path_out_len) {
+  return target_is_protected(target_pid, path_out, path_out_len, false);
 }
 
 static int protected_proc_show(struct seq_file *m, void *v) {
@@ -1102,9 +1189,10 @@ static u32 pid_key(pid_t pid) { return (u32)pid; }
  * malicious activity needed, just staying alive) and permanently fill
  * the table with entries GC will never touch. Every subsequent
  * process then gets e == NULL from get_or_create_entry() forever -
- * and av_behavior_check_unlink()'s self-delete kill depends entirely
- * on exec_path having been recorded, which never happens for an
- * untracked pid. That's not "only degrading the volume-based
+ * and the self-delete kill used to depend entirely on exec_path
+ * having been recorded, which never happens for an untracked pid (it
+ * now matches on exec_ident_table instead, which has its own cap -
+ * see exec_ident_stage()). That's not "only degrading the volume-based
  * heuristics" (this function's stance before this comment) - it's a
  * cheap, durable bypass of a real kill path. LRU eviction closes that:
  * the table can never stay permanently full of untouchable entries,
@@ -1288,9 +1376,11 @@ static bool is_extension_append_rename(const char *old_path,
   return new_base[old_len] == '.';
 }
 
-/* Shared kill-and-log helper - same pid_task/rcu_read_lock/send_sig
- * pattern used in main.c's execve path, duplicated here rather than
- * shared across modules to keep behavior.c self-contained.
+/* Shared kill-and-log helper - same pid_task/rcu_read_lock pattern as
+ * main.c's execve path (av_kill()), duplicated here rather than shared
+ * across modules to keep behavior.c self-contained. Unlike av_kill() it
+ * kills through kill_pid(), i.e. the whole thread group, so a tgid
+ * target works even when its leader has exited.
  *
  * SAFETY NET: never target PID 1, full stop, regardless of what
  * triggered detection. Killing init can panic the kernel outright.
@@ -1304,9 +1394,15 @@ static bool is_extension_append_rename(const char *old_path,
  *
  * v1.0.0-merge: structured key=value log format, matching main.c's
  * av_kill - see its comment for why. */
-static void kill_with_reason(struct pid *target_pid, const char *path,
-                             const char *reason) {
-  struct task_struct *task;
+/* Returns true when the target was found (killed, or suppressed by the
+ * PID-1 guard / protected list) and false when it no longer exists, so a
+ * caller with a reason worth keeping can log it itself. `image_may_be_gone`
+ * is for the self-delete reports: the protected-list lookup then looks
+ * through the " (deleted)" suffix, see target_is_protected(). */
+static bool kill_target(struct pid *target_pid, const char *path,
+                        const char *reason, bool image_may_be_gone) {
+  const struct task_struct *task; /* only tested: kill_pid() takes the pid */
+  bool found = false;
   char *protected_path;
   /* av_log_escape() for path/protected_exe, not %s or %*pE (#166) -
    * same log-injection reasoning as av_kill() in main.c, see its
@@ -1319,7 +1415,7 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
              "path=\"%s\" reason=\"%s\" pid=1\n",
              av_log_str(esc_path), reason);
     kfree(esc_path);
-    return;
+    return true;
   }
   /* PATH_MAX (4096) is far too large for the kernel stack (typically
    * 8-16KB total, shared with everything else on this call path) -
@@ -1330,7 +1426,8 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
    * is_protected() tolerates a NULL path_out for exactly this case. */
   protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
-  if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
+  if (target_is_protected(target_pid, protected_path, PATH_MAX,
+                          image_may_be_gone)) {
     char *esc_exe =
         protected_path ? av_log_escape(protected_path, GFP_KERNEL) : NULL;
 
@@ -1341,20 +1438,41 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
     kfree(esc_exe);
     kfree(protected_path);
     kfree(esc_path);
-    return;
+    return true;
   }
   kfree(protected_path);
 
   rcu_read_lock();
   task = pid_task(target_pid, PIDTYPE_PID);
   if (task) {
-    pr_alert("kernel-av: event=detected action=kill type=behavioral "
-             "path=\"%s\" reason=\"%s\" pid=%d\n",
-             av_log_str(esc_path), reason, pid_nr(target_pid));
-    send_sig(SIGKILL, task, 0);
+    /* kill_pid(), not send_sig(): send_sig() is thread-scoped, and to a
+     * thread-group leader that has already exited (a zombie, still the
+     * task a tgid pid names while other threads run) it does not start a
+     * group exit at all, so the rest of the process would carry on.
+     * kill_pid() delivers to the group, picking a live thread. priv=1:
+     * this is the module acting, not a signal from user space, so no
+     * kill() permission check.
+     *
+     * The record is written after the call, from its result: the task
+     * can be reaped between pid_task() above and the signal, and
+     * kill_pid() then returns -ESRCH. That is "no longer exists", not a
+     * kill, so it must not log action=kill and must let a self-delete
+     * caller write its own detection-only record. */
+    if (kill_pid(target_pid, SIGKILL, 1) != -ESRCH) {
+      found = true;
+      pr_alert("kernel-av: event=detected action=kill type=behavioral "
+               "path=\"%s\" reason=\"%s\" pid=%d\n",
+               av_log_str(esc_path), reason, pid_nr(target_pid));
+    }
   }
   rcu_read_unlock();
   kfree(esc_path);
+  return found;
+}
+
+static void kill_with_reason(struct pid *target_pid, const char *path,
+                             const char *reason) {
+  kill_target(target_pid, path, reason, false);
 }
 
 /* Periodic sweep: reclaims behavior_table entries for processes that
@@ -1380,6 +1498,8 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
  * overwrites them. Entries that never recorded an exec (start_time == 0)
  * are left alone - they may still belong to the same pre-exec process,
  * and record_exec() will initialise them on its first exec. */
+static unsigned int exec_ident_sweep_dead(void);
+
 static void behavior_gc_fn(struct work_struct *w) {
   /* Initialized to NULL only to satisfy static analyzers that can't
    * expand hash_for_each_safe() (same false-positive category as
@@ -1414,6 +1534,7 @@ static void behavior_gc_fn(struct work_struct *w) {
        * new occupant is never judged on the previous process's activity. */
       e->start_time = cur_start;
       e->exec_path[0] = '\0';
+      e->exec_dentry = NULL;
       e->trusted = false;
       e->recent_path_next = 0;
       e->recent_path_filled = 0;
@@ -1424,6 +1545,8 @@ static void behavior_gc_fn(struct work_struct *w) {
   behavior_table_count -= removed;
   mutex_unlock(&behavior_lock);
 
+  removed += exec_ident_sweep_dead();
+
   if (removed)
     pr_debug("kernel-av: event=gc type=behavioral reclaimed=%u\n", removed);
 
@@ -1432,6 +1555,7 @@ static void behavior_gc_fn(struct work_struct *w) {
 }
 
 void av_behavior_record_exec(pid_t pid, const char *path,
+                             const struct dentry *dentry,
                              const char *sha256_hex, u64 start_time) {
   struct av_behavior_entry *e;
   /* cppcheck-suppress knownConditionTrueFalse
@@ -1445,6 +1569,7 @@ void av_behavior_record_exec(pid_t pid, const char *path,
   e = get_or_create_entry(pid);
   if (e) {
     strscpy(e->exec_path, path, sizeof(e->exec_path));
+    e->exec_dentry = dentry;
     e->trusted = trusted;
     /* A reused pid can land on a stale entry left behind by a
      * previous, unrelated process (get_or_create_entry() matches on
@@ -1516,48 +1641,498 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                      "rapid file modification (possible ransomware pattern)");
 }
 
-void av_behavior_check_unlink(pid_t pid, const char *path,
-                              struct pid *target_pid) {
-  const struct av_behavior_entry *e;
-  bool self_delete = false;
-  bool sensitive;
-
+void av_behavior_check_unlink(const char *path, struct pid *target_pid) {
   if (path_is_pseudo_fs(path))
     return;
+  if (path_is_sensitive(path))
+    kill_with_reason(target_pid, path, "deletion of sensitive path");
+}
 
+/* ---- exec identity: the self-delete heuristic (#230) ----
+ *
+ * "Did this process just delete its own executable?" used to be a
+ * string comparison: the unlink target, made absolute and normalized
+ * in a worker, against the d_path() of the executed file plus a second,
+ * second, unresolved spelling of the exec'd name. Every alias the kernel resolves
+ * differently from a string - a directory symlink retargeted between
+ * exec and unlink, a ".." after a symlink, a bind mount, another mount
+ * namespace's view, /proc/self/cwd/... - was a way either to escape the
+ * kill or to be killed for deleting something else.
+ *
+ * Now the decision is made where the kernel has already resolved the
+ * name: the security_inode_unlink() and security_inode_rename() kprobes
+ * in main.c see the dentry being removed and compare it with the dentry
+ * this process was exec'd from. However the unlink was spelled, it is a
+ * self-delete exactly when it removes that directory entry. Paths are
+ * only rendered for the log line.
+ *
+ * Dentry, not inode, identity: unlinking another hard link to the same
+ * inode (busybox-style `rm` of a sibling name, a package manager
+ * replacing a linked copy) leaves the executed name in place and is not
+ * a self-delete; hard-linking the image elsewhere and then unlinking the
+ * exec'd name is. A rename of the executed file moves its dentry, so a
+ * later unlink of the new name still matches. The inode, superblock and
+ * inode number are compared too, so a dentry freed and reallocated at
+ * the same address for a different file cannot match.
+ *
+ * Kprobe handlers run in atomic context and behavior_lock is a mutex, so
+ * the identities live in their own RCU hashtable: writers take
+ * exec_ident_lock, the unlink-side reader only rcu_read_lock(). Keyed by
+ * the thread group's struct pid (a counted reference), so pid number
+ * reuse can never alias two processes. The cookies are never
+ * dereferenced and hold no references: a dentry or vfsmount reference
+ * held for the life of the process would keep the filesystem busy
+ * (umount -EBUSY, or "busy inodes" at shutdown).
+ *
+ * Two stages, so a failing exec cannot replace the identity of the image
+ * that is still running: security_bprm_check() (first binfmt level -
+ * the script, not its interpreter) stages the file, and
+ * security_bprm_committing_creds(), past exec's point of no return,
+ * makes the staged identity the active one. Without that, a dropper
+ * could execve() a non-executable file (ENOEXEC) and then delete itself
+ * unnoticed.
+ *
+ * The dentry pointer alone is not enough to recognise the entry, because
+ * a live process can lose its dentry without losing its image. For an
+ * interpreted image (a "#!" script, binfmt_misc) nothing pins the
+ * script's dentry after exec - the process holds the interpreter, not
+ * the script - so under memory pressure it is reclaimed. And even a
+ * native image's dentry, pinned by mm->exe_file, can be invalidated
+ * (unhashed while still referenced) by a filesystem that revalidates,
+ * FUSE and the network filesystems among them. Either way the next
+ * lookup of the name allocates a new dentry that the pointer comparison
+ * no longer recognises. Every identity therefore also records the
+ * directory entry by value, which neither can change: the filesystem,
+ * the file's inode number and generation, the parent directory's inode
+ * number and generation, and a hash of the entry's name. An unlink that
+ * misses the dentry comparison is still a self-delete if all of that
+ * matches. That keeps the dentry policy: another hard link has the same
+ * file but a different name (or directory); a file put in the exec'd
+ * name's place has a different inode, whose number and generation differ
+ * (a freed inode number can be handed out again, its generation is what
+ * tells the two files apart); neither matches. The name is compared by
+ * hash, which can only add a match between two names of the same file in
+ * the same directory, never lose one. The mount is deliberately not part
+ * of the tuple: a bind mount of the same entry is the same entry.
+ *
+ * The tuple names one entry only where a filesystem has one inode number
+ * space. btrfs (and bcachefs) number inodes per subvolume, so a snapshot
+ * holds a copy at the same inode number and generation, under the same
+ * parent number and basename, on the same superblock: an unlink of the
+ * copy would be taken for a self-delete. Those filesystems keep the
+ * exact dentry comparison alone (exec_ident_tuple_is_unique()); so does
+ * FUSE, whose reported inode numbers need not tell nodes apart.
+ *
+ * Known gaps: a forked child (no exec) deleting its parent's image is a
+ * different thread group with no identity; an image renamed after exec
+ * whose dentry is then reclaimed or invalidated is looked up under its
+ * new name, which the recorded one no longer describes; and on btrfs or
+ * bcachefs an image whose dentry is reclaimed or invalidated is not
+ * recognised. All fail open.
+ *
+ * The opposite error - a kill for an unlink that does not remove the
+ * image - is possible where hard links to the image exist, and only when
+ * the process shuffles them itself:
+ *  - exec /tmp/app, which has another link /tmp/app.other; move /tmp/app
+ *    to /tmp/app.saved and /tmp/app.other to /tmp/app; unlink /tmp/app.
+ *    The dentries moved with their names, so the exact comparison
+ *    rejects the entry at /tmp/app, but the by-value comparison takes it
+ *    for the entry recorded at exec (same inode, parent and name).
+ *  - the image's dentry is reclaimed and the dentry allocated for a
+ *    lookup of another link of the same inode lands at the same address,
+ *    so the exact comparison matches it.
+ * Telling these apart needs a fresh lookup of the image's current entry,
+ * which an atomic-context probe cannot do. The kill lands on the process
+ * that is rearranging its own image's links, so it is left as is. */
+
+struct av_exec_file_id {
+  const struct dentry *dentry;
+  const struct inode *inode;
+  const struct super_block *sb;
+  unsigned long ino;
+  /* The entry by value, which reclamation and invalidation of the dentry
+   * cannot change (see above). Valid only when `stable`; not recorded on
+   * filesystems whose inode numbers are not unique per superblock. */
+  bool stable;
+  u32 gen;               /* the file's i_generation */
+  unsigned long dir_ino; /* the parent directory's inode number... */
+  u32 dir_gen;           /* ...and generation */
+  u32 name_hash;         /* full_name_hash() of the entry's name */
+};
+
+struct av_exec_ident {
+  struct hlist_node node;
+  struct rcu_head rcu;
+  struct pid *tgid;              /* counted; put in exec_ident_free_rcu() */
+  struct av_exec_file_id active; /* the image the process is running.
+                                  * Immutable once published - a commit
+                                  * publishes a new node instead. */
+  struct av_exec_file_id staged; /* the exec in flight, written and read
+                                  * only under exec_ident_lock */
+  bool has_active;
+  bool has_staged;
+};
+
+#define EXEC_IDENT_BITS 12
+/* One ~100-byte node per live process that has exec'd since load. A
+ * full table is first swept for dead thread groups inline, at most once
+ * per EXEC_IDENT_SWEEP_MIN_INTERVAL; if it is still full, a new
+ * process's exec is not recorded (its self-delete is then missed) and a
+ * warning says so. 65536 live processes is above any realistic system
+ * and costs ~6.5 MiB at most. */
+#define MAX_EXEC_IDENTS 65536
+/* The inline sweep walks every node and pid_task()s each, under
+ * exec_ident_lock with IRQs off, inside the exec kprobe. With a table
+ * full of live processes it frees nothing, so repeating it for every new
+ * process's first exec would stall each one for nothing. The periodic GC
+ * sweeps as well; a full table that has just been swept (by either) is
+ * left alone until this has passed. The cost: a new process can go
+ * unrecorded for up to this long after the table fills, even if a thread
+ * group has exited since. */
+#define EXEC_IDENT_SWEEP_MIN_INTERVAL HZ
+static DEFINE_HASHTABLE(exec_ident_table, EXEC_IDENT_BITS);
+static DEFINE_SPINLOCK(exec_ident_lock);
+static unsigned int exec_ident_count;       /* under exec_ident_lock */
+static unsigned long exec_ident_last_sweep; /* under exec_ident_lock */
+/* Separate from the timestamp: jiffies starts about five minutes before
+ * wraparound (INITIAL_JIFFIES), so a zero timestamp would make
+ * time_after() false for the first ~300 s of uptime and the inline sweep
+ * would never run in that window. */
+static bool exec_ident_swept; /* under exec_ident_lock */
+
+static void exec_ident_free_rcu(struct rcu_head *rcu) {
+  struct av_exec_ident *n = container_of(rcu, struct av_exec_ident, rcu);
+
+  /* RCU callback context: put_pid() is fine here, the kernel's own
+   * delayed_put_pid() does the same. Dropping the reference only after
+   * the grace period means a reader still walking this node can never
+   * see its tgid pointer freed and reused for the reader's own pid. */
+  put_pid(n->tgid);
+  kfree(n);
+}
+
+#ifndef BTRFS_SUPER_MAGIC
+#define BTRFS_SUPER_MAGIC 0x9123683EUL
+#endif
+/* Spelled here: bcachefs has come and gone from <linux/magic.h> across
+ * the kernels this module builds against. */
+#define AV_BCACHEFS_SUPER_MAGIC 0xca451a4eUL
+#ifndef FUSE_SUPER_MAGIC
+#define FUSE_SUPER_MAGIC 0x65735546UL
+#endif
+
+/* True when (superblock, inode number, generation) plus the parent and
+ * name identify one directory entry on `sb`, i.e. its inode numbers are
+ * unique per superblock. btrfs and bcachefs number them per subvolume,
+ * and a snapshot keeps a copy of a file at the same tuple; the subvolume
+ * is not available to a module (and the mount is no substitute: a bind
+ * mount of the same entry must still match), so those two are left out
+ * rather than risk taking the copy for the image. FUSE is left out too:
+ * the kernel tells its inodes apart by the server's node ID, but i_ino
+ * and i_generation are whatever the server reports, and distinct nodes
+ * can report the same pair. Unknown filesystems are included: the
+ * by-value match is what a reclaimed or invalidated dentry needs, and the
+ * ones known to break the assumption are few. */
+static bool exec_ident_tuple_is_unique(const struct super_block *sb) {
+  return sb->s_magic != BTRFS_SUPER_MAGIC &&
+         sb->s_magic != AV_BCACHEFS_SUPER_MAGIC &&
+         sb->s_magic != FUSE_SUPER_MAGIC;
+}
+
+/* Atomic context. Fills in both the dentry cookies and the
+ * reclamation-stable name (where the filesystem allows one, see
+ * exec_ident_tuple_is_unique()). The parent is read under the dentry's
+ * d_lock, which holds d_parent and d_name still, and a dentry keeps a
+ * reference on its parent, so the parent (and its inode) cannot go away
+ * while `file` pins the child. */
+static void exec_ident_file_id(const struct file *file,
+                               struct av_exec_file_id *id) {
+  struct dentry *dentry = file->f_path.dentry;
+  const struct inode *inode = d_inode(dentry);
+  const struct inode *dir;
+
+  /* Everything, so a node never carries stack leftovers in the stable
+   * fields it does not use. */
+  memset(id, 0, sizeof(*id));
+  id->dentry = dentry;
+  id->inode = inode;
+  id->sb = dentry->d_sb;
+  id->ino = inode ? inode->i_ino : 0;
+  if (!inode || !exec_ident_tuple_is_unique(dentry->d_sb))
+    return;
+
+  spin_lock(&dentry->d_lock);
+  dir = d_inode(dentry->d_parent);
+  if (dir) {
+    id->gen = inode->i_generation;
+    id->dir_ino = dir->i_ino;
+    id->dir_gen = dir->i_generation;
+    id->name_hash =
+        full_name_hash(NULL, dentry->d_name.name, dentry->d_name.len);
+    id->stable = true;
+  }
+  spin_unlock(&dentry->d_lock);
+}
+
+/* TEST ONLY: when nonzero, av_behavior_exec_ident_match() skips the
+ * dentry-pointer comparison, as if the exec'd image's dentry had been
+ * reclaimed or invalidated and the name looked up afresh. tmpfs pins
+ * every dentry, so the QEMU boot test cannot make the kernel do either;
+ * this puts the matcher in the state they leave it in, so the by-value
+ * comparison is the only thing that can match.
+ *
+ * Compiled only when built with -DAV_TEST_KNOBS, which the QEMU boot
+ * test's build passes and no shipped module does. It is a 0644 module
+ * parameter, and the standard setter does not carry the capability
+ * checks the trust and protected-exe controls enforce: on a writable
+ * sysfs a root service without CAP_SYS_ADMIN could change it live, and
+ * the dentry comparison is what native self-delete detection leans on
+ * first. */
+#ifdef AV_TEST_KNOBS
+static int av_exec_ident_test_no_dentry; /* = 0: disabled unless a test sets it */
+module_param(av_exec_ident_test_no_dentry, int, 0644);
+MODULE_PARM_DESC(av_exec_ident_test_no_dentry,
+                 "TEST ONLY: skip the exec identity's dentry-pointer comparison, simulating a reclaimed or invalidated dentry (default 0 = disabled); never set in production");
+#define AV_EXEC_IDENT_NO_DENTRY() READ_ONCE(av_exec_ident_test_no_dentry)
+#else
+#define AV_EXEC_IDENT_NO_DENTRY() 0
+#endif
+
+/* exec_ident_lock held. */
+static struct av_exec_ident *exec_ident_find_locked(struct pid *tgid) {
+  struct av_exec_ident *n;
+
+  hash_for_each_possible(exec_ident_table, n, node, (unsigned long)tgid)
+    if (n->tgid == tgid)
+      return n;
+  return NULL;
+}
+
+/* exec_ident_lock held. Unpublishes `n` and frees it after a grace
+ * period. */
+static void exec_ident_drop_locked(struct av_exec_ident *n) {
+  hash_del_rcu(&n->node);
+  exec_ident_count--;
+  call_rcu(&n->rcu, exec_ident_free_rcu);
+}
+
+/* exec_ident_lock and rcu_read_lock() held (pid_task() needs the
+ * latter). */
+static unsigned int exec_ident_sweep_dead_locked(void) {
+  struct av_exec_ident *n;
+  struct hlist_node *tmp;
+  unsigned int removed = 0;
+  int bkt;
+
+  exec_ident_last_sweep = jiffies;
+  exec_ident_swept = true;
+  hash_for_each_safe(exec_ident_table, bkt, tmp, n, node) {
+    if (!pid_task(n->tgid, PIDTYPE_TGID)) {
+      /* cppcheck-suppress uninitvar
+       * False positive: cppcheck can't expand hash_for_each_safe(),
+       * which always points n at a real table entry before this runs. */
+      exec_ident_drop_locked(n);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/* GC: drop identities of thread groups that have exited. */
+static unsigned int exec_ident_sweep_dead(void) {
+  unsigned long flags;
+  unsigned int removed;
+
+  rcu_read_lock();
+  spin_lock_irqsave(&exec_ident_lock, flags);
+  removed = exec_ident_sweep_dead_locked();
+  spin_unlock_irqrestore(&exec_ident_lock, flags);
+  rcu_read_unlock();
+  return removed;
+}
+
+void av_behavior_exec_ident_stage(const struct file *file) {
+  struct pid *tgid = task_tgid(current);
+  struct av_exec_ident *n, *fresh;
+  struct av_exec_file_id id;
+  unsigned long flags;
+  bool full = false;
+
+  if (!file)
+    return;
+  exec_ident_file_id(file, &id);
+  /* Allocated before the lock, used only when this thread group has no
+   * node yet (its first exec since load). */
+  fresh = kzalloc(sizeof(*fresh), GFP_ATOMIC);
+
+  rcu_read_lock();
+  spin_lock_irqsave(&exec_ident_lock, flags);
+  n = exec_ident_find_locked(tgid);
+  if (n) {
+    /* Not visible to readers - see the struct. */
+    n->staged = id;
+    n->has_staged = true;
+  } else if (fresh) {
+    if (exec_ident_count >= MAX_EXEC_IDENTS &&
+        (!exec_ident_swept ||
+         time_after(jiffies, exec_ident_last_sweep +
+                                 EXEC_IDENT_SWEEP_MIN_INTERVAL)))
+      exec_ident_sweep_dead_locked();
+    if (exec_ident_count >= MAX_EXEC_IDENTS) {
+      full = true;
+    } else {
+      fresh->tgid = get_pid(tgid);
+      fresh->staged = id;
+      fresh->has_staged = true;
+      hash_add_rcu(exec_ident_table, &fresh->node, (unsigned long)tgid);
+      exec_ident_count++;
+      fresh = NULL;
+    }
+  }
+  spin_unlock_irqrestore(&exec_ident_lock, flags);
+  rcu_read_unlock();
+
+  kfree(fresh);
+  if (full)
+    pr_warn_ratelimited("kernel-av: event=skip reason=exec-ident-table-full "
+                        "pid=%d\n",
+                        pid_nr(tgid));
+}
+
+void av_behavior_exec_ident_commit(void) {
+  struct pid *tgid = task_tgid(current);
+  struct av_exec_ident *n, *next;
+  unsigned long flags;
+
+  /* The replacement is allocated before the lock; it is only needed
+   * when something is staged, which is nearly always true here. */
+  next = kzalloc(sizeof(*next), GFP_ATOMIC);
+
+  spin_lock_irqsave(&exec_ident_lock, flags);
+  n = exec_ident_find_locked(tgid);
+  if (n && n->has_staged) {
+    if (next) {
+      next->tgid = get_pid(tgid);
+      next->active = n->staged;
+      next->has_active = true;
+      hlist_replace_rcu(&n->node, &next->node);
+      call_rcu(&n->rcu, exec_ident_free_rcu);
+      next = NULL;
+    } else {
+      /* Cannot publish the new image's identity, and the old one no
+       * longer describes what this process runs: forget both. */
+      exec_ident_drop_locked(n);
+    }
+  }
+  spin_unlock_irqrestore(&exec_ident_lock, flags);
+
+  kfree(next);
+}
+
+/* The by-value comparison for an interpreted image whose dentry the
+ * pointer comparison missed: true when `dentry`, in `dir`, is the
+ * directory entry `a` recorded, whatever dentry now represents it. The
+ * cheap fields are compared first - this runs for every unlink and
+ * rename of a process that has an identity, nearly all of which are
+ * unrelated files - and only a file that already agrees on filesystem,
+ * inode number and generation, and parent directory has its name read.
+ * Atomic context: the unlink and rename paths hold the directory's
+ * i_rwsem, so the name is stable, and d_lock is taken anyway to read it
+ * the way every other reader does. */
+static bool exec_ident_stable_match(const struct av_exec_file_id *a,
+                                    const struct inode *dir,
+                                    struct dentry *dentry,
+                                    const struct inode *inode) {
+  bool same;
+
+  if (!a->stable || !dir)
+    return false;
+  if (a->sb != dentry->d_sb || a->ino != inode->i_ino ||
+      a->gen != inode->i_generation || a->dir_ino != dir->i_ino ||
+      a->dir_gen != dir->i_generation)
+    return false;
+  spin_lock(&dentry->d_lock);
+  same = a->name_hash ==
+         full_name_hash(NULL, dentry->d_name.name, dentry->d_name.len);
+  spin_unlock(&dentry->d_lock);
+  return same;
+}
+
+/* Whether `dentry` (an entry of `dir`, with inode `inode`) is the
+ * directory entry the image recorded in `n` was exec'd from: the exact
+ * dentry first, then, for an interpreted image, the entry by value.
+ * Split out of av_behavior_exec_ident_match() so that function's
+ * table-walk loop variable is touched on one line only. */
+static bool exec_ident_node_match(const struct av_exec_ident *n,
+                                  const struct inode *dir,
+                                  struct dentry *dentry,
+                                  const struct inode *inode) {
+  const struct av_exec_file_id *a = &n->active;
+
+  if (!n->has_active)
+    return false;
+  if (!AV_EXEC_IDENT_NO_DENTRY() && a->dentry == dentry && a->inode == inode &&
+      a->sb == dentry->d_sb && a->ino == inode->i_ino)
+    return true;
+  return exec_ident_stable_match(a, dir, dentry, inode);
+}
+
+bool av_behavior_exec_ident_match(const struct inode *dir,
+                                  struct dentry *dentry) {
+  const struct pid *tgid = task_tgid(current);
+  const struct inode *inode = d_inode(dentry);
+  const struct av_exec_ident *n;
+  bool match = false;
+
+  if (!inode)
+    return false;
+  rcu_read_lock();
+  hash_for_each_possible_rcu(exec_ident_table, n, node, (unsigned long)tgid) {
+    /* cppcheck-suppress uninitvar
+     * False positive: cppcheck can't expand hash_for_each_possible_rcu(),
+     * which assigns n before running the body. */
+    if (n->tgid != tgid)
+      continue;
+    /* cppcheck-suppress uninitvar
+     * Same false positive: n is the loop variable assigned above. */
+    match = exec_ident_node_match(n, dir, dentry, inode);
+    break;
+  }
+  rcu_read_unlock();
+  return match;
+}
+
+void av_behavior_report_self_delete(pid_t pid, const struct dentry *cookie,
+                                    char *path, size_t path_len,
+                                    bool overwrite, struct pid *target_pid) {
+  const struct av_behavior_entry *e;
+  const char *reason;
+
+  /* The exec worker's d_path() is the better name to log (absolute,
+   * through this process's own mounts) when it has been recorded for
+   * this same file; otherwise keep main.c's filesystem-relative
+   * dentry_path_raw() rendering. The exec worker runs asynchronously,
+   * so an image deleted right after exec may not be recorded yet. */
   mutex_lock(&behavior_lock);
-  /* Read-only lookup, deliberately NOT get_or_create_entry(): every
-   * unlinker allocating a table slot meant routine unlink traffic
-   * (shells, build tools, package managers) churned through the
-   * capped table and its LRU eviction could drop the entry recording
-   * a real dropper's exec_path before it self-deleted, silently
-   * defeating this very check. A process that never exec'd through
-   * the hook has no exec_path to match anyway, so there is nothing to
-   * lose by only consulting an existing entry. */
   e = find_entry(pid);
-  /* Both sides must be genuinely-resolved absolute paths (path[0] ==
-   * '/' is the same litmus test resolve_absolute_path() itself uses
-   * for "already absolute") before trusting a strcmp() match as real
-   * identity. resolve_absolute_path() falls back to copying the raw,
-   * still-relative `path` through unresolved on a handful of rare
-   * failure paths (allocation failure, d_path() failure, or - see its
-   * own comment - a would-be truncating concatenation) rather than
-   * silently dropping the event; two DIFFERENT files that both hit
-   * one of those fallbacks could otherwise share the exact same
-   * leftover relative remainder and falsely strcmp() equal here,
-   * triggering a self-delete kill of an unrelated process. */
-  if (e && e->exec_path[0] == '/' && path[0] == '/' &&
-      !strcmp(e->exec_path, path))
-    self_delete = true;
+  if (e && e->exec_dentry == cookie && e->exec_path[0] == '/')
+    strscpy(path, e->exec_path, path_len);
   mutex_unlock(&behavior_lock);
 
-  sensitive = path_is_sensitive(path);
+  reason = overwrite ? "self-overwriting binary (possible dropper/backdoor)"
+                     : "self-deleting binary (possible dropper/backdoor)";
+  if (!kill_target(target_pid, path, reason, true)) {
+    /* Another worker (sensitive-path unlink, rapid-write, ...) killed the
+     * process first, or it exited on its own. The detection still
+     * happened and its reason would otherwise vanish from the log, so
+     * record it without claiming a kill. */
+    char *esc_path = av_log_escape(path, GFP_KERNEL);
 
-  if (self_delete)
-    kill_with_reason(target_pid, path,
-                     "self-deleting binary (possible dropper/backdoor)");
-  else if (sensitive)
-    kill_with_reason(target_pid, path, "deletion of sensitive path");
+    pr_alert("kernel-av: event=detected action=none type=behavioral "
+             "path=\"%s\" reason=\"%s\" pid=%d target=exited\n",
+             av_log_str(esc_path), reason, pid);
+    kfree(esc_path);
+  }
 }
 
 void av_behavior_check_rename(pid_t pid, const char *oldpath,
@@ -1664,6 +2239,24 @@ void av_behavior_exit(void) {
     kfree(e);
   }
   mutex_unlock(&behavior_lock);
+
+  /* The kprobes that read and write exec_ident_table are unregistered
+   * before this runs (av_exit()), so nothing else touches it. The
+   * rcu_barrier() waits for every queued exec_ident_free_rcu() - module
+   * text - to have run before the module can be freed. */
+  {
+    struct av_exec_ident *n;
+    unsigned long flags;
+
+    spin_lock_irqsave(&exec_ident_lock, flags);
+    hash_for_each_safe(exec_ident_table, bkt, tmp, n, node) {
+      /* cppcheck-suppress uninitvar
+       * Same false positive as in exec_ident_sweep_dead_locked(). */
+      exec_ident_drop_locked(n);
+    }
+    spin_unlock_irqrestore(&exec_ident_lock, flags);
+    rcu_barrier();
+  }
 
   av_behavior_protect_proc_exit();
   protected_table_destroy();
