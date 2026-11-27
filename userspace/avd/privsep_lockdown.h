@@ -173,6 +173,11 @@ static inline int ps_set_capabilities_to(uint64_t keep) {
  * calls it before this filter exists). rt_sigaction is allowed, through the
  * worker list. */
 static const int ps_allow_spawner_extra[] = {
+    /* The worker's filter allows mmap only with constrained flags, so it is
+     * not in the shared list. This filter has to allow whatever a worker may
+     * do (see "Why the filter must be a superset"), and the spawner itself
+     * parses nothing untrusted, so mmap stays unconditional here. */
+    SYS_mmap,
     SYS_poll,       SYS_wait4,     SYS_getpid,    SYS_getppid,
     SYS_recvmsg,    SYS_sendmsg,   SYS_set_robust_list,
     SYS_close_range,

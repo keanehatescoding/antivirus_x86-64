@@ -372,6 +372,17 @@ struct scan_result {
  * producer-side wait and an empty queue's consumer-side wait unblock
  * cleanly on SIGINT/SIGTERM instead of hanging the process past
  * `running = 0`. */
+/* Identity of the file the kernel hashed, from AV_A_DEV_MAJOR/MINOR/INO
+ * (issue #227). present=false for a request from a kernel module that
+ * predates those attributes, and for every non-netlink task - see
+ * handle_scan_request(). */
+struct scan_ident {
+  bool present;
+  uint32_t dev_major;
+  uint32_t dev_minor;
+  uint64_t ino;
+};
+
 struct scan_task {
   struct scan_task *next;
   /* False: kernel-triggered scan, reported back over netlink via
@@ -381,6 +392,8 @@ struct scan_task {
   bool on_demand;
   uint64_t reqid;
   uint32_t pid;
+  /* Kernel-triggered only: what the kernel hashed (issue #227). */
+  struct scan_ident ident;
   char path[PATH_MAX];
   char sha256_hex[65];
   /* On-demand only: the already-open, regularity-checked fd cmd_scan()
@@ -399,6 +412,10 @@ struct scan_task {
    * fd and every other field live in the pending record, which the
    * listener shares - see struct fan_pending. */
   struct fan_pending *fan;
+  /* Timestamp when this task was enqueued, for pending latency metrics
+   * (issue #105). Filled by queue_push() before the task is linked into
+   * the queue. */
+  struct timespec enqueue_time;
 };
 
 struct scan_completion {
@@ -431,6 +448,12 @@ static uint64_t scans_malicious;
 static uint64_t scan_time_total_ms;
 static uint64_t scan_time_max_ms;
 static uint64_t last_scan_ms;
+/* Pending latency metrics (time from enqueue to dequeue) for STATUS
+ * (issue #105). Updated once per scan at the point it is dequeued in
+ * scan_worker_main(), guarded by metrics_lock like the scan metrics above. */
+static uint64_t pending_time_total_ms;
+static uint64_t pending_time_max_ms;
+static uint64_t pending_count;
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
@@ -552,8 +575,11 @@ static void handle_sigint(int signum) {
 
 /*
  * Sends AV_C_VERDICT back to the kernel for the given request.
- * verdict: AV_VERDICT_CLEAN or AV_VERDICT_MALICIOUS.
- * rule_name: may be NULL/empty for a clean verdict.
+ * verdict: AV_VERDICT_CLEAN, AV_VERDICT_MALICIOUS, or AV_VERDICT_UNAVAILABLE
+ * (the file the kernel hashed could not be reached - issue #227; only
+ * sent for requests that carried the identity attributes, since an
+ * older module rejects it).
+ * rule_name: may be NULL/empty for a non-malicious verdict.
  */
 static int send_verdict(uint64_t reqid, uint8_t verdict,
                         const char *rule_name) {
@@ -1426,38 +1452,46 @@ static int read_quarantine_meta(const char *meta_path,
  * documented limitation as avctl's save/load format (see do_save()'s
  * comment in avctl.c for the equivalent caveat there).
  */
-static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
+static int write_quarantine_meta(int qdirfd, const char *name,
+                                 const struct stat *orig_st,
                                  const char *orig_path, const char *rule_name,
                                  const char *sha256_hex) {
-  /* PATH_MAX + 8, not PATH_MAX - `dest` is itself a PATH_MAX buffer, so
+  /* PATH_MAX + 8, not PATH_MAX - `name` is itself a PATH_MAX buffer
+   * (quarantine_file()'s "<pid>_<nanotime>_<base>.quarantined"), so
    * appending ".meta" needs headroom beyond it for gcc's
    * -Wformat-truncation to prove this can't overflow (same margin
    * avctl.c's do_save() uses for its own "%s.tmp" append). */
-  char meta_path[PATH_MAX + 8];
+  char meta_name[PATH_MAX + 8];
   FILE *f;
   int mfd;
   int mn;
 
-  /* Fail closed on truncation: a silently-truncated meta path would
-   * attach the sidecar to the wrong file (or a different directory)
-   * with no error, leaving a quarantine entry unrestorable. */
-  mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
-  if (mn < 0 || (size_t)mn >= sizeof(meta_path))
+  /* Fail closed on truncation: a silently-truncated meta name would
+   * attach the sidecar to the wrong file with no error, leaving a
+   * quarantine entry unrestorable. `name` holds no '/' (quarantine_file()
+   * builds it from fixed fields plus a basename), so the openat() below
+   * cannot leave the pinned directory - refuse rather than rely on the
+   * caller if that ever stops holding. */
+  if (strchr(name, '/') != NULL)
     return -1;
-  /* O_EXCL|O_NOFOLLOW, not fopen("w"): dest itself is an
+  mn = snprintf(meta_name, sizeof(meta_name), "%s.meta", name);
+  if (mn < 0 || (size_t)mn >= sizeof(meta_name))
+    return -1;
+  /* O_EXCL|O_NOFOLLOW, not fopen("w"): name itself is an
    * unpredictable pid+nanotime name (see quarantine_file()), so a
    * planted symlink here is impractical - but fopen() would still
    * follow one if it ever existed, and O_EXCL also turns a
    * same-nanosecond collision into a loud failure instead of a
    * silent clobber. Best-effort either way (caller logs, quarantine
    * itself still stands). */
-  mfd = open(meta_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  mfd = openat(qdirfd, meta_name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+               0600);
   if (mfd < 0)
     return -1;
   f = fdopen(mfd, "w");
   if (!f) {
     close(mfd);
-    unlink(meta_path);
+    unlinkat(qdirfd, meta_name, 0);
     return -1;
   }
 
@@ -1471,12 +1505,12 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
     /* fclose() to avoid leaking mfd, then drop the partial sidecar so
      * a later restore never reads a truncated meta file as valid. */
     fclose(f);
-    unlink(meta_path);
+    unlinkat(qdirfd, meta_name, 0);
     return -1;
   }
 
   if (fclose(f) != 0) {
-    unlink(meta_path);
+    unlinkat(qdirfd, meta_name, 0);
     return -1;
   }
   return 0;
@@ -1607,7 +1641,10 @@ static int dir_hierarchy_trusted(const char *label, const char *dir,
   return 0;
 }
 
-static int ensure_quarantine_dir(void) {
+static int open_quarantine_dir(void) {
+  int dirfd;
+  struct stat st;
+
   if (mkdir(quarantine_dir, 0700) != 0 && errno != EEXIST) {
     fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
             quarantine_dir, strerror(errno));
@@ -1623,12 +1660,33 @@ static int ensure_quarantine_dir(void) {
    * just as easily as anywhere else - an attacker-owned ancestor can
    * rename our new directory away afterwards). The full chain - not
    * just the final component - is validated, so no unprivileged user
-   * can modify any of it; that is also what closes the check-then-use
-   * gap without pinned fds for every later operation. No *at()/dir-FD
-   * pinning on top: once unprivileged users cannot modify the
-   * directory or any ancestor, there is nothing left for a retained
-   * FD to defend against. */
-  return dir_hierarchy_trusted("quarantine dir", quarantine_dir, false);
+   * can modify any of it. */
+  if (dir_hierarchy_trusted("quarantine dir", quarantine_dir, false) != 0)
+    return -1;
+  /* Then pin it (#231): every later step goes through this fd, so the
+   * directory that was just validated and the one written to are the
+   * same open file description. The chain check above already makes an
+   * ancestor swap unreachable for an unprivileged user; this removes the
+   * check-then-use gap between the two outright instead of relying on
+   * the chain staying trusted. O_NOFOLLOW plus the fstat() recheck
+   * refuse a final component that turned into a symlink or changed
+   * hands in between. */
+  dirfd = open(quarantine_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dirfd < 0) {
+    fprintf(stderr, "avd: could not open quarantine dir \"%s\": %s\n",
+            quarantine_dir, strerror(errno));
+    return -1;
+  }
+  if (fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+      (st.st_uid != geteuid() && st.st_uid != 0) ||
+      (st.st_mode & (S_IWGRP | S_IWOTH))) {
+    fprintf(stderr,
+            "avd: quarantine dir \"%s\" failed identity recheck after open - refusing\n",
+            quarantine_dir);
+    close(dirfd);
+    return -1;
+  }
+  return dirfd;
 }
 
 /* Fallback for quarantine_file()'s linkat() failing - see that
@@ -1638,7 +1696,8 @@ static int ensure_quarantine_dir(void) {
  * rather than a rename()-away one - linkat(fd, "", ..., AT_EMPTY_PATH)
  * cannot resurrect a fully unlinked inode even though the fd itself
  * is still perfectly valid). Copies the already-open `fd`'s content
- * into `dst`, reading through `fd` rather than re-opening a path, so
+ * into `name` inside the pinned quarantine directory `dirfd`, reading
+ * through `fd` rather than re-opening a path, so
  * this copy step itself reads the exact file that was scanned,
  * regardless of anything that may have happened to its original path
  * since - and regardless of which of the two cases above triggered
@@ -1646,12 +1705,12 @@ static int ensure_quarantine_dir(void) {
  * once, since removing-by-path is the one operation here that still
  * has to re-resolve a path name and can't be done purely through `fd`
  * (see quarantine_file()'s identity re-check that guards it). */
-static int copy_fd_to(int fd, const char *dst) {
+static int copy_fd_to_at(int fd, int dirfd, const char *name) {
   int out_fd;
   char buf[65536];
   ssize_t n;
   int ret = 0;
-  /* errno at the failure point: close()/unlink() below may clobber it,
+  /* errno at the failure point: close()/unlinkat() below may clobber it,
    * but the caller logs strerror(errno) right after we return (see the
    * copy-fallback branch in quarantine_file()), so restore this before
    * returning -1. */
@@ -1660,7 +1719,9 @@ static int copy_fd_to(int fd, const char *dst) {
   if (lseek(fd, 0, SEEK_SET) < 0)
     return -1;
 
-  out_fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  out_fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                O_CLOEXEC,
+                  0600);
   if (out_fd < 0)
     return -1;
 
@@ -1726,13 +1787,88 @@ static int copy_fd_to(int fd, const char *dst) {
   close(out_fd);
 
   if (ret != 0) {
-    unlink(dst); /* best-effort cleanup of the partial copy */
-    /* Restore the failure-point errno clobbered by close()/unlink(). */
+    unlinkat(dirfd, name, 0); /* best-effort cleanup of the partial copy */
+    /* Restore the failure-point errno clobbered by close()/unlinkat(). */
     if (saved_errno != 0)
       errno = saved_errno;
   }
 
   return ret;
+}
+
+/*
+ * Removes quarantine_file()'s original at `path`, but only while that
+ * name still refers to the inode `want` describes (the fstat() of the
+ * scanned fd). Returns 0 once it is removed, 1 when refused because the
+ * name is gone or now refers to another file, and -1 with errno set
+ * on any other failure.
+ *
+ * unlink() has no fd form, so this pins the parent directory instead:
+ * the identity check (fstatat) and the removal (unlinkat) both go
+ * through one O_PATH dirfd. Swapping any directory on `path` for a
+ * symlink, before or after the open(), can then only make the check
+ * fail. It can never send the unlink somewhere else. A path-based
+ * lstat()+unlink() pair could not promise that. Each call walked the
+ * whole path again, so an ancestor swapped in between let root remove
+ * a same-named file in an attacker-chosen directory (#231).
+ *
+ * What is left is a swap of the final name inside that one pinned
+ * directory, between fstatat() and unlinkat(). Only a user who can
+ * write to that directory can do that. They can only put in a file
+ * they could already link or rename there, and could therefore remove
+ * themselves: protected_hardlinks and the sticky bit stop them using
+ * anyone else's. Flags 0 never removes a directory.
+ */
+static int unlink_original_pinned(const char *path, const struct stat *want) {
+  char dir[PATH_MAX];
+  const char *slash = strrchr(path, '/');
+  const char *base;
+  struct stat st;
+  int dirfd;
+  int rc;
+  int saved_errno;
+
+  if (!slash) {
+    strcpy(dir, ".");
+    base = path;
+  } else {
+    size_t len = slash == path ? 1 : (size_t)(slash - path);
+
+    if (len >= sizeof(dir)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+    base = slash + 1;
+  }
+  if (!*base || !strcmp(base, ".") || !strcmp(base, "..")) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  dirfd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (dirfd < 0)
+    return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
+
+  if (fstatat(dirfd, base, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+    saved_errno = errno;
+    close(dirfd);
+    if (saved_errno == ENOENT)
+      return 1;
+    errno = saved_errno;
+    return -1;
+  }
+  if (st.st_dev != want->st_dev || st.st_ino != want->st_ino) {
+    close(dirfd);
+    return 1;
+  }
+
+  rc = unlinkat(dirfd, base, 0);
+  saved_errno = errno;
+  close(dirfd);
+  errno = saved_errno;
+  return rc == 0 ? 0 : -1;
 }
 
 /*
@@ -1772,18 +1908,16 @@ static int copy_fd_to(int fd, const char *dst) {
  * (ENOENT once `fd`'s link count hits zero - a real, not just
  * theoretical, case: an unlink()-then-replace race hits this, a
  * rename()-away-then-replace race doesn't, and an attacker doesn't
- * owe us a choice between the two). copy_fd_to() below is the
+ * owe us a choice between the two). copy_fd_to_at() below is the
  * fallback for any such failure, still reading through `fd` rather
  * than `path` either way. Once the quarantine copy exists (by
- * whichever route), removing the ORIGINAL by `path` is the one step left
- * that still has to re-walk it - unlink() has no fd-based equivalent
- * - so it gets a re-check-and-refuse immediately before it, comparing
- * the fd's true identity against a fresh lstat(). This is
- * risk-reduction, not elimination, for this one narrowed step - same
- * kind of tradeoff documented elsewhere in this codebase (see
- * Has_RWX_Segment's scope note) - but unlike the old design, a
- * mismatch here only means the original wasn't also cleaned up from
- * its old location, never that the wrong content got quarantined.
+ * whichever route), removing the ORIGINAL is the one step left that
+ * still goes by name - unlink() has no fd-based equivalent. It goes
+ * through unlink_original_pinned(), which checks the fd's identity and
+ * unlinks through the same pinned parent dirfd, so a directory swapped
+ * on `path` cannot redirect it. A mismatch only means the original
+ * wasn't also cleaned up from its old location, never that the wrong
+ * content got quarantined or a different file got removed.
  *
  * `rule_name`/`sha256_hex` (may be NULL/empty) are passed through only
  * for write_quarantine_meta()'s sidecar - purely informational, no
@@ -1791,20 +1925,26 @@ static int copy_fd_to(int fd, const char *dst) {
  */
 static void quarantine_file(int fd, const char *path, const char *rule_name,
                             const char *sha256_hex) {
+  /* `name` is the entry created through the pinned quarantine dirfd
+   * (link/copy/sidecar/chmod/cleanup all go through it, #231); `dest`
+   * is the same entry as a full path, for log messages only. */
   char dest[PATH_MAX];
+  char name[PATH_MAX];
   const char *base;
   struct timespec ts;
   struct stat fd_st;
   struct stat orig_st;
   bool have_orig_st;
   bool linked;
+  int qdirfd;
 
-  if (ensure_quarantine_dir() != 0)
+  qdirfd = open_quarantine_dir();
+  if (qdirfd < 0)
     return;
 
-  /* Captured before linkat()/chmod() below - once linkat() succeeds,
-   * `dest` is a second directory entry for fd's SAME inode (a
-   * hardlink, not a copy), so chmod(dest, 0000) further down would
+  /* Captured before linkat()/fchmodat() below - once linkat() succeeds,
+   * `name` is a second directory entry for fd's SAME inode (a
+   * hardlink, not a copy), so fchmodat(qdirfd, name, 0000) further down would
    * otherwise also be the last read of the original's own mode. This
    * is the one place in this function that needs the pre-quarantine
    * permissions, for write_quarantine_meta()'s restore record - not to
@@ -1824,37 +1964,53 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * monotonic-clock nanosecond reading is unique per call even if
    * two quarantines land in the same second. */
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  /* Fail closed on truncation: a silently-truncated dest would quarantine
-   * into the wrong directory entry (potentially outside quarantine_dir
-   * for a long attacker-influenced basename) with no error. */
+  /* Fail closed on truncation: a silently-truncated name would quarantine
+   * into the wrong directory entry with no error. `base` is
+   * attacker-influenced (the scanned file's own basename), so both the
+   * dirfd-relative name and the full display path are checked. */
   {
-    int dn = snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined",
-                        quarantine_dir, (int)getpid(), (long)ts.tv_sec,
-                        ts.tv_nsec, base);
-    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
-      fprintf(stderr, "avd: quarantine destination path would truncate - refusing\n");
+    int nn = snprintf(name, sizeof(name), "%d_%ld%09ld_%s.quarantined",
+                      (int)getpid(), (long)ts.tv_sec, ts.tv_nsec, base);
+    int dn;
+
+    if (nn < 0 || (size_t)nn >= sizeof(name)) {
+      fprintf(stderr, "avd: quarantine destination name would truncate - refusing\n");
+      close(qdirfd);
       return;
     }
+    dn = snprintf(dest, sizeof(dest), "%s/%s", quarantine_dir, name);
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      fprintf(stderr, "avd: quarantine destination path would truncate - refusing\n");
+      close(qdirfd);
+      return;
+    }
+    /* `name` holds no '/' (fixed fields plus `base`, and a basename by
+     * construction contains none), so the *at() calls below cannot
+     * leave the pinned directory no matter what `base` held. */
   }
 
-  linked = (linkat(fd, "", AT_FDCWD, dest, AT_EMPTY_PATH) == 0);
+  /* Through the pinned dirfd, not AT_FDCWD with a full path: the
+   * directory open_quarantine_dir() validated and the one entered here
+   * are the same open file description. */
+  linked = (linkat(fd, "", qdirfd, name, AT_EMPTY_PATH) == 0);
   if (!linked) {
     /* Fall back to the fd-based copy on ANY linkat failure, not just
-     * EXDEV - see copy_fd_to()'s comment for why ENOENT (source fully
+     * EXDEV - see copy_fd_to_at()'s comment for why ENOENT (source fully
      * unlinked, not just renamed away) is an equally real case here,
      * and the copy is correct regardless of which one triggered it. */
     int linkat_errno = errno;
 
-    if (copy_fd_to(fd, dest) != 0) {
+    if (copy_fd_to_at(fd, qdirfd, name) != 0) {
       fprintf(stderr,
               "avd: quarantine failed for \"%s\": linkat: %s; copy "
               "fallback: %s\n",
               path, strerror(linkat_errno), strerror(errno));
+      close(qdirfd);
       return;
     }
   }
 
-  /* Sidecar metadata written before the chmod(dest, 0000) below, and
+  /* Sidecar metadata written before the fchmodat(..., 0000) below, and
    * before the original is touched at all - the whole point of this
    * file is to survive even if a later step here fails, so the
    * quarantine stays restorable. Best-effort: a metadata write failure
@@ -1862,8 +2018,8 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * unrestorable-by-GUI quarantine is still a successful quarantine,
    * same "logging failure isn't a quarantine failure" stance as
    * everywhere else in this function. */
-  if (write_quarantine_meta(dest, have_orig_st ? &orig_st : NULL, path,
-                            rule_name, sha256_hex) != 0)
+  if (write_quarantine_meta(qdirfd, name, have_orig_st ? &orig_st : NULL,
+                            path, rule_name, sha256_hex) != 0)
     fprintf(stderr,
             "avd: could not write quarantine metadata for \"%s\" - restore "
             "via avctl will not be possible for this file\n",
@@ -1880,12 +2036,13 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * original in place - a worse but at least contained outcome for
    * this specific (essentially unreachable in practice: this is a
    * freshly-created file we just opened successfully) failure. */
-  if (chmod(dest, 0000) != 0) {
+  if (fchmodat(qdirfd, name, 0000, 0) != 0) {
     fprintf(stderr, "avd: quarantined \"%s\" to \"%s\" but chmod failed: %s "
             "- leaving the original in place rather than removing it "
             "without a locked-down copy to show for it\n",
             path, dest, strerror(errno));
-    unlink(dest);
+    unlinkat(qdirfd, name, 0);
+    close(qdirfd);
     return;
   }
 
@@ -1904,49 +2061,34 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
             "avd: quarantined \"%s\" to \"%s\", but refusing to remove the "
             "original - fstat on our own fd failed unexpectedly: %s\n",
             path, dest, strerror(errno));
+    close(qdirfd);
     return;
   }
 
-  {
-    struct stat now_st;
-
-    /* This lstat()-then-unlink() pair is not, and cannot be made,
-     * atomic through standard POSIX path-based syscalls - a swap
-     * landing in the gap between this check and unlink() below (as
-     * opposed to before it, which this check does catch) would still
-     * remove whatever now occupies `path` instead of the original.
-     * There is no portable "unlink iff this path still names inode X"
-     * primitive to close that with. The alternative - doing this
-     * removal from kernel space, where the already-resolved dentry
-     * from detection could be unlinked directly - is deliberately out
-     * of scope: see this file's top comment on why kernel-side
-     * rename()/unlink() is the riskier direction, not the safer one,
-     * for this codebase specifically. What's left is the same
-     * risk-reduction-not-elimination tradeoff as every other
-     * TOCTOU note in this codebase (see Has_RWX_Segment's scope
-     * note): this check narrows the race to the syscall gap right
-     * here instead of the whole scan-to-quarantine sequence, which is
-     * what it was worth fixing for - it was never going to make
-     * path-based removal provably atomic, and claiming otherwise
-     * would be the actual bug. */
-    if (lstat(path, &now_st) != 0 || now_st.st_dev != fd_st.st_dev ||
-        now_st.st_ino != fd_st.st_ino) {
-      fprintf(stderr,
-              "avd: quarantined \"%s\" to \"%s\", but refusing to remove "
-              "the original - path now resolves to a different file "
-              "(possible symlink swap); remove it manually if "
-              "appropriate\n",
-              path, dest);
-      return;
-    }
-  }
-
-  if (unlink(path) != 0)
-    fprintf(stderr, "avd: unlink of original \"%s\" failed: %s\n", path,
-            strerror(errno));
-  else
+  /* Removal is the one step here that has to go by name. It goes
+   * through a pinned parent dirfd and re-checks the fd's identity there
+   * - see unlink_original_pinned(). A mismatch means only that the
+   * original is not also removed from its old location; the
+   * quarantine copy above came from the fd either way. */
+  switch (unlink_original_pinned(path, &fd_st)) {
+  case 0:
     printf("avd: QUARANTINED \"%s\" -> \"%s\"%s\n", path, dest,
            linked ? "" : " (copy fallback)");
+    break;
+  case 1:
+    fprintf(stderr,
+            "avd: quarantined \"%s\" to \"%s\", but refusing to remove "
+            "the original - path now resolves to a different file "
+            "(possible symlink swap); remove it manually if "
+            "appropriate\n",
+            path, dest);
+    break;
+  default:
+    fprintf(stderr, "avd: unlink of original \"%s\" failed: %s\n", path,
+            strerror(errno));
+    break;
+  }
+  close(qdirfd);
 }
 
 /* ---- fanotify exec-permission enforcement: shared state (#176) ----
@@ -2367,11 +2509,25 @@ static void analyze_content(int fd, const char *path, const char *hash,
 #define AVD_PRIVSEP_CPU_SECONDS                                                \
   (AVD_PRIVSEP_MAX_SCANS * (AVD_PRIVSEP_SCAN_WAIT_MS / 1000 + 1))
 #define AVD_PRIVSEP_NOFILE 32
-/* RLIMIT_AS counts the compiled rules and corpora a worker inherits, and
- * libyara maps the scanned file whole, so the limit is "what the spawner had
- * when it was forked" plus this much. A larger file fails the mapping and
- * comes back inconclusive instead of being scanned. */
-#define AVD_PRIVSEP_AS_HEADROOM (2ULL << 30)
+/* A worker's RLIMIT_DATA is "the data the spawner had when it was forked"
+ * (the compiled rules and corpora every worker inherits) plus this much.
+ * RLIMIT_DATA counts memory a worker can actually fill, and not the read-only
+ * mapping of the scanned file that libyara makes whole, so a file of any size
+ * is scanned exactly as in process (this replaced an RLIMIT_AS headroom under
+ * which a file bigger than the headroom came back inconclusive). What the
+ * headroom bounds is what the scan itself allocates, and the one thing that
+ * grows with the input is libyara's ELF module: about 0.8 KiB per symbol, so a
+ * crafted symbol table of a few tens of MB can ask for GiB. A scan that runs
+ * out fails open (inconclusive), exactly as one that hits YARA's timeout does.
+ * Measured with the shipped rules: real binaries (a 75 MB Go executable, a
+ * 32 MB gcc) need under 100 MiB; 1M symbols need about 833 MiB. Set by
+ * AVD_PRIVSEP_DATA_HEADROOM_MB. The floor keeps a typo (say "1" for GiB) from
+ * making nearly every scan fail open; the helper rejects, it does not clamp. */
+#define AVD_PRIVSEP_DATA_HEADROOM_MB_DEFAULT 1024
+#define AVD_PRIVSEP_DATA_HEADROOM_MB_MIN 256
+#define AVD_PRIVSEP_DATA_HEADROOM_MB_MAX 65536
+static int privsep_data_headroom_mb = AVD_PRIVSEP_DATA_HEADROOM_MB_DEFAULT;
+static unsigned long long privsep_data_limit_mb; /* the limit workers got */
 
 /* Each scan thread holds one worker and a replacement can briefly coexist
  * with its predecessor, so the spawner's table must cover twice the pool. */
@@ -2442,8 +2598,10 @@ static void privsep_on_dead(void *ctx) {
   _exit(1);
 }
 
-/* Current virtual size of this process in bytes, 0 if it cannot be read. */
-static unsigned long long privsep_vmsize_bytes(void) {
+/* Private writable memory of this process in bytes (VmData), 0 if it cannot be
+ * read. This is the number the kernel checks RLIMIT_DATA against, and a forked
+ * worker starts with the same figure, so limit = this + headroom. */
+static unsigned long long privsep_vmdata_bytes(void) {
   FILE *f = fopen("/proc/self/status", "re");
   char line[256];
   unsigned long long kb = 0;
@@ -2451,7 +2609,7 @@ static unsigned long long privsep_vmsize_bytes(void) {
   if (!f)
     return 0;
   while (fgets(line, sizeof(line), f)) {
-    if (sscanf(line, "VmSize: %llu kB", &kb) == 1)
+    if (sscanf(line, "VmData: %llu kB", &kb) == 1)
       break;
     kb = 0;
   }
@@ -2465,7 +2623,9 @@ static unsigned long long privsep_vmsize_bytes(void) {
  * opened (it inherits nothing but its own channel). Returns 0 on success. */
 static int privsep_start(uid_t uid, gid_t gid) {
   struct ps_spawner_cfg cfg;
-  unsigned long long vm = privsep_vmsize_bytes();
+  unsigned long long vm = privsep_vmdata_bytes();
+  unsigned long long headroom = (unsigned long long)privsep_data_headroom_mb
+                                << 20;
   pid_t spawner_pid;
   int ctl_fd;
 
@@ -2474,8 +2634,10 @@ static int privsep_start(uid_t uid, gid_t gid) {
   cfg.harden.gid = gid;
   cfg.harden.ipc_fd = -1; /* filled in per worker */
   cfg.harden.log_fd = -1;
-  cfg.harden.as_bytes =
-      (rlim_t)(vm ? vm + AVD_PRIVSEP_AS_HEADROOM : 8ULL << 30);
+  /* If VmData cannot be read there is no base to add to, so use a flat limit
+   * that is generous rather than none. */
+  cfg.harden.data_bytes = (rlim_t)(vm ? vm + headroom : 8ULL << 30);
+  privsep_data_limit_mb = (unsigned long long)cfg.harden.data_bytes >> 20;
   cfg.harden.cpu_seconds = AVD_PRIVSEP_CPU_SECONDS;
   cfg.harden.nofile = AVD_PRIVSEP_NOFILE;
   cfg.scan = privsep_worker_scan;
@@ -2556,6 +2718,9 @@ static int privsep_start(uid_t uid, gid_t gid) {
   printf("avd: privilege separation on: scans run in workers as uid %u gid "
          "%u (spawner pid %d)\n",
          (unsigned)uid, (unsigned)gid, (int)spawner_pid);
+  printf("avd: privsep: worker data limit %llu MiB (inherited %llu MiB + "
+         "headroom %d MiB, AVD_PRIVSEP_DATA_HEADROOM_MB)\n",
+         privsep_data_limit_mb, vm >> 20, privsep_data_headroom_mb);
   return 0;
 }
 
@@ -2667,8 +2832,22 @@ static void analyze_in_worker(int fd, const char *path, const char *hash,
   }
 
   out->score = v.score;
-  if (v.inconclusive)
+  if (v.inconclusive) {
+    struct stat st;
+
     out->inconclusive = true;
+    /* The worker's own log output is discarded (it cannot write), and the
+     * reply carries no reason, so the cause is not known here. Name the
+     * likeliest one's inputs, so that an operator who finds a large file
+     * fail open can tell a memory limit from a timeout. */
+    if (fstat(fd, &st) == 0)
+      fprintf(stderr,
+              "avd: privsep: scan of \"%s\" inconclusive in the worker (file "
+              "%llu MiB, worker data limit %llu MiB; if the worker ran out of "
+              "memory, raise AVD_PRIVSEP_DATA_HEADROOM_MB)\n",
+              path, (unsigned long long)st.st_size >> 20,
+              privsep_data_limit_mb);
+  }
   if (v.verdict == PS_VERDICT_MALICIOUS) {
     out->verdict = AV_VERDICT_MALICIOUS;
     snprintf(out->rule_name, sizeof(out->rule_name), "%s", v.rule_name);
@@ -2824,9 +3003,50 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
                          out->rule_name, out->score, on_demand);
 }
 
-static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
-                                const char *sha256_hex) {
+/* Opens `p` for scanning: O_NONBLOCK + fstat/S_ISREG + clear-flag, same
+ * pattern as cmd_scan() below. Without O_NONBLOCK, opening a FIFO with no
+ * writer blocks this worker thread indefinitely - and these workers are
+ * the one shared pool every scan funnels through (kernel-triggered and
+ * control-socket on-demand alike), so one hung worker is a direct step
+ * toward starving the whole pool. The flag is cleared once the file is
+ * known-regular, where it has no read() effect anyway. Returns the fd
+ * with *st filled, or -1 with *what naming the step that failed (errno
+ * is meaningful for "open" and "prepare"). */
+static int open_scan_target(const char *p, struct stat *st, const char **what) {
+  int fd = open(p, O_RDONLY | O_NONBLOCK);
+
+  if (fd < 0) {
+    *what = "open";
+    return -1;
+  }
+  if (fstat(fd, st) != 0 || !S_ISREG(st->st_mode)) {
+    *what = "non-regular";
+    close(fd);
+    return -1;
+  }
+  if (fcntl(fd, F_SETFL, O_RDONLY) != 0) {
+    int saved = errno;
+
+    *what = "prepare";
+    close(fd);
+    errno = saved;
+    return -1;
+  }
+  return fd;
+}
+
+static bool scan_ident_matches(const struct stat *st,
+                               const struct scan_ident *id) {
+  return major(st->st_dev) == id->dev_major &&
+         minor(st->st_dev) == id->dev_minor && (uint64_t)st->st_ino == id->ino;
+}
+
+static void handle_scan_request(uint64_t reqid, uint32_t pid,
+                                const struct scan_ident *ident,
+                                const char *path, const char *sha256_hex) {
   struct scan_result result;
+  struct stat st;
+  const char *what = "";
   int fd;
 
   printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
@@ -2841,65 +3061,118 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
    * regardless of what happens to `path` afterward (deleted, renamed,
    * replaced with a symlink to something else - even during the scan
    * itself, which can take up to SCAN_TIMEOUT_SECS), so there's
-   * nothing left for an attacker to swap out from under it. This
-   * replaces the previous design's lstat-baseline-then-re-check-at-
-   * rename-time approach, which could only narrow that window, not
-   * close it. */
-  /* O_NONBLOCK + fstat() + S_ISREG + clear-flag: same pattern as cmd_scan()
-   * below. Without O_NONBLOCK, opening a FIFO with no writer blocks this
-   * worker thread indefinitely - and these workers are the one shared
-   * pool every scan funnels through now (kernel-triggered and
-   * control-socket on-demand alike), so one hung worker is a direct
-   * step toward starving the whole pool. With O_NONBLOCK the open
-   * succeeds immediately regardless, and the S_ISREG check rejects
-   * FIFOs and every other non-regular file before perform_scan() touches it. */
-  fd = open(path, O_RDONLY | O_NONBLOCK);
-  if (fd < 0) {
-    fprintf(stderr, "avd: could not open \"%s\" for scanning: %s\n", path,
-            strerror(errno));
-    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
-    return;
-  }
+   * nothing left for an attacker to swap out from under it.
+   *
+   * What the fd can't do by itself is prove that `path` still named
+   * the file the kernel hashed when this open() resolved it: the
+   * request is queued and answered asynchronously, so a rename between
+   * the exec and here would hand YARA/fuzzy/TLSH a decoy, and an unlink
+   * used to make the open fail and be answered CLEAN (issue #227). So
+   * the fd is only scanned if its st_dev/st_ino match what the kernel
+   * reports for the file it pinned and hashed. */
+  fd = open_scan_target(path, &st, &what);
 
-  {
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-      fprintf(stderr, "avd: skipping scan of non-regular file \"%s\"\n", path);
-      close(fd);
+  if (!ident->present) {
+    /* Kernel module predates the identity attributes (module/daemon
+     * version skew during an upgrade). It would also reject
+     * AV_VERDICT_UNAVAILABLE with -EINVAL, leaving every failed open
+     * to wait out DAEMON_TIMEOUT_MS, so keep the old by-path
+     * behaviour - including CLEAN when the open fails - for it. */
+    if (fd < 0) {
+      if (strcmp(what, "non-regular") == 0)
+        fprintf(stderr, "avd: skipping scan of non-regular file \"%s\"\n",
+                path);
+      else
+        fprintf(stderr, "avd: could not %s \"%s\" for scanning: %s\n",
+                what, path, strerror(errno));
       send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
       return;
     }
-    /* Clear O_NONBLOCK now that the file is known-regular (where the flag
-     * has no read() effect anyway) - keeps this fd behaving identically to
-     * every other scan path's plain O_RDONLY open from here on. */
-    if (fcntl(fd, F_SETFL, O_RDONLY) != 0) {
-      fprintf(stderr, "avd: could not prepare \"%s\" for scanning: %s\n", path,
-              strerror(errno));
+  } else {
+    if (fd >= 0 && !scan_ident_matches(&st, ident)) {
+      fprintf(stderr,
+              "avd: \"%s\" is now %u:%u ino %llu, not the %u:%u ino %llu "
+              "the kernel hashed - replaced since exec\n",
+              path, major(st.st_dev), minor(st.st_dev),
+              (unsigned long long)st.st_ino, ident->dev_major,
+              ident->dev_minor, (unsigned long long)ident->ino);
       close(fd);
-      send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
-      return;
+      fd = -1;
+    } else if (fd < 0 && strcmp(what, "non-regular") == 0) {
+      fprintf(stderr, "avd: \"%s\" is not a regular file\n", path);
+    } else if (fd < 0) {
+      fprintf(stderr, "avd: could not %s \"%s\" for scanning: %s\n", what,
+              path, strerror(errno));
     }
 
-    /* With fanotify enforcement active this exec was already held and
-     * judged by fan_run_task() moments ago (FAN_OPEN_EXEC_PERM fires in
-     * open_exec(), before security_bprm_check()), so the kernel's
-     * fallback request is answered from the verdict cache instead of
-     * scanning the same image twice. A miss (cache disabled, the
-     * fanotify verdict timed out, an unmarked filesystem) falls
-     * through to a normal scan. */
-    if (atomic_load(&fan_active)) {
-      uint8_t cached;
-      char cached_rule[AV_RULE_NAME_MAXLEN + 1];
+    /* Fallback: the exec'ing process's own image. mm->exe_file is the
+     * file the kernel exec'd whatever has since happened to its name
+     * (renamed, unlinked), so this reaches the hashed inode in the
+     * common evasion case of "exec, then immediately swap the path".
+     * It is only right once the exec has committed - for a script it
+     * names the interpreter, and before commit (or after a failed
+     * exec) it names the old image - so it is accepted only on the
+     * same identity match, never on trust. ptrace_may_access() gates
+     * the open: without CAP_SYS_PTRACE, which the unit and the privsep
+     * parent deliberately leave out, it only succeeds for a same-uid
+     * target whose capabilities are a subset of ours, so under the
+     * shipped unit this usually fails and the swap ends as UNAVAILABLE
+     * below (see docs/netlink-protocol.md, "Step 2 and capabilities"). */
+    if (fd < 0 && pid != 0) {
+      char exe[32];
 
-      if (fan_cache_lookup(&st, &cached, cached_rule, sizeof(cached_rule))) {
-        send_verdict(reqid, cached,
-                     cached == AV_VERDICT_MALICIOUS ? cached_rule : NULL);
+      snprintf(exe, sizeof(exe), "/proc/%u/exe", pid);
+      fd = open_scan_target(exe, &st, &what);
+      if (fd >= 0 && !scan_ident_matches(&st, ident)) {
         close(fd);
-        return;
+        fd = -1;
       }
+      if (fd >= 0)
+        printf("avd: scanning reqid=%llu via %s (path no longer names the "
+               "hashed file)\n",
+               (unsigned long long)reqid, exe);
+    }
+
+    if (fd < 0) {
+      /* Not CLEAN: we never saw the bytes the kernel hashed. The kernel
+       * applies its fail-open/fail-closed daemon policy to this, and
+       * logs it as event=unverified rather than event=clean. */
+      fprintf(stderr,
+              "avd: reqid=%llu: could not reach the file the kernel hashed "
+              "for \"%s\" - answering UNAVAILABLE\n",
+              (unsigned long long)reqid, path);
+      send_verdict(reqid, AV_VERDICT_UNAVAILABLE, NULL);
+      return;
     }
   }
 
+  /* With fanotify enforcement active this exec was already held and
+   * judged by fan_run_task() moments ago (FAN_OPEN_EXEC_PERM fires in
+   * open_exec(), before security_bprm_check()), so the kernel's
+   * fallback request is answered from the verdict cache instead of
+   * scanning the same image twice. A miss (cache disabled, the
+   * fanotify verdict timed out, an unmarked filesystem) falls
+   * through to a normal scan. `st` is the fd that passed the identity
+   * check above (or, for an old kernel, the by-path open), so a
+   * decoy's cached CLEAN can never answer for the hashed file. */
+  if (atomic_load(&fan_active)) {
+    uint8_t cached;
+    char cached_rule[AV_RULE_NAME_MAXLEN + 1];
+
+    if (fan_cache_lookup(&st, &cached, cached_rule, sizeof(cached_rule))) {
+      send_verdict(reqid, cached,
+                   cached == AV_VERDICT_MALICIOUS ? cached_rule : NULL);
+      close(fd);
+      return;
+    }
+  }
+
+  /* `path` is kept for logging/history even when scanning via
+   * /proc/<pid>/exe - it is what the operator knows the exec by.
+   * quarantine_file() is safe with that combination: it links the fd's
+   * inode into quarantine and only unlinks `path` after an lstat()
+   * re-check that its dev/ino still match the fd, which a swapped-in
+   * decoy fails, so the decoy is never removed. */
   perform_scan(fd, path, sha256_hex, pid, false, &result);
 
   if (send_verdict(reqid, result.verdict, result.rule_name) < 0)
@@ -2940,6 +3213,9 @@ static bool queue_push(struct scan_task *task, bool may_block) {
     return false;
   }
 
+  /* Enqueue timestamp for pending latency metrics (issue #105), taken
+   * after any wait for capacity so admission delay isn't counted. */
+  clock_gettime(CLOCK_MONOTONIC, &task->enqueue_time);
   if (queue_tail)
     queue_tail->next = task;
   else
@@ -2955,7 +3231,8 @@ static bool queue_push(struct scan_task *task, bool may_block) {
 /* Producer side (called only from msg_handler(), the netlink recv
  * thread). Copies the request into a heap task and pushes it - see
  * queue_push() for the full-queue behavior. */
-static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
+static bool enqueue_scan_task(uint64_t reqid, uint32_t pid,
+                              const struct scan_ident *ident, const char *path,
                               const char *sha256_hex) {
   struct scan_task *task = malloc(sizeof(*task));
 
@@ -2965,6 +3242,7 @@ static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
   task->on_demand = false;
   task->reqid = reqid;
   task->pid = pid;
+  task->ident = *ident;
   snprintf(task->path, sizeof(task->path), "%s", path ? path : "");
   snprintf(task->sha256_hex, sizeof(task->sha256_hex), "%s",
            sha256_hex ? sha256_hex : "");
@@ -2996,6 +3274,7 @@ static bool enqueue_ondemand_scan(int fd, const char *path,
   task->on_demand = true;
   task->reqid = 0;
   task->pid = 0;
+  memset(&task->ident, 0, sizeof(task->ident));
   snprintf(task->path, sizeof(task->path), "%s", path ? path : "");
   task->sha256_hex[0] = '\0';
   task->fd = fd;
@@ -3863,6 +4142,7 @@ static void *scan_worker_main(void *arg) {
   serve = serve_wait();
   for (;;) {
     struct scan_task *task;
+    struct timespec dequeue_time;
 
     pthread_mutex_lock(&queue_lock);
     while (!queue_head && !shutting_down)
@@ -3879,8 +4159,36 @@ static void *scan_worker_main(void *arg) {
       queue_tail = NULL;
     queue_len--;
     scan_in_flight++;
+    /* Sample the clock while still holding queue_lock: reading it after
+     * unlocking can include time the worker was descheduled, inflating
+     * the reported queue latency. */
+    clock_gettime(CLOCK_MONOTONIC, &dequeue_time);
     pthread_cond_signal(&queue_not_full);
     pthread_mutex_unlock(&queue_lock);
+
+    /* Record pending latency: time from enqueue to dequeue (issue #105).
+     * The clock was sampled at dequeue, under queue_lock; the arithmetic
+     * below does not need the lock and can run afterwards. */
+    {
+      int64_t pending_ms;
+
+      /* Same borrow-one-second logic as scan_time in perform_scan(). */
+      pending_ms = (int64_t)(dequeue_time.tv_sec - task->enqueue_time.tv_sec) * 1000;
+      if (dequeue_time.tv_nsec < task->enqueue_time.tv_nsec)
+        pending_ms -= 1000;
+      pending_ms += (dequeue_time.tv_nsec - task->enqueue_time.tv_nsec +
+                     (dequeue_time.tv_nsec < task->enqueue_time.tv_nsec ? 1000000000L : 0)) /
+                    1000000L;
+      if (pending_ms < 0)
+        pending_ms = 0;
+
+      pthread_mutex_lock(&metrics_lock);
+      pending_count++;
+      pending_time_total_ms += (uint64_t)pending_ms;
+      if ((uint64_t)pending_ms > pending_time_max_ms)
+        pending_time_max_ms = (uint64_t)pending_ms;
+      pthread_mutex_unlock(&metrics_lock);
+    }
 
     if (!serve) {
       if (task->fan) {
@@ -3942,7 +4250,7 @@ static void *scan_worker_main(void *arg) {
       continue;
     }
 
-    handle_scan_request(task->reqid, task->pid, task->path,
+    handle_scan_request(task->reqid, task->pid, &task->ident, task->path,
                         task->sha256_hex);
     pthread_mutex_lock(&queue_lock);
     scan_in_flight--;
@@ -3968,6 +4276,9 @@ static struct nla_policy av_policy[AV_A_MAX + 1] = {
     [AV_A_PID] = {.type = NLA_U32},
     [AV_A_PATH] = {.type = NLA_STRING, .maxlen = AV_PATH_ATTR_MAXLEN},
     [AV_A_SHA256] = {.type = NLA_STRING, .maxlen = AV_SHA256_ATTR_MAXLEN + 1},
+    [AV_A_DEV_MAJOR] = {.type = NLA_U32},
+    [AV_A_DEV_MINOR] = {.type = NLA_U32},
+    [AV_A_INO] = {.type = NLA_U64},
 };
 
 static int msg_handler(struct nl_msg *msg, void *arg) {
@@ -4025,9 +4336,18 @@ static int msg_handler(struct nl_msg *msg, void *arg) {
       fprintf(stderr, "avd: malformed SCAN_REQUEST (missing attrs)\n");
       return NL_SKIP;
     }
+    /* All three or none: a partial set is treated as an old kernel
+     * rather than matched against a half-filled identity. */
+    struct scan_ident ident = {0};
+    if (attrs[AV_A_DEV_MAJOR] && attrs[AV_A_DEV_MINOR] && attrs[AV_A_INO]) {
+      ident.present = true;
+      ident.dev_major = nla_get_u32(attrs[AV_A_DEV_MAJOR]);
+      ident.dev_minor = nla_get_u32(attrs[AV_A_DEV_MINOR]);
+      ident.ino = nla_get_u64(attrs[AV_A_INO]);
+    }
     if (!enqueue_scan_task(
             nla_get_u64(attrs[AV_A_REQID]),
-            attrs[AV_A_PID] ? nla_get_u32(attrs[AV_A_PID]) : 0,
+            attrs[AV_A_PID] ? nla_get_u32(attrs[AV_A_PID]) : 0, &ident,
             nla_get_string(attrs[AV_A_PATH]),
             attrs[AV_A_SHA256] ? nla_get_string(attrs[AV_A_SHA256]) : ""))
       fprintf(stderr,
@@ -4118,6 +4438,7 @@ static void cmd_status(int fd) {
    * scan_threads, so field indices 0-5 are byte-stable for existing
    * parsers (notably tests/test_avd_socket.sh's $5 queueing poll). */
   uint64_t total, malicious, time_total, time_max, last_ms, avg_ms;
+  uint64_t pending_total, pending_max, pending_avg_ms, pending_count_snap;
   uint64_t f_events, f_hits, f_denied, f_fallbacks;
 
   pthread_mutex_lock(&queue_lock);
@@ -4130,27 +4451,34 @@ static void cmd_status(int fd) {
   time_total = scan_time_total_ms;
   time_max = scan_time_max_ms;
   last_ms = last_scan_ms;
+  pending_total = pending_time_total_ms;
+  pending_max = pending_time_max_ms;
+  pending_count_snap = pending_count;
   f_events = fan_events_total;
   f_hits = fan_cache_hits;
   f_denied = fan_denied;
   f_fallbacks = fan_fallbacks;
   pthread_mutex_unlock(&metrics_lock);
   avg_ms = total ? time_total / total : 0;
+  pending_avg_ms = pending_count_snap ? pending_total / pending_count_snap : 0;
 
   write_all(fd, "OK\n", 3);
   write_all(fd, "COUNT 1\n", 8);
   /* fanotify fields (#176) appended after last_scan_ms for the same
-   * byte-stability reason as the scan metrics above. */
+   * byte-stability reason as the scan metrics above. Pending latency
+   * metrics (issue #105) appended after fan_fallbacks for the same reason. */
   snprintf(row, sizeof(row),
            "%ld\t%d\t%zu\t%zu\t%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu"
-           "\t%d\t%llu\t%llu\t%llu\t%llu\n",
+           "\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
            (long)(time(NULL) - start_time), compiled_rules ? 1 : 0,
            fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads,
            (unsigned long long)total, (unsigned long long)malicious,
            (unsigned long long)avg_ms, (unsigned long long)time_max,
            (unsigned long long)last_ms, atomic_load(&fan_active) ? 1 : 0,
            (unsigned long long)f_events, (unsigned long long)f_hits,
-           (unsigned long long)f_denied, (unsigned long long)f_fallbacks);
+           (unsigned long long)f_denied, (unsigned long long)f_fallbacks,
+           (unsigned long long)pending_total, (unsigned long long)pending_max,
+           (unsigned long long)pending_avg_ms);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
 }
@@ -4441,16 +4769,27 @@ static void cmd_quarantine_restore(int fd, const char *id) {
               "will be restored under avd's own uid/gid instead)\n",
               dest, strerror(errno));
 
-    if (rename(dest, meta.original_path) != 0) {
-      /* Leave it chmod'd/chown'd back to original but still under
-       * quarantine_dir rather than deleting the .meta - the operator
-       * can still recover it manually (e.g. the two directories are
-       * on different filesystems), and losing the recovery record
-       * here would be strictly worse than a restore that has to be
-       * retried. */
+    /* RENAME_NOREPLACE: close the lstat()-then-rename() TOCTOU window
+     * above. The lstat() check is only advisory - something can occupy
+     * meta.original_path between it and here - and a plain rename()
+     * would silently clobber that occupant. renameat2() with
+     * RENAME_NOREPLACE makes the kernel refuse (EEXIST) instead, so a
+     * concurrent creation can never be overwritten. On failure the file
+     * stays at dest (quarantine); re-lock it to mode 0000 through qfd
+     * below so any surviving hard link to the inode cannot be reached
+     * with the restored permissions, while keeping the quarantine entry
+     * and .meta in place for manual recovery. */
+    if (renameat2(AT_FDCWD, dest, AT_FDCWD, meta.original_path,
+                  RENAME_NOREPLACE) != 0) {
+      int saved_errno = errno;
+      if (fchmod(qfd, 0000) != 0)
+        fprintf(stderr, "avd: quarantine restore: could not re-lock \"%s\": %s\n", dest, strerror(errno));
       close(qfd);
-      send_err(fd, "rename failed (different filesystem? check "
-                  "/var/lib/av-quarantine manually)");
+      if (saved_errno == EEXIST)
+        send_err(fd, "original path is occupied - move or remove it first");
+      else
+        send_err(fd, "rename failed (different filesystem? check "
+                    "/var/lib/av-quarantine manually)");
       return;
     }
     close(qfd);
@@ -4831,7 +5170,7 @@ static void *control_conn_main(void *arg) {
 }
 
 /* Best-effort mkdir of `path`'s parent directory - mirrors
- * ensure_quarantine_dir()'s stance (not fatal if it already exists,
+ * open_quarantine_dir()'s stance (not fatal if it already exists,
  * loud if it can't be created for some other reason). Needed for
  * manual/test runs of avd outside systemd; under avd.service,
  * RuntimeDirectory=avd already creates /run/avd before avd starts, so
@@ -4855,7 +5194,7 @@ static int ensure_parent_dir(const char *path, mode_t mode) {
             strerror(errno));
     return -1;
   }
-  /* Same gate as ensure_quarantine_dir(), over the whole ancestor
+  /* Same gate as open_quarantine_dir(), over the whole ancestor
    * chain: a pre-existing parent that an unprivileged user can modify
    * must not be silently accepted as "directory already exists" -
    * they could replace the socket between the bind() below and its
@@ -5179,7 +5518,7 @@ int main(int argc, char **argv) {
    * argv/env overrides legitimately point outside the production
    * prefixes - the test suite's throwaway dirs live under /tmp - so
    * the trusted-directory gate (ownership + no unprivileged write in
-   * ensure_quarantine_dir()/ensure_parent_dir()) is what constrains
+   * open_quarantine_dir()/ensure_parent_dir()) is what constrains
    * attacker influence instead of a prefix list that would break those
    * supported overrides. */
   if (!quarantine_dir[0] || quarantine_dir[0] != '/') {
@@ -5230,6 +5569,9 @@ int main(int argc, char **argv) {
 
     privsep_requested = ps_env && strcmp(ps_env, "1") == 0;
   }
+  privsep_data_headroom_mb = parse_tunable_env(
+      "AVD_PRIVSEP_DATA_HEADROOM_MB", AVD_PRIVSEP_DATA_HEADROOM_MB_DEFAULT,
+      AVD_PRIVSEP_DATA_HEADROOM_MB_MIN, AVD_PRIVSEP_DATA_HEADROOM_MB_MAX);
   /* Unset or "kill": enforce. "log": log what the filter would have killed
    * and let it through. Anything else is refused, so a typo cannot quietly
    * leave the filter in a mode nobody asked for. */

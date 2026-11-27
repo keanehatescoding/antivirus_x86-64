@@ -112,8 +112,9 @@ def status():
     on daemons new enough to report them - scans_total,
     scans_malicious, scan_avg_ms, scan_max_ms, last_scan_ms, and then
     fanotify_active, fan_events, fan_cache_hits, fan_denied,
-    fan_fallbacks (all int). Accepts the 6-field row (oldest avd), the
-    11-field row and the 16-field row: each group was appended, never
+    fan_fallbacks (all int), and then pending_time_total_ms,
+    pending_time_max_ms, pending_avg_ms (queue wait, int). Accepts the
+    6-, 11-, 16- and 19-field rows: each group was appended, never
     inserted, so positional parsing of the earlier fields is stable."""
     rows = _parse_rows(_request("STATUS"))
     if len(rows) != 1:
@@ -130,10 +131,14 @@ def status():
         "fanotify_active", "fan_events", "fan_cache_hits", "fan_denied",
         "fan_fallbacks",
     ]
+    pending_keys = [
+        "pending_time_total_ms", "pending_time_max_ms", "pending_avg_ms",
+    ]
     shapes = [
         base_keys,
         base_keys + metric_keys,
         base_keys + metric_keys + fan_keys,
+        base_keys + metric_keys + fan_keys + pending_keys,
     ]
     fields = rows[0]
     keys = next((k for k in shapes if len(k) == len(fields)), None)

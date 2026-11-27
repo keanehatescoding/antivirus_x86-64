@@ -65,6 +65,7 @@
 #include <linux/binfmts.h>
 #include <linux/crypto.h>
 #include <linux/dcache.h>
+#include <linux/delay.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -74,6 +75,7 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/pid.h>
@@ -160,6 +162,20 @@
 static struct kprobe kp_bprm_check = {
     .symbol_name = AV_EXEC_HOOK_SYMBOL,
 };
+/* Self-delete detection on exec identity (#230): the commit point of an
+ * exec, and the two places a name is removed. All three are
+ * CONFIG_SECURITY entry points with signatures unchanged across every
+ * supported kernel, like security_bprm_check(). Probed rather than
+ * registered as LSM hooks because modules cannot register LSM hooks. */
+static struct kprobe kp_bprm_committing = {
+    .symbol_name = "security_bprm_committing_creds",
+};
+static struct kprobe kp_inode_unlink = {
+    .symbol_name = "security_inode_unlink",
+};
+static struct kprobe kp_inode_rename = {
+    .symbol_name = "security_inode_rename",
+};
 static struct kprobe kp_openat = {
     .symbol_name = "__x64_sys_openat",
 };
@@ -207,6 +223,18 @@ static struct workqueue_struct *av_wq;
  * non-exec traffic is quiet, it just can't be shut out entirely. */
 #define AV_EXEC_RESERVED_WORK 512
 static atomic_t av_inflight_work = ATOMIC_INIT(0);
+/* A separate budget for matched self-delete reports (see
+ * schedule_selfdel_work()), not a slice of av_inflight_work. A process
+ * whose image is already staged can have exec work filling
+ * AV_MAX_INFLIGHT_WORK around it, and admitting its report from that
+ * budget would drop the unlink or rename it was matched on, letting it
+ * remove its own image with no report and no kill. A match is rare (each
+ * one ends the process), so this stays small; what it bounds is the
+ * PATH_MAX buffer every item carries. It still has to be a bound: a
+ * process the kill is suppressed for (a protected exe) can repeat the
+ * attempt, and so can one that keeps going until the kill lands. */
+#define AV_MAX_INFLIGHT_SELFDEL 256
+static atomic_t av_inflight_selfdel = ATOMIC_INIT(0);
 
 /* Workqueue concurrency cap - see the comment beside its use in
  * av_init() below. A module param (not just a compile-time constant)
@@ -235,6 +263,31 @@ static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
 module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
                  "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
+
+/* TEST-ONLY: parks every deferred exec work item for this many ms
+ * before it looks at the file at all (d_path() and the hash), so
+ * tests/test_netlink.sh can rename or unlink the exec'd pathname while
+ * the request is still in flight and prove that avd scans the file the
+ * kernel hashed, not whatever the path names by then (issue #227), and
+ * the QEMU boot test can unlink an image before d_path() runs and
+ * prove the self-delete kill does not wait for this work item. The
+ * hash itself reads the pinned
+ * bprm->file, so the delay cannot change what is hashed - only how
+ * late avd gets to open the path. Ported from the arm64 tree, where
+ * the same knob drives the QEMU boot test's exec-time TOCTOU cases.
+ *
+ * Default 0 = disabled, so every production configuration is byte-for-byte
+ * unaffected (the sleep is not even entered). Writable (0644) so the test
+ * can enable it around its cases and clear it again via
+ * /sys/module/av/parameters/av_toctou_test_delay_ms; read once per work
+ * item and clamped, so a concurrent out-of-range write can never turn it
+ * into an unbounded sleep. The _test_ infix marks it as never an
+ * operational knob. */
+#define AV_TOCTOU_TEST_DELAY_MAX_MS 2000
+static int av_toctou_test_delay_ms; /* = 0: disabled unless a test sets it */
+module_param(av_toctou_test_delay_ms, int, 0644);
+MODULE_PARM_DESC(av_toctou_test_delay_ms,
+                 "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -265,6 +318,21 @@ static inline bool av_work_admit_nonexec(void) {
 
 static inline void av_work_release(void) {
   atomic_dec(&av_inflight_work);
+}
+
+/* Same contract as av_work_admit(), against the self-delete budget only:
+ * paired with exactly one av_selfdel_release() on every path after a true
+ * return. */
+static inline bool av_selfdel_admit(void) {
+  if (atomic_inc_return(&av_inflight_selfdel) > AV_MAX_INFLIGHT_SELFDEL) {
+    atomic_dec(&av_inflight_selfdel);
+    return false;
+  }
+  return true;
+}
+
+static inline void av_selfdel_release(void) {
+  atomic_dec(&av_inflight_selfdel);
 }
 
 /* Resolves a syscall's `dfd` argument into a struct path suitable as
@@ -317,8 +385,8 @@ static bool resolve_dfd_path(int dfd, struct path *out) {
  * filesystem or resolves symlinks. Its only job is making two
  * differently-spelled-but-lexically-identical paths (e.g.
  * "/cwd/./foo" and "/cwd/foo") compare equal via strcmp() - see the
- * self-delete correlation in behavior.c and the prefix/substring
- * matching referenced in resolve_absolute_path()'s comment below,
+ * prefix/substring matching referenced in resolve_absolute_path()'s
+ * comment below,
  * which this now actually delivers on. A ".." that would walk above
  * the leading "/" is dropped rather than treated as an error - same
  * as normal path semantics ("/.." collapses to "/"). On allocation
@@ -350,11 +418,11 @@ static void normalize_abs_path(char *path, size_t path_len) {
        * dropping the excess would collapse two genuinely different
        * deep paths onto the same normalized string (e.g. two
        * distinct files under a shared >128-component prefix), which
-       * downstream self-delete/trust checks treat as identity via
-       * strcmp. Bail out instead of producing a lossy, potentially
-       * colliding result - leave `path` untouched (still the
-       * original, un-normalized string) so callers compare the real
-       * path rather than a truncated stand-in. */
+       * downstream path checks (sensitive-path, rename/write-open
+       * dedup) compare by string. Bail out instead of producing a
+       * lossy, potentially colliding result - leave `path` untouched
+       * (still the original, un-normalized string) so callers compare
+       * the real path rather than a truncated stand-in. */
       overflowed = true;
       break;
     }
@@ -393,8 +461,8 @@ static void normalize_abs_path(char *path, size_t path_len) {
  * to its absolute path via d_path() and string-concatenates the
  * (still possibly containing "." / ".." components) relative
  * remainder onto it. That's sufficient for behavior.c's prefix/
- * substring matching and exec_path self-delete comparison once
- * normalize_abs_path() (below) collapses those components - lexical
+ * substring matching once normalize_abs_path() (below) collapses
+ * those components - lexical
  * normalization only, not a canonical realpath() (no symlink
  * resolution, no filesystem access to confirm anything exists). On any
  * failure this falls back to copying `path` through unresolved rather
@@ -426,18 +494,18 @@ static void resolve_absolute_path(const char *path, const struct path *base,
      * silent truncation the assignment-and-move-on version above
      * couldn't. Two distinct, deeply-nested files whose combined
      * dirpath+path exceeds out_len would otherwise truncate to the
-     * identical string, which self-delete correlation (a plain
-     * strcmp() on this output) would then treat as the same file -
+     * identical string, which any strcmp() on this output would
+     * then treat as the same file -
      * same lossy-result-is-dangerous reasoning as normalize_abs_path()'s
      * own >128-component bail-out above. Falling back to the
      * unresolved relative path (not absolute, but not truncated
      * either) matches this function's existing degraded-not-dropped
      * fallback stance for the d_path() failure case just above - it
      * doesn't fully rule out a collision between two different
-     * fallback results, which is why av_behavior_check_unlink() in
-     * behavior.c separately requires both sides of its self-delete
-     * comparison to start with '/' before trusting a match; this
-     * fallback deliberately never produces that.
+     * fallback results. (Self-delete correlation, the one caller that
+     * used to compare two of these with strcmp(), now matches on the
+     * resolved dentry instead - see struct av_exec_ident in
+     * behavior.c.)
      *
      * Known, accepted tradeoff: path_is_sensitive() in behavior.c
      * also runs against this output, and its "/boot/" prefix check
@@ -514,7 +582,7 @@ struct algo_ctx {
  * the signature match AND the daemon scan with no verdict and no log
  * line at all - a silent, complete fail-open. Allocating once at load
  * moves that failure to module-load time, where it is loud (pr_err,
- * and fatal for SHA-256: self-delete correlation and the daemon scan
+ * and fatal for SHA-256: the trusted-hash lookup and the daemon scan
  * key on it unconditionally, so loading without it would silently
  * degrade every exec to "no hash at all").
  *
@@ -613,7 +681,7 @@ static int hash_file_multi(struct file *f, struct av_digest *out,
                            struct av_file_identity *ident_out) {
   u8 md5_bin[16], sha1_bin[20], sha256_bin[32];
   /* SHA-256 is always computed - av_behavior_record_exec()'s
-   * self-delete correlation and the netlink scan request to avd
+   * trusted-hash lookup and the netlink scan request to avd
    * both key on it unconditionally, regardless of what the sigtable
    * holds. MD5/SHA-1 exist purely to match against sigtable entries
    * of that algo, so skip computing them when the sigtable holds
@@ -935,6 +1003,36 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
   kfree(esc_path);
 }
 
+/* Releases everything an av_work holds. */
+static void av_work_free(struct av_work *aw) {
+  fput(aw->file);
+  put_pid(aw->target_pid);
+  kfree(aw);
+  av_work_release();
+}
+
+/* Identity of the pinned exec file in the form userspace fstat() reports
+ * it, for the daemon's "is this still the file the kernel hashed" check
+ * (issue #227). Deliberately vfs_getattr() rather than inode->i_sb->s_dev/
+ * i_ino (what av_file_identity carries for logging): btrfs subvolumes and
+ * overlayfs report a different st_dev/st_ino through ->getattr than the
+ * raw inode fields, and a mismatch there would make avd refuse every
+ * legitimate exec on those filesystems. Returns false when getattr
+ * fails. The daemon is then not asked at all: an identity-free request
+ * is avd's compatibility mode for pre-#227 modules, which scans
+ * whatever the path names now, so av_work_fn() treats the exec as
+ * unverified instead (fail-closed kills, fail-open logs it). */
+static bool av_scan_ident_of(struct file *file, struct av_scan_ident *out) {
+  struct kstat st;
+
+  if (vfs_getattr(&file->f_path, &st, STATX_INO, AT_STATX_SYNC_AS_STAT))
+    return false;
+  out->dev_major = MAJOR(st.dev);
+  out->dev_minor = MINOR(st.dev);
+  out->ino = st.ino;
+  return true;
+}
+
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
  * GFP_KERNEL. This is where all "heavy" work happens.
  *
@@ -959,21 +1057,38 @@ static void av_work_fn(struct work_struct *w) {
   char *esc_path;
   int ret;
 
-  /* Recorded as this process's exec_path (for the unlink hook's
-   * self-delete comparison, av_behavior_check_unlink()) and used in
-   * every log line below. d_path() of the kernel's own resolved
-   * f_path: absolute, with symlinks already followed (so a
-   * /usr/bin/python symlink exec records the real target's path),
-   * and " (deleted)"-suffixed if the file was unlinked after the
-   * exec opened it. A d_path() failure leaves an empty string, which
-   * av_behavior_check_unlink() never matches (it requires a leading
-   * '/'), rather than a misleading partial path. */
+  /* TEST-ONLY delay (see av_toctou_test_delay_ms): a no-op whenever the
+   * knob is at its default 0, i.e. in every production configuration.
+   * Placed before this work item looks at the file at all - the
+   * d_path() below and the hash - so a test can rename or unlink the
+   * pathname while it is parked. The request then carries the
+   * " (deleted)" form d_path() gives an unlinked image, which avd
+   * cannot open either, so #227's UNAVAILABLE answer is unchanged.
+   * The self-delete check does not depend on this record at all (it
+   * matches on the dentry, from the exec-time kprobe). Read once and
+   * clamped so a
+   * racing sysfs write of a bogus value cannot stall a worker
+   * indefinitely. */
+  {
+    int delay_ms = READ_ONCE(av_toctou_test_delay_ms);
+
+    if (delay_ms > 0) {
+      if (delay_ms > AV_TOCTOU_TEST_DELAY_MAX_MS)
+        delay_ms = AV_TOCTOU_TEST_DELAY_MAX_MS;
+      msleep(delay_ms);
+    }
+  }
+
+  /* d_path() of the kernel's own resolved f_path, used in every log
+   * line below and recorded as this process's exec_path, which the
+   * self-delete report prefers for its log line. Absolute, with
+   * symlinks already followed (a /usr/bin/python symlink exec records
+   * the real target's path), and " (deleted)"-suffixed if the file was
+   * unlinked after the exec opened it. A d_path() failure leaves an
+   * empty string rather than a misleading partial path. */
   abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!abs_path) {
-    fput(aw->file);
-    put_pid(aw->target_pid);
-    kfree(aw);
-    av_work_release();
+    av_work_free(aw);
     return;
   }
   {
@@ -984,7 +1099,6 @@ static void av_work_fn(struct work_struct *w) {
     else
       memmove(abs_path, p, strlen(p) + 1);
   }
-
   ret = hash_file_multi(aw->file, &digest, &ident);
   if (ret) {
     /* A hash failure skips both the signature match and the daemon
@@ -1017,7 +1131,8 @@ static void av_work_fn(struct work_struct *w) {
    * immediately it'll never reach the unlink hook anyway, and this
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
-  av_behavior_record_exec(aw->tgid, abs_path, digest.sha256, aw->start_time);
+  av_behavior_record_exec(aw->tgid, abs_path, aw->file->f_path.dentry,
+                          digest.sha256, aw->start_time);
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
     snprintf(reason, sizeof(reason), "signature:%s", sig_name);
@@ -1033,14 +1148,53 @@ static void av_work_fn(struct work_struct *w) {
   {
     int verdict = AV_VERDICT_CLEAN;
     char rule_name[AV_RULE_NAME_MAXLEN + 1] = "";
+    struct av_scan_ident sid;
+    bool have_sid = av_scan_ident_of(aw->file, &sid);
     int nl_ret;
 
-    nl_ret = av_netlink_scan_request(
-        abs_path, digest.sha256, pid_nr(aw->target_pid), &verdict, rule_name,
-        sizeof(rule_name), DAEMON_TIMEOUT_MS);
+    if (have_sid) {
+      nl_ret = av_netlink_scan_request(
+          abs_path, digest.sha256, pid_nr(aw->target_pid), &sid, &verdict,
+          rule_name, sizeof(rule_name), DAEMON_TIMEOUT_MS);
+    } else {
+      /* We hashed the pinned file but can't name it to avd, which
+       * could then only scan whatever the path names now - or answer
+       * CLEAN if it names nothing. Don't ask: take the same "no
+       * verdict for the hashed file" branch as an UNAVAILABLE reply,
+       * so aw->fail_closed decides, never a by-path scan. */
+      nl_ret = 0;
+      verdict = AV_VERDICT_UNAVAILABLE;
+    }
     if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
       snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
       av_kill(aw->target_pid, abs_path, "daemon", reason, &ident);
+    } else if (nl_ret == 0 && verdict == AV_VERDICT_UNAVAILABLE) {
+      /* No verdict for the inode we hashed. Either avd answered
+       * UNAVAILABLE - the path names a different file now
+       * (rename-swap) or nothing (unlink), and /proc/<pid>/exe didn't
+       * lead back to it either (issue #227) - or vfs_getattr() failed
+       * and avd was never asked (have_sid above). That is "no
+       * verdict", not "clean" - same policy as a timeout
+       * (aw->fail_closed, captured at kprobe time), but logged
+       * distinctly at warn because a swap in this window is exactly
+       * what an evasion attempt looks like. */
+      if (aw->fail_closed) {
+        av_kill(aw->target_pid, abs_path, "fail-closed",
+                have_sid ? "daemon-unavailable" : "identity-unavailable",
+                &ident);
+      } else {
+        esc_path = av_log_escape(abs_path, GFP_KERNEL);
+        pr_warn_ratelimited("kernel-av: event=unverified type=daemon "
+                            "path=\"%s\" pid=%d sha256=%s dev=%u:%u ino=%lu "
+                            "(%s)\n",
+                            av_log_str(esc_path), pid_nr(aw->target_pid),
+                            digest.sha256, MAJOR(ident.dev), MINOR(ident.dev),
+                            ident.ino,
+                            have_sid ? "daemon could not open the hashed file"
+                                     : "could not read the hashed file's "
+                                       "identity; daemon not asked");
+        kfree(esc_path);
+      }
     } else if (nl_ret == 0) {
       /* pr_info_ratelimited, not plain pr_info: this fires for
        * every exec that reaches the daemon path (i.e. every
@@ -1091,10 +1245,7 @@ static void av_work_fn(struct work_struct *w) {
 
 out:
   kfree(abs_path);
-  fput(aw->file);
-  put_pid(aw->target_pid);
-  kfree(aw);
-  av_work_release();
+  av_work_free(aw);
 }
 
 /* Atomic context - the ONLY things allowed here: taking references,
@@ -1121,9 +1272,8 @@ out:
  * bprm->file = /bin/sh. Only the first level is scanned, matching the
  * old syscall-entry hook, which saw only the path passed to execve().
  * Scanning the interpreter too would hash /bin/sh on every script
- * exec, and av_behavior_record_exec() would overwrite the script's
- * exec_path with the interpreter's, breaking self-delete correlation
- * for scripts. alloc_bprm() sets bprm->interp = bprm->filename, and
+ * exec, and the self-delete identity would become the interpreter's
+ * instead of the script's. alloc_bprm() sets bprm->interp = bprm->filename, and
  * only bprm_change_interp() (binfmt_script, binfmt_misc) repoints
  * interp, so pointer equality identifies the first level. */
 static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
@@ -1135,6 +1285,11 @@ static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
     return 0;
   if (bprm->interp != bprm->filename)
     return 0;
+
+  /* Before the work budget check: the identity is a cheap, bounded
+   * record of its own, and an exec flood that exhausts the budget must
+   * not also blind the self-delete check for that exec. */
+  av_behavior_exec_ident_stage(bprm->file);
 
   if (!av_work_admit())
     return 0;
@@ -1153,6 +1308,161 @@ static int handler_pre_bprm_check(struct kprobe *p, struct pt_regs *regs) {
   INIT_WORK(&aw->work, av_work_fn);
   queue_work(av_wq, &aw->work);
 
+  return 0;
+}
+
+/* Probes security_bprm_committing_creds(), which begin_new_exec()
+ * calls once per exec, after the point of no return. It promotes
+ * whatever handler_pre_bprm_check() staged for this thread group to the
+ * identity of the image now running (see struct av_exec_ident in
+ * behavior.c for why staging and committing are separate). No argument
+ * is needed: it promotes whatever handler_pre_bprm_check() staged. Atomic
+ * context, like every pre-handler here. */
+/* cppcheck-suppress constParameterCallback */
+static int handler_pre_bprm_committing(struct kprobe *p, struct pt_regs *regs) {
+  av_behavior_exec_ident_commit();
+  return 0;
+}
+
+/* ---- self-delete: security_inode_unlink / security_inode_rename ---- */
+
+struct av_selfdel_work {
+  struct work_struct work;
+  struct pid *target_pid;
+  pid_t tgid;
+  const struct dentry *cookie; /* compared, never dereferenced */
+  bool overwrite;              /* rename over the image, not unlink */
+  char *path;                  /* PATH_MAX, dentry_path_raw() fallback */
+};
+
+static void av_selfdel_work_fn(struct work_struct *w) {
+  struct av_selfdel_work *sw = container_of(w, struct av_selfdel_work, work);
+
+  av_behavior_report_self_delete(sw->tgid, sw->cookie, sw->path, PATH_MAX,
+                                 sw->overwrite, sw->target_pid);
+  kfree(sw->path);
+  put_pid(sw->target_pid);
+  kfree(sw);
+  av_selfdel_release();
+}
+
+/* A matched self-delete whose report could not be queued: the process
+ * removes its image unobserved, so say so. Atomic context. */
+static void selfdel_missed(const char *why) {
+  pr_warn_ratelimited("kernel-av: event=skip reason=%s pid=%d\n", why,
+                      task_tgid_nr(current));
+}
+
+/* Called from the two inode-level probes below with the dentry about to
+ * be removed (unlink) or replaced (rename's target). Atomic context.
+ * The decision is made here, on the dentry the kernel resolved, so no
+ * spelling of the name - symlinked directories, "..", bind mounts,
+ * another mount namespace, /proc/self/cwd/... - changes the answer; see
+ * struct av_exec_ident in behavior.c.
+ *
+ * Only a match costs anything beyond an RCU hash lookup. It then
+ * renders a log name here, because the work item may not hold a
+ * reference to the dentry (a dentry pinned past umount is a "busy
+ * inodes" bug at superblock shutdown): dentry_path_raw() is RCU-walk
+ * and seqlock based, safe in atomic context, and gives the path within
+ * the dentry's filesystem. The report replaces it with the exec-time
+ * d_path() when that was recorded.
+ *
+ * Admitted from av_selfdel_admit()'s own budget, not av_work_admit()
+ * (shared with exec work) or the _nonexec one: a self-delete is a kill
+ * path and the process is already matched, so neither a burst of exec
+ * work nor a flood of unrelated unlinks may crowd its report out. A
+ * report that is still dropped (budget or memory) is logged by
+ * selfdel_missed().
+ *
+ * The report targets the thread GROUP (task_tgid()), not the calling
+ * thread: the thread that unlinks can exit before the work runs, and a
+ * thread pid that no longer names a task would skip the kill while the
+ * rest of the process carried on. kill_with_reason() then kills the
+ * group through that pid, which also works when the leader is already a
+ * zombie. */
+static void schedule_selfdel_work(const struct inode *dir,
+                                  struct dentry *dentry, bool overwrite) {
+  struct av_selfdel_work *sw;
+  char *p;
+
+  if (!av_behavior_exec_ident_match(dir, dentry))
+    return;
+  if (!av_selfdel_admit()) {
+    selfdel_missed("selfdel-budget-full");
+    return;
+  }
+
+  sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
+  if (!sw) {
+    av_selfdel_release();
+    selfdel_missed("selfdel-alloc-failed");
+    return;
+  }
+  sw->path = kmalloc(PATH_MAX, GFP_ATOMIC);
+  if (!sw->path) {
+    kfree(sw);
+    av_selfdel_release();
+    selfdel_missed("selfdel-alloc-failed");
+    return;
+  }
+  p = dentry_path_raw(dentry, sw->path, PATH_MAX);
+  if (IS_ERR(p))
+    strscpy(sw->path, "?", PATH_MAX);
+  else
+    memmove(sw->path, p, strlen(p) + 1);
+
+  sw->cookie = dentry;
+  sw->overwrite = overwrite;
+  sw->tgid = task_tgid_nr(current);
+  sw->target_pid = get_pid(task_tgid(current));
+  INIT_WORK(&sw->work, av_selfdel_work_fn);
+  queue_work(av_wq, &sw->work);
+}
+
+/* security_inode_unlink(struct inode *dir, struct dentry *dentry):
+ * vfs_unlink() calls it with the target's inode locked, after
+ * may_delete() and before the filesystem's ->unlink(). Every unlink
+ * and unlinkat(fd, name, 0) reaches it whatever the spelling, and so
+ * do kernel-internal callers (overlayfs's own upper-layer unlinks, in
+ * the same task, pass the upper dentry, which never matches an exec'd
+ * overlay dentry; nfsd and other kthreads never have an exec identity).
+ * The unlink can still fail after this (a mountpoint's -EBUSY, the
+ * filesystem refusing); the attempt is what is flagged, as with the
+ * syscall-level hook before. */
+static int handler_pre_inode_unlink(struct kprobe *p, struct pt_regs *regs) {
+  const struct inode *dir =
+      (const struct inode *)regs_get_kernel_argument(regs, 0);
+  struct dentry *dentry = (struct dentry *)regs_get_kernel_argument(regs, 1);
+
+  if (dentry)
+    schedule_selfdel_work(dir, dentry, false);
+  return 0;
+}
+
+/* security_inode_rename(old_dir, old_dentry, new_dir, new_dentry,
+ * flags): a rename onto the exec'd name removes it just as an unlink
+ * does (rename(decoy, own_exe)). vfs_rename() has already returned for
+ * a rename of a name onto itself or another link of the same inode
+ * (source == target), so this only sees real replacements. Skipped:
+ * a negative new_dentry (nothing is replaced) and RENAME_EXCHANGE
+ * (both names survive, swapped). Renaming the executed file itself
+ * away is not a delete; its dentry moves with it, so an unlink of the
+ * new name later still matches.
+ *
+ * This also catches an updater that renames a new build over its own
+ * running binary. That is the atomic-update idiom, and it is also how
+ * a dropper replaces itself with a decoy; the protected-exe list is the
+ * per-binary escape hatch, as for every behavioral kill. */
+static int handler_pre_inode_rename(struct kprobe *p, struct pt_regs *regs) {
+  const struct inode *new_dir =
+      (const struct inode *)regs_get_kernel_argument(regs, 2);
+  struct dentry *new_dentry = (struct dentry *)regs_get_kernel_argument(regs, 3);
+  unsigned int flags = (unsigned int)regs_get_kernel_argument(regs, 4);
+
+  if (!new_dentry || (flags & RENAME_EXCHANGE) || !d_is_positive(new_dentry))
+    return 0;
+  schedule_selfdel_work(new_dir, new_dentry, true);
   return 0;
 }
 
@@ -1281,15 +1591,12 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
   return 0;
 }
 
-/* ---- unlink/unlinkat: self-delete + sensitive-path-deletion ---- */
+/* ---- unlink/unlinkat: sensitive-path deletion (self-delete is the
+ * inode-level probe above) ---- */
 
 struct av_unlink_work {
   struct work_struct work;
   struct pid *target_pid;
-  pid_t pid;        /* tgid, not thread pid - see the note on av_openat_work
-                     * above; self-delete correlation against exec_path
-                     * needs to match the same key av_behavior_record_exec()
-                     * used. */
   struct path base; /* dfd resolved at kprobe time - see
                      * resolve_dfd_path(). For plain unlink() (no
                      * dfd arg) this is always the cwd capture, same
@@ -1311,7 +1618,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
   }
 
   resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
-  av_behavior_check_unlink(uw->pid, abs_path, uw->target_pid);
+  av_behavior_check_unlink(abs_path, uw->target_pid);
 
   kfree(abs_path);
   path_put(&uw->base);
@@ -1324,8 +1631,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
  * always cwd-relative) or the real dfd argument for unlinkat(). Same
  * dfd-ignored evasion fix as openat: unlinkat(fd_for_/etc, "shadow", 0)
  * previously reached behavior.c as bare "shadow", so it could never
- * match /etc/shadow's sensitive-path check, and could never correlate
- * against an exec_path recorded as an absolute path either. */
+ * match /etc/shadow's sensitive-path check. */
 static int schedule_unlink_work(const char __user *user_path, int dfd) {
   struct av_unlink_work *uw;
   struct path base;
@@ -1360,7 +1666,6 @@ static int schedule_unlink_work(const char __user *user_path, int dfd) {
     }
   }
 
-  uw->pid = task_tgid_nr(current);
   uw->target_pid = get_task_pid(current, PIDTYPE_PID);
   INIT_WORK(&uw->work, av_unlink_work_fn);
   queue_work(av_wq, &uw->work);
@@ -1797,9 +2102,40 @@ static int __init av_init(void) {
     goto err_kp_renameat;
   }
 
+  kp_bprm_committing.pre_handler = handler_pre_bprm_committing;
+  ret = register_kprobe(&kp_bprm_committing);
+  if (ret < 0) {
+    pr_err("kernel-av: register_kprobe(security_bprm_committing_creds) "
+           "failed: %d\n",
+           ret);
+    goto err_kp_renameat2;
+  }
+
+  kp_inode_unlink.pre_handler = handler_pre_inode_unlink;
+  ret = register_kprobe(&kp_inode_unlink);
+  if (ret < 0) {
+    pr_err("kernel-av: register_kprobe(security_inode_unlink) failed: %d\n",
+           ret);
+    goto err_kp_bprm_committing;
+  }
+
+  kp_inode_rename.pre_handler = handler_pre_inode_rename;
+  ret = register_kprobe(&kp_inode_rename);
+  if (ret < 0) {
+    pr_err("kernel-av: register_kprobe(security_inode_rename) failed: %d\n",
+           ret);
+    goto err_kp_inode_unlink;
+  }
+
   pr_info("kernel-av: loaded, %zu signature(s) active\n", av_sigtable_count());
   return 0;
 
+err_kp_inode_unlink:
+  unregister_kprobe(&kp_inode_unlink);
+err_kp_bprm_committing:
+  unregister_kprobe(&kp_bprm_committing);
+err_kp_renameat2:
+  unregister_kprobe(&kp_renameat2);
 err_kp_renameat:
   unregister_kprobe(&kp_renameat);
 err_kp_rename:
@@ -1831,6 +2167,9 @@ err_sigtable:
 }
 
 static void __exit av_exit(void) {
+  unregister_kprobe(&kp_inode_rename);
+  unregister_kprobe(&kp_inode_unlink);
+  unregister_kprobe(&kp_bprm_committing);
   unregister_kprobe(&kp_renameat2);
   unregister_kprobe(&kp_renameat);
   unregister_kprobe(&kp_rename);

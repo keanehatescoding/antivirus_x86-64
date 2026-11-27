@@ -233,10 +233,12 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
     close(fd);
 
   quarantine_dir = qdir_path;
-  if (ensure_quarantine_dir() != 0) {
+  fd = open_quarantine_dir();
+  if (fd < 0) {
     fprintf(stderr, "could not prepare quarantine dir %s\n", qdir_path);
     exit(2);
   }
+  close(fd);
 
   /* A few history rows so VERDICTS RECENT has something to format,
    * including fields a hostile file name could put there. */
