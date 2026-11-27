@@ -37,8 +37,9 @@
 # NEEDS THE LIVE KERNEL MODULE - run this in your VM, not standalone.
 # Usage: tests/evasion/test_open_hook_coverage_evasion.sh [--strict]
 #   --strict  exit 1 if any non-control case is EVADED (use after the fix)
-# Exit: 0 ok, 1 strict failure, 2 inconclusive (control not detected,
-#       module not loaded, or build failure).
+# Exit: 0 ok, 1 strict failure (evasions), 2 inconclusive (control not
+#       detected, a non-control case failed to open, module not loaded,
+#       or build failure).
 #
 set -u
 
@@ -141,18 +142,21 @@ fi
 SENS_DIR="$TESTDIR/.ssh"
 TARGET="$SENS_DIR/id_test"
 mkdir -p "$SENS_DIR"
-: > "$TARGET"
+# Never open the sensitive target from the coordinator: the write-intent
+# hook can queue a SIGKILL against whichever task opens it, which would kill
+# this script before it reports the helper results. Each helper creates the
+# file itself, and a symlink may point at a not-yet-existing target.
 ln -s "$TARGET" "$TESTDIR/innocent_link"
 printf '%s' "$TARGET" > "$TESTDIR/pathfile"   # printf: no trailing newline;
 printf '\0' >> "$TESTDIR/pathfile"            # NUL-terminate for the kernel
 
 RESULTS=()
 EVADED=0
+INCONCLUSIVE=0
 CONTROL_OK=1
 
 run_case() {
     local name="$1" mode="$2" arg="$3" rc verdict
-    rm -f "$TARGET"; : > "$TARGET"
     "$HELPER" "$mode" "$arg" >/dev/null 2>&1
     rc=$?
     case "$rc" in
@@ -166,6 +170,8 @@ run_case() {
         [ "$verdict" = "DETECTED" ] || CONTROL_OK=0
     elif [ "$verdict" = "EVADED" ]; then
         EVADED=$((EVADED + 1))
+    elif [ "${verdict%% *}" = "INCONCLUSIVE" ]; then
+        INCONCLUSIVE=$((INCONCLUSIVE + 1))
     fi
 }
 
@@ -191,12 +197,17 @@ if [ "$CONTROL_OK" -ne 1 ]; then
     exit 2
 fi
 
-echo "$EVADED case(s) evaded."
+echo "$EVADED case(s) evaded, $INCONCLUSIVE case(s) inconclusive."
 echo "Today's expectation: open/creat/openat2/cold EVADED (hook coverage and"
 echo "atomic-context copy gaps); symlink is the open question this settles."
 echo "After the security_file_open swap, re-run with --strict: all must be DETECTED."
 
 if [ "$STRICT" -eq 1 ] && [ "$EVADED" -gt 0 ]; then
     exit 1
+fi
+if [ "$INCONCLUSIVE" -gt 0 ]; then
+    echo "INCONCLUSIVE: a non-control case never opened its path; the result"
+    echo "for that case was not validated."
+    exit 2
 fi
 exit 0
