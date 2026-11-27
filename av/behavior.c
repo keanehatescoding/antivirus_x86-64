@@ -1602,9 +1602,13 @@ bool av_behavior_path_is_sensitive(const char *path) {
   return path_is_sensitive(path);
 }
 
+bool av_behavior_path_is_pseudo_fs(const char *path) {
+  return path_is_pseudo_fs(path);
+}
+
 static void av_behavior_check_openat_common(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
-                                            bool sensitive) {
+                                            bool sensitive, bool pseudo) {
   struct av_behavior_entry *e;
   bool rapid = false;
 
@@ -1613,8 +1617,12 @@ static void av_behavior_check_openat_common(pid_t pid, const char *path,
     return;
 
   /* Pseudo-filesystem/device paths never count toward either
-   * heuristic - see the comment on excluded_path_prefixes for why. */
-  if (path_is_pseudo_fs(path))
+   * heuristic - see the comment on excluded_path_prefixes for why.
+   * The caller supplies the verdict from the observed pathname: the
+   * worker's d_path() uses the workqueue thread's root, which can turn
+   * a chrooted /etc/passwd into /dev/shm/rootfs/etc/passwd and wrongly
+   * match this exclusion. */
+  if (pseudo)
     return;
 
   mutex_lock(&behavior_lock);
@@ -1646,13 +1654,15 @@ static void av_behavior_check_openat_common(pid_t pid, const char *path,
 void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                               struct pid *target_pid) {
   av_behavior_check_openat_common(pid, path, flags, target_pid,
-                                  path_is_sensitive(path));
+                                  path_is_sensitive(path),
+                                  path_is_pseudo_fs(path));
 }
 
 void av_behavior_check_openat_preclassified(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
-                                            bool sensitive) {
-  av_behavior_check_openat_common(pid, path, flags, target_pid, sensitive);
+                                            bool sensitive, bool pseudo) {
+  av_behavior_check_openat_common(pid, path, flags, target_pid, sensitive,
+                                  pseudo);
 }
 
 void av_behavior_check_unlink(const char *path, struct pid *target_pid) {

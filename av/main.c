@@ -1652,7 +1652,8 @@ struct av_fileopen_work {
   struct pid *target_pid;
   pid_t pid; /* tgid, not thread id - same keying as av_openat_work */
   int flags;
-  bool sensitive; /* classified at hook entry, NOT re-derived below */
+  bool sensitive; /* both classified at hook entry, NOT re-derived below */
+  bool pseudo;
   struct path path; /* pinned with path_get() in the entry handler, released
                      * in av_fileopen_work_fn(); d_path()'d there only for
                      * the log line and the rapid-write hash */
@@ -1661,15 +1662,32 @@ struct av_fileopen_work {
 static void av_fileopen_work_fn(struct work_struct *w) {
   struct av_fileopen_work *fw = container_of(w, struct av_fileopen_work, work);
   char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  char *abs_path = NULL;
+  char fallback[128];
 
   if (buf) {
-    char *abs_path = d_path(&fw->path, buf, PATH_MAX);
+    char *rendered = d_path(&fw->path, buf, PATH_MAX);
 
-    if (!IS_ERR(abs_path))
-      av_behavior_check_openat_preclassified(fw->pid, abs_path, fw->flags,
-                                             fw->target_pid, fw->sensitive);
-    kfree(buf);
+    if (!IS_ERR(rendered))
+      abs_path = rendered;
   }
+  if (!abs_path) {
+    /* Late rendering can fail (kmalloc, or ENAMETOOLONG after an
+     * ancestor is renamed deeper). The frozen verdicts are still valid,
+     * so the check must still run. A constant placeholder here would
+     * merge every unresolved write into one rapid-write counter; the
+     * (tgid, dentry) pair keeps unrelated files apart. */
+    snprintf(fallback, sizeof(fallback), "<unresolved:%d:%p>", fw->pid,
+             fw->path.dentry);
+    abs_path = fallback;
+  }
+  /* 'pseudo' is the entry-time decision: reapplying the exclusion to a
+   * worker-rendered path would drop a chrooted /etc/passwd open whose
+   * worker path happens to start with /dev/. */
+  av_behavior_check_openat_preclassified(fw->pid, abs_path, fw->flags,
+                                         fw->target_pid, fw->sensitive,
+                                         fw->pseudo);
+  kfree(buf);
   path_put(&fw->path);
   put_pid(fw->target_pid);
   kfree(fw);
@@ -1719,17 +1737,22 @@ static int entry_file_open(struct kretprobe_instance *ri,
   {
     char *buf = kmalloc(PATH_MAX, GFP_ATOMIC);
     bool sensitive = false;
+    bool pseudo = false;
 
     if (buf) {
       char *entry_path = d_path(&file->f_path, buf, PATH_MAX);
 
-      if (!IS_ERR(entry_path))
+      if (!IS_ERR(entry_path)) {
         sensitive = av_behavior_path_is_sensitive(entry_path);
+        pseudo = av_behavior_path_is_pseudo_fs(entry_path);
+      }
       kfree(buf);
     }
-    /* A failed render fails closed here: the deferred check will not
-     * claim a sensitive path it could not classify at observation time. */
+    /* A failed render fails closed for the sensitive verdict: the
+     * deferred check will not claim a sensitive path it could not
+     * classify at observation time. */
     fw->sensitive = sensitive;
+    fw->pseudo = pseudo;
   }
 
   fw->path = file->f_path;
@@ -1738,7 +1761,10 @@ static int entry_file_open(struct kretprobe_instance *ri,
   fw->pid = task_tgid_nr(current);
   fw->target_pid = get_task_pid(current, PIDTYPE_PID);
   *slot = fw;
-  return 1; /* call the exit handler once security_file_open() returns */
+  /* Per the kretprobe contract, 0 (not 1) means the return handler runs
+   * on function return. Returning 1 would recycle the instance, skip
+   * exit_file_open(), and leak the pinned path/pid/budget slot. */
+  return 0;
 }
 
 /* Exit half: only a granted open is allowed to become a behavioral
