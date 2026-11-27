@@ -56,6 +56,8 @@ expect "$QCOPY" 'openat(dirfd, name,' \
     "copy_fd_to_at() creates the copy relative to the dirfd"
 expect "$QMETA" 'openat(qdirfd, meta_name,' \
     "write_quarantine_meta() creates the sidecar relative to the dirfd"
+expect "$QMETA" 'strpbrk(orig_path, "\r\n")' \
+    "write_quarantine_meta() rejects newline-corrupted ORIGINAL_PATH"
 
 if grep -qE '(linkat|openat|fchmodat|unlinkat)\([^;]*AT_FDCWD' <<< "$QFILE$QCOPY$QMETA"; then
     fail "quarantine creation still resolves a path via AT_FDCWD"
