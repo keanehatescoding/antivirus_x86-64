@@ -315,11 +315,13 @@ MODULE_PARM_DESC(av_legacy_openat_hook,
                  "Track write-intent opens via the legacy __x64_sys_openat kprobe instead of security_file_open (default 0 = security_file_open); escape hatch, remove once the new hook has soaked");
 
 /* Read-only observability for the security_file_open kretprobe. nmissed
- * counts opens for which no return-probe instance was available: in that
- * case even entry_file_open() is skipped, so the work-admission budget
- * never gets a chance to decide. With maxactive sized to that budget (see
- * av_register_open_probe()) this should stay at zero; a nonzero value is
- * real, measurable coverage loss worth alerting on. */
+ * counts probe hits for which no return-probe instance was available: in
+ * that case even entry_file_open() is skipped, so the work-admission
+ * budget never gets a chance to decide. It counts ALL opens, including
+ * read-only ones the entry handler would have filtered out, so a nonzero
+ * value signals that write-intent coverage MAY have been lost, not that
+ * a qualifying write was definitely missed. With maxactive sized to the
+ * work budget (see av_register_open_probe()) this should stay at zero. */
 static int av_file_open_nmissed_get(char *buffer,
                                     const struct kernel_param *kp) {
   return sprintf(buffer, "%d\n", kr_file_open.nmissed);
@@ -329,7 +331,7 @@ static const struct kernel_param_ops av_file_open_nmissed_ops = {
 };
 module_param_cb(av_file_open_nmissed, &av_file_open_nmissed_ops, NULL, 0444);
 MODULE_PARM_DESC(av_file_open_nmissed,
-                 "security_file_open kretprobe instances missed since load (read-only; nonzero means write-intent open coverage was lost)");
+                 "security_file_open kretprobe instances missed since load (read-only; nonzero means write-intent open coverage may have been lost)");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1669,7 +1671,13 @@ struct av_fileopen_work {
   struct pid *target_pid;
   pid_t pid; /* tgid, not thread id - same keying as av_openat_work */
   int flags;
-  bool sensitive; /* all classified at hook entry, NOT re-derived below */
+  bool sensitive; /* verdict from the entry-rendered path */
+  /* Entry rendering can fail (GFP_ATOMIC kmalloc or d_path() error). In
+   * that case sensitive is not a real "no" verdict but "unknown", and the
+   * worker must not treat it as non-sensitive - see av_fileopen_work_fn().
+   * pseudo/noise have a safe default (false = "not excluded") and need no
+   * such flag. */
+  bool sensitive_known;
   bool pseudo;
   bool noise;
   u32 path_hash; /* rapid-write sliding-window key from the entry path */
@@ -1682,13 +1690,17 @@ static void av_fileopen_work_fn(struct work_struct *w) {
   struct av_fileopen_work *fw = container_of(w, struct av_fileopen_work, work);
   char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
   const char *abs_path = NULL;
+  bool render_ok = false;
+  bool sensitive;
   char fallback[128];
 
   if (buf) {
     char *rendered = d_path(&fw->path, buf, PATH_MAX);
 
-    if (!IS_ERR(rendered))
+    if (!IS_ERR(rendered)) {
       abs_path = rendered;
+      render_ok = true;
+    }
   }
   if (!abs_path) {
     /* Late rendering can fail (kmalloc, or ENAMETOOLONG after an
@@ -1700,12 +1712,24 @@ static void av_fileopen_work_fn(struct work_struct *w) {
              fw->path.dentry);
     abs_path = fallback;
   }
+
+  if (fw->sensitive_known) {
+    sensitive = fw->sensitive;
+  } else {
+    /* The entry handler could not render the path, so it has no policy
+     * verdict to freeze. "unknown" must not silently become "not
+     * sensitive": a write to /etc/passwd whose GFP_ATOMIC allocation
+     * failed would otherwise escape the sensitive-path check. Classify
+     * from the late render when it worked (best available information),
+     * and fail closed otherwise so the check still runs. */
+    sensitive = render_ok ? av_behavior_path_is_sensitive(abs_path) : true;
+  }
   /* 'pseudo' and 'noise' are the entry-time decisions: reapplying either
    * exclusion to a worker-rendered path would drop a chrooted
    * /etc/passwd (rendered under /dev/) or turn /documents/fN into a
    * fake cache path under /.cache/rootfs/. */
   av_behavior_check_openat_preclassified(fw->pid, abs_path, fw->flags,
-                                         fw->target_pid, fw->sensitive,
+                                         fw->target_pid, sensitive,
                                          fw->pseudo, fw->noise,
                                          fw->path_hash);
   kfree(buf);
@@ -1787,12 +1811,14 @@ static int entry_file_open(struct kretprobe_instance *ri,
                task_tgid_nr(current), file->f_path.dentry);
       path_hash = av_behavior_path_hash(fallback);
     }
+    fw->sensitive_known = (entry_path != NULL);
     kfree(buf);
-    /* A failed render fails closed for the sensitive verdict: the
-     * deferred check will not claim a sensitive path it could not
-     * classify at observation time. For the exclusions, false means
-     * "not excluded", so a genuine cache/journal open whose rendering
-     * failed is counted rather than silently dropped. */
+    /* On a successful render all verdicts are frozen here. On failure,
+     * pseudo/noise keep their safe "not excluded" defaults (so a genuine
+     * cache/journal open is counted rather than dropped), path_hash is the
+     * per-(tgid,dentry) placeholder, and 'sensitive' is flagged unknown:
+     * the worker must not read the default false as a real "not sensitive"
+     * verdict - it reclassifies from its own render or fails closed. */
     fw->sensitive = sensitive;
     fw->pseudo = pseudo;
     fw->noise = noise;
