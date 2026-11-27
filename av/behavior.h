@@ -94,21 +94,24 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
 
 /* Same classifications as the wrapper above, exposed for the
  * security_file_open hook. That hook renders the kernel's pathname in its
- * kretprobe entry handler and freezes both verdicts there: deferring the
- * decision lets another thread rename an ancestor (e.g. .ssh -> stash)
+ * kretprobe entry handler and freezes all three verdicts there: deferring
+ * the decision lets another thread rename an ancestor (e.g. .ssh -> stash)
  * before the worker runs, which would hide the write that was observed. */
 bool av_behavior_path_is_sensitive(const char *path);
 bool av_behavior_path_is_pseudo_fs(const char *path);
+bool av_behavior_path_is_rapid_write_noise(const char *path);
 
-/* av_behavior_check_openat() with both verdicts already captured at
+/* av_behavior_check_openat() with all verdicts already captured at
  * observation time. 'path' is used only for logging and the rapid-write
  * hash; if late rendering failed the caller may pass a private fallback
- * string, and the pseudo-path exclusion must NOT be recomputed from it.
+ * string, and the pseudo/noise exclusions must NOT be recomputed from it
+ * (the worker's root can render a chrooted /documents/f under /.cache/).
  * Only the security_file_open work handler uses this; every other caller
  * should use the wrapper above, which derives the verdicts itself. */
 void av_behavior_check_openat_preclassified(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
-                                            bool sensitive, bool pseudo);
+                                            bool sensitive, bool pseudo,
+                                            bool noise);
 
 /* Called from the unlink/unlinkat work handler. Kills target_pid if
  * `path` (the normalized absolute target) is on the sensitive-path

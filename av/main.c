@@ -1652,8 +1652,9 @@ struct av_fileopen_work {
   struct pid *target_pid;
   pid_t pid; /* tgid, not thread id - same keying as av_openat_work */
   int flags;
-  bool sensitive; /* both classified at hook entry, NOT re-derived below */
+  bool sensitive; /* all classified at hook entry, NOT re-derived below */
   bool pseudo;
+  bool noise;
   struct path path; /* pinned with path_get() in the entry handler, released
                      * in av_fileopen_work_fn(); d_path()'d there only for
                      * the log line and the rapid-write hash */
@@ -1681,12 +1682,13 @@ static void av_fileopen_work_fn(struct work_struct *w) {
              fw->path.dentry);
     abs_path = fallback;
   }
-  /* 'pseudo' is the entry-time decision: reapplying the exclusion to a
-   * worker-rendered path would drop a chrooted /etc/passwd open whose
-   * worker path happens to start with /dev/. */
+  /* 'pseudo' and 'noise' are the entry-time decisions: reapplying either
+   * exclusion to a worker-rendered path would drop a chrooted
+   * /etc/passwd (rendered under /dev/) or turn /documents/fN into a
+   * fake cache path under /.cache/rootfs/. */
   av_behavior_check_openat_preclassified(fw->pid, abs_path, fw->flags,
                                          fw->target_pid, fw->sensitive,
-                                         fw->pseudo);
+                                         fw->pseudo, fw->noise);
   kfree(buf);
   path_put(&fw->path);
   put_pid(fw->target_pid);
@@ -1738,6 +1740,7 @@ static int entry_file_open(struct kretprobe_instance *ri,
     char *buf = kmalloc(PATH_MAX, GFP_ATOMIC);
     bool sensitive = false;
     bool pseudo = false;
+    bool noise = false;
 
     if (buf) {
       char *entry_path = d_path(&file->f_path, buf, PATH_MAX);
@@ -1745,14 +1748,18 @@ static int entry_file_open(struct kretprobe_instance *ri,
       if (!IS_ERR(entry_path)) {
         sensitive = av_behavior_path_is_sensitive(entry_path);
         pseudo = av_behavior_path_is_pseudo_fs(entry_path);
+        noise = av_behavior_path_is_rapid_write_noise(entry_path);
       }
       kfree(buf);
     }
     /* A failed render fails closed for the sensitive verdict: the
      * deferred check will not claim a sensitive path it could not
-     * classify at observation time. */
+     * classify at observation time. For the exclusions, false means
+     * "not excluded", so a genuine cache/journal open whose rendering
+     * failed is counted rather than silently dropped. */
     fw->sensitive = sensitive;
     fw->pseudo = pseudo;
+    fw->noise = noise;
   }
 
   fw->path = file->f_path;
