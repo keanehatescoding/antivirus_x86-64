@@ -183,9 +183,16 @@ static struct kprobe kp_openat = {
  * calls security_file_open() with the file it actually resolved, for
  * every open (open/creat/openat/openat2, io_uring, kernel-internal),
  * so there is no user string to copy and no syscall ABI to name.
- * kp_openat above is kept only behind av_legacy_openat_hook. */
-static struct kprobe kp_file_open = {
-    .symbol_name = "security_file_open",
+ * kp_openat above is kept only behind av_legacy_openat_hook.
+ *
+ * A kretprobe, not a plain kprobe: security_file_open() itself runs the
+ * LSM and fanotify permission checks in its body, so the event may only
+ * be queued once the function returns 0. The entry handler retains the
+ * state; the exit handler either queues it or drops it on denial. */
+struct av_fileopen_work; /* defined with the deferred work item below */
+static struct kretprobe kr_file_open = {
+    .kp.symbol_name = "security_file_open",
+    .data_size = sizeof(struct av_fileopen_work *),
 };
 static struct kprobe kp_unlink = {
     .symbol_name = "__x64_sys_unlink",
@@ -306,11 +313,6 @@ static bool av_legacy_openat_hook;
 module_param(av_legacy_openat_hook, bool, 0444);
 MODULE_PARM_DESC(av_legacy_openat_hook,
                  "Track write-intent opens via the legacy __x64_sys_openat kprobe instead of security_file_open (default 0 = security_file_open); escape hatch, remove once the new hook has soaked");
-
-/* The one probe that tracks write-intent opens for this load. */
-static inline struct kprobe *av_open_probe(void) {
-  return av_legacy_openat_hook ? &kp_openat : &kp_file_open;
-}
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1623,7 +1625,10 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
  *     is silently dropped) when the string sits on a page that is not
  *     resident, and reads the string before the kernel does, so another
  *     thread can rewrite it in between. Here the kernel has already
- *     resolved the file; we pin its struct path and d_path() it later.
+ *     resolved the file; we pin its struct path and freeze the sensitive
+ *     path verdict at hook entry, before an ancestor can be renamed.
+ *     The full pathname is re-rendered in the worker only for logging
+ *     and the rapid-write hash - never for the sensitive-path decision.
  *   - Every spelling of open is seen: open(), creat(), openat2(),
  *     io_uring, not just openat().
  *   - The path is canonical (symlinks followed, no "..", no dfd/cwd
@@ -1647,9 +1652,10 @@ struct av_fileopen_work {
   struct pid *target_pid;
   pid_t pid; /* tgid, not thread id - same keying as av_openat_work */
   int flags;
-  struct path path; /* pinned with path_get() in the handler, released in
-                     * av_fileopen_work_fn(); d_path()'d there, in process
-                     * context */
+  bool sensitive; /* classified at hook entry, NOT re-derived below */
+  struct path path; /* pinned with path_get() in the entry handler, released
+                     * in av_fileopen_work_fn(); d_path()'d there only for
+                     * the log line and the rapid-write hash */
 };
 
 static void av_fileopen_work_fn(struct work_struct *w) {
@@ -1660,7 +1666,8 @@ static void av_fileopen_work_fn(struct work_struct *w) {
     char *abs_path = d_path(&fw->path, buf, PATH_MAX);
 
     if (!IS_ERR(abs_path))
-      av_behavior_check_openat(fw->pid, abs_path, fw->flags, fw->target_pid);
+      av_behavior_check_openat_preclassified(fw->pid, abs_path, fw->flags,
+                                             fw->target_pid, fw->sensitive);
     kfree(buf);
   }
   path_put(&fw->path);
@@ -1669,13 +1676,18 @@ static void av_fileopen_work_fn(struct work_struct *w) {
   av_work_release();
 }
 
-/* security_file_open(struct file *file) */
-static int handler_pre_file_open(struct kprobe *p, struct pt_regs *regs) {
+/* security_file_open(struct file *file) - entry half. Nothing is queued
+ * here: the LSM/fanotify checks live inside the probed function and may
+ * still reject the open. */
+static int entry_file_open(struct kretprobe_instance *ri,
+                           struct pt_regs *regs) {
   const struct file *file =
       (const struct file *)regs_get_kernel_argument(regs, 0);
+  struct av_fileopen_work **slot = (struct av_fileopen_work **)ri->data;
   struct av_fileopen_work *fw;
   unsigned int flags;
 
+  *slot = NULL;
   if (!file || (current->flags & PF_KTHREAD))
     return 0;
   if (file->f_mode & FMODE_BACKING)
@@ -1696,15 +1708,84 @@ static int handler_pre_file_open(struct kprobe *p, struct pt_regs *regs) {
     av_work_release();
     return 0;
   }
+
+  /* Freeze the policy input while the pathname is still the one the
+   * kernel observed. A concurrent rename of an ancestor keeps fw->path
+   * valid (path_get pins the object) but changes what d_path() would
+   * return in the worker; the legacy openat hook copied the string and
+   * kept the original classification. d_path() here is atomic-safe
+   * (RCU/seqcount only) and uses the opening task's root, unlike the
+   * workqueue thread's root. */
+  {
+    char *buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+    bool sensitive = false;
+
+    if (buf) {
+      char *entry_path = d_path(&file->f_path, buf, PATH_MAX);
+
+      if (!IS_ERR(entry_path))
+        sensitive = av_behavior_path_is_sensitive(entry_path);
+      kfree(buf);
+    }
+    /* A failed render fails closed here: the deferred check will not
+     * claim a sensitive path it could not classify at observation time. */
+    fw->sensitive = sensitive;
+  }
+
   fw->path = file->f_path;
   path_get(&fw->path);
   fw->flags = (int)flags;
   fw->pid = task_tgid_nr(current);
   fw->target_pid = get_task_pid(current, PIDTYPE_PID);
+  *slot = fw;
+  return 1; /* call the exit handler once security_file_open() returns */
+}
+
+/* Exit half: only a granted open is allowed to become a behavioral
+ * event. security_file_open() calls call_int_hook(file_open, ...) and
+ * fsnotify_open_perm() in its body, either of which can deny; counting
+ * a rejected attempt would risk killing a process for a write the
+ * kernel never permitted. */
+static int exit_file_open(struct kretprobe_instance *ri,
+                          struct pt_regs *regs) {
+  struct av_fileopen_work **slot = (struct av_fileopen_work **)ri->data;
+  struct av_fileopen_work *fw = *slot;
+
+  if (!fw)
+    return 0;
+
+  if (regs_return_value(regs) != 0) {
+    path_put(&fw->path);
+    put_pid(fw->target_pid);
+    kfree(fw);
+    av_work_release();
+    return 0;
+  }
+
   INIT_WORK(&fw->work, av_fileopen_work_fn);
   queue_work(av_wq, &fw->work);
-
   return 0;
+}
+
+/* Register whichever open probe this load uses. Defined after the
+ * handlers so the kretprobe callbacks are in scope. */
+static int av_register_open_probe(void) {
+  if (av_legacy_openat_hook) {
+    kp_openat.pre_handler = handler_pre_openat;
+    pr_info("kernel-av: av_legacy_openat_hook=1, write-intent opens tracked "
+            "via __x64_sys_openat\n");
+    return register_kprobe(&kp_openat);
+  }
+  kr_file_open.entry_handler = entry_file_open;
+  kr_file_open.handler = exit_file_open;
+  return register_kretprobe(&kr_file_open);
+}
+
+static void av_unregister_open_probe(void) {
+  if (av_legacy_openat_hook)
+    unregister_kprobe(&kp_openat);
+  else
+    unregister_kretprobe(&kr_file_open);
 }
 
 /* ---- unlink/unlinkat: sensitive-path deletion (self-delete is the
@@ -2176,17 +2257,11 @@ static int __init av_init(void) {
     goto err_netlink;
   }
 
-  if (av_legacy_openat_hook) {
-    kp_openat.pre_handler = handler_pre_openat;
-    pr_info("kernel-av: av_legacy_openat_hook=1, write-intent opens tracked "
-            "via __x64_sys_openat\n");
-  } else {
-    kp_file_open.pre_handler = handler_pre_file_open;
-  }
-  ret = register_kprobe(av_open_probe());
+  ret = av_register_open_probe();
   if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(%s) failed: %d\n",
-           av_open_probe()->symbol_name, ret);
+    pr_err("kernel-av: register open probe (%s) failed: %d\n",
+           av_legacy_openat_hook ? kp_openat.symbol_name
+                                 : kr_file_open.kp.symbol_name, ret);
     goto err_kp_bprm_check;
   }
 
@@ -2268,7 +2343,7 @@ err_kp_unlinkat:
 err_kp_unlink:
   unregister_kprobe(&kp_unlink);
 err_kp_openat:
-  unregister_kprobe(av_open_probe());
+  av_unregister_open_probe();
 err_kp_bprm_check:
   unregister_kprobe(&kp_bprm_check);
 err_netlink:
@@ -2298,7 +2373,7 @@ static void __exit av_exit(void) {
   unregister_kprobe(&kp_rename);
   unregister_kprobe(&kp_unlinkat);
   unregister_kprobe(&kp_unlink);
-  unregister_kprobe(av_open_probe());
+  av_unregister_open_probe();
   unregister_kprobe(&kp_bprm_check);
   /* destroy_workqueue() flushes all pending work first, so no work
    * item can run against unloaded module .text after this returns. */

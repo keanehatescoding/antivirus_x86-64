@@ -1598,10 +1598,14 @@ void av_behavior_record_exec(pid_t pid, const char *path,
   mutex_unlock(&behavior_lock);
 }
 
-void av_behavior_check_openat(pid_t pid, const char *path, int flags,
-                              struct pid *target_pid) {
+bool av_behavior_path_is_sensitive(const char *path) {
+  return path_is_sensitive(path);
+}
+
+static void av_behavior_check_openat_common(pid_t pid, const char *path,
+                                            int flags, struct pid *target_pid,
+                                            bool sensitive) {
   struct av_behavior_entry *e;
-  bool sensitive;
   bool rapid = false;
 
   /* Read-only opens aren't interesting for either heuristic here. */
@@ -1612,8 +1616,6 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
    * heuristic - see the comment on excluded_path_prefixes for why. */
   if (path_is_pseudo_fs(path))
     return;
-
-  sensitive = path_is_sensitive(path);
 
   mutex_lock(&behavior_lock);
   e = get_or_create_entry(pid);
@@ -1639,6 +1641,18 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
   else if (rapid)
     kill_with_reason(target_pid, path,
                      "rapid file modification (possible ransomware pattern)");
+}
+
+void av_behavior_check_openat(pid_t pid, const char *path, int flags,
+                              struct pid *target_pid) {
+  av_behavior_check_openat_common(pid, path, flags, target_pid,
+                                  path_is_sensitive(path));
+}
+
+void av_behavior_check_openat_preclassified(pid_t pid, const char *path,
+                                            int flags, struct pid *target_pid,
+                                            bool sensitive) {
+  av_behavior_check_openat_common(pid, path, flags, target_pid, sensitive);
 }
 
 void av_behavior_check_unlink(const char *path, struct pid *target_pid) {
