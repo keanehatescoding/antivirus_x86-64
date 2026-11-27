@@ -314,6 +314,23 @@ module_param(av_legacy_openat_hook, bool, 0444);
 MODULE_PARM_DESC(av_legacy_openat_hook,
                  "Track write-intent opens via the legacy __x64_sys_openat kprobe instead of security_file_open (default 0 = security_file_open); escape hatch, remove once the new hook has soaked");
 
+/* Read-only observability for the security_file_open kretprobe. nmissed
+ * counts opens for which no return-probe instance was available: in that
+ * case even entry_file_open() is skipped, so the work-admission budget
+ * never gets a chance to decide. With maxactive sized to that budget (see
+ * av_register_open_probe()) this should stay at zero; a nonzero value is
+ * real, measurable coverage loss worth alerting on. */
+static int av_file_open_nmissed_get(char *buffer,
+                                    const struct kernel_param *kp) {
+  return sprintf(buffer, "%d\n", kr_file_open.nmissed);
+}
+static const struct kernel_param_ops av_file_open_nmissed_ops = {
+    .get = av_file_open_nmissed_get,
+};
+module_param_cb(av_file_open_nmissed, &av_file_open_nmissed_ops, NULL, 0444);
+MODULE_PARM_DESC(av_file_open_nmissed,
+                 "security_file_open kretprobe instances missed since load (read-only; nonzero means write-intent open coverage was lost)");
+
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
     atomic_dec(&av_inflight_work);
@@ -1829,6 +1846,13 @@ static int av_register_open_probe(void) {
             "via __x64_sys_openat\n");
     return register_kprobe(&kp_openat);
   }
+  /* The kernel default when maxactive == 0 is only max(10, 2*CPUs).
+   * A fanotify/LSM permission check can hold an instance for a long
+   * time; once that many opens are in flight, further opens skip the
+   * entry handler entirely and the work budget never sees them. Size
+   * the pool to the non-exec work-admission cap instead, so admission
+   * (and its fail-open policy under overload) stays in control. */
+  kr_file_open.maxactive = AV_MAX_INFLIGHT_WORK - AV_EXEC_RESERVED_WORK;
   kr_file_open.entry_handler = entry_file_open;
   kr_file_open.handler = exit_file_open;
   return register_kretprobe(&kr_file_open);
