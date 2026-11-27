@@ -1662,7 +1662,7 @@ struct av_fileopen_work {
 static void av_fileopen_work_fn(struct work_struct *w) {
   struct av_fileopen_work *fw = container_of(w, struct av_fileopen_work, work);
   char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
-  char *abs_path = NULL;
+  const char *abs_path = NULL;
   char fallback[128];
 
   if (buf) {
