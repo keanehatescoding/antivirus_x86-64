@@ -1610,10 +1610,14 @@ bool av_behavior_path_is_rapid_write_noise(const char *path) {
   return path_is_rapid_write_noise(path);
 }
 
+u32 av_behavior_path_hash(const char *path) {
+  return full_name_hash(NULL, path, strlen(path));
+}
+
 static void av_behavior_check_openat_common(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
                                             bool sensitive, bool pseudo,
-                                            bool noise) {
+                                            bool noise, u32 path_hash) {
   struct av_behavior_entry *e;
   bool rapid = false;
 
@@ -1638,7 +1642,6 @@ static void av_behavior_check_openat_common(pid_t pid, const char *path,
      * not just given a higher threshold. The sensitive-path check
      * above still applies regardless; only the volume-based signal
      * is exempted. */
-    u32 path_hash = full_name_hash(NULL, path, strlen(path));
     unsigned int in_window = sliding_window_note(
         path_hash, jiffies, WRITE_OPEN_WINDOW_MS, e->recent_path_hashes,
         e->recent_path_jiffies, MAX_TRACKED_PATHS, &e->recent_path_next,
@@ -1661,15 +1664,16 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
   av_behavior_check_openat_common(pid, path, flags, target_pid,
                                   path_is_sensitive(path),
                                   path_is_pseudo_fs(path),
-                                  path_is_rapid_write_noise(path));
+                                  path_is_rapid_write_noise(path),
+                                  av_behavior_path_hash(path));
 }
 
 void av_behavior_check_openat_preclassified(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
                                             bool sensitive, bool pseudo,
-                                            bool noise) {
+                                            bool noise, u32 path_hash) {
   av_behavior_check_openat_common(pid, path, flags, target_pid, sensitive,
-                                  pseudo, noise);
+                                  pseudo, noise, path_hash);
 }
 
 void av_behavior_check_unlink(const char *path, struct pid *target_pid) {

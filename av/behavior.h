@@ -100,18 +100,21 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
 bool av_behavior_path_is_sensitive(const char *path);
 bool av_behavior_path_is_pseudo_fs(const char *path);
 bool av_behavior_path_is_rapid_write_noise(const char *path);
+u32 av_behavior_path_hash(const char *path);
 
-/* av_behavior_check_openat() with all verdicts already captured at
- * observation time. 'path' is used only for logging and the rapid-write
- * hash; if late rendering failed the caller may pass a private fallback
- * string, and the pseudo/noise exclusions must NOT be recomputed from it
- * (the worker's root can render a chrooted /documents/f under /.cache/).
- * Only the security_file_open work handler uses this; every other caller
- * should use the wrapper above, which derives the verdicts itself. */
+/* av_behavior_check_openat() with all verdicts and the sliding-window key
+ * already captured at observation time. 'path' is used only for the log
+ * line; the rapid-write counter must NOT hash a worker-rendered string,
+ * which can collapse distinct opens onto a later-renamed name. If entry
+ * rendering failed, the caller supplies a per-(tgid, dentry) key so
+ * unrelated files do not merge. The pseudo/noise exclusions must not be
+ * recomputed from the late string either (the worker's root can render a
+ * chrooted /documents/f under /.cache/). Only the security_file_open work
+ * handler uses this; every other caller should use the wrapper above. */
 void av_behavior_check_openat_preclassified(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
                                             bool sensitive, bool pseudo,
-                                            bool noise);
+                                            bool noise, u32 path_hash);
 
 /* Called from the unlink/unlinkat work handler. Kills target_pid if
  * `path` (the normalized absolute target) is on the sensitive-path

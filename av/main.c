@@ -1655,6 +1655,7 @@ struct av_fileopen_work {
   bool sensitive; /* all classified at hook entry, NOT re-derived below */
   bool pseudo;
   bool noise;
+  u32 path_hash; /* rapid-write sliding-window key from the entry path */
   struct path path; /* pinned with path_get() in the entry handler, released
                      * in av_fileopen_work_fn(); d_path()'d there only for
                      * the log line and the rapid-write hash */
@@ -1688,7 +1689,8 @@ static void av_fileopen_work_fn(struct work_struct *w) {
    * fake cache path under /.cache/rootfs/. */
   av_behavior_check_openat_preclassified(fw->pid, abs_path, fw->flags,
                                          fw->target_pid, fw->sensitive,
-                                         fw->pseudo, fw->noise);
+                                         fw->pseudo, fw->noise,
+                                         fw->path_hash);
   kfree(buf);
   path_put(&fw->path);
   put_pid(fw->target_pid);
@@ -1738,20 +1740,37 @@ static int entry_file_open(struct kretprobe_instance *ri,
    * workqueue thread's root. */
   {
     char *buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+    const char *entry_path = NULL;
     bool sensitive = false;
     bool pseudo = false;
     bool noise = false;
+    u32 path_hash;
 
     if (buf) {
-      char *entry_path = d_path(&file->f_path, buf, PATH_MAX);
-
-      if (!IS_ERR(entry_path)) {
-        sensitive = av_behavior_path_is_sensitive(entry_path);
-        pseudo = av_behavior_path_is_pseudo_fs(entry_path);
-        noise = av_behavior_path_is_rapid_write_noise(entry_path);
-      }
-      kfree(buf);
+      entry_path = d_path(&file->f_path, buf, PATH_MAX);
+      if (IS_ERR(entry_path))
+        entry_path = NULL;
     }
+    if (entry_path) {
+      sensitive = av_behavior_path_is_sensitive(entry_path);
+      pseudo = av_behavior_path_is_pseudo_fs(entry_path);
+      noise = av_behavior_path_is_rapid_write_noise(entry_path);
+      /* The counting key must be the observed pathname: a worker that
+       * renders after a batch of renames can collapse /documents/f1..f51
+       * onto /documents/sink and defeat the sliding-window threshold. */
+      path_hash = av_behavior_path_hash(entry_path);
+    } else {
+      /* Entry rendering failed. Keep the key distinct per (tgid, dentry)
+       * so unresolved opens do not merge into one bucket; a constant
+       * placeholder here would have the same collapsing effect as a
+       * late-rendered renamed path. */
+      char fallback[128];
+
+      snprintf(fallback, sizeof(fallback), "<unresolved:%d:%p>",
+               task_tgid_nr(current), file->f_path.dentry);
+      path_hash = av_behavior_path_hash(fallback);
+    }
+    kfree(buf);
     /* A failed render fails closed for the sensitive verdict: the
      * deferred check will not claim a sensitive path it could not
      * classify at observation time. For the exclusions, false means
@@ -1760,6 +1779,7 @@ static int entry_file_open(struct kretprobe_instance *ri,
     fw->sensitive = sensitive;
     fw->pseudo = pseudo;
     fw->noise = noise;
+    fw->path_hash = path_hash;
   }
 
   fw->path = file->f_path;
