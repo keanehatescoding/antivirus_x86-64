@@ -44,6 +44,8 @@ scripts/               setup-hooks.sh, av-reload.sh
 
 ## Prerequisites (inside the VM)
 
+* Linux with kernel headers >= 6.12
+
 ```bash
 sudo apt update
 sudo apt install build-essential linux-headers-$(uname -r) git
@@ -68,7 +70,7 @@ dmesg | tail -20
 sudo rmmod av
 ```
 
-Targets x86_64 kernels 5.7+ only, built with `CONFIG_SECURITY=y` (exec is
+Targets x86_64 kernels 6.12+ only, built with `CONFIG_SECURITY=y` (exec is
 intercepted by a kprobe on `security_bprm_check`; the behavioral hooks
 still probe `__x64_sys_*` by symbol name — see the wiki's Architecture
 page for the arm64 note and why it isn't supported). `make CC=clang LLVM=1` builds against a Clang-built kernel.
