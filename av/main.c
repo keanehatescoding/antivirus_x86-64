@@ -179,6 +179,14 @@ static struct kprobe kp_inode_rename = {
 static struct kprobe kp_openat = {
     .symbol_name = "__x64_sys_openat",
 };
+/* Write-intent open tracking at the VFS layer (#105, #94): the kernel
+ * calls security_file_open() with the file it actually resolved, for
+ * every open (open/creat/openat/openat2, io_uring, kernel-internal),
+ * so there is no user string to copy and no syscall ABI to name.
+ * kp_openat above is kept only behind av_legacy_openat_hook. */
+static struct kprobe kp_file_open = {
+    .symbol_name = "security_file_open",
+};
 static struct kprobe kp_unlink = {
     .symbol_name = "__x64_sys_unlink",
 };
@@ -288,6 +296,21 @@ static int av_toctou_test_delay_ms; /* = 0: disabled unless a test sets it */
 module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
                  "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
+
+/* Escape hatch while the security_file_open hook is new: load with
+ * av_legacy_openat_hook=1 to track write-intent opens through the old
+ * __x64_sys_openat kprobe instead. Exactly one of the two is ever
+ * registered (never both: that would double-count every open toward
+ * the rapid-write threshold). Read-only at runtime (0444). */
+static bool av_legacy_openat_hook;
+module_param(av_legacy_openat_hook, bool, 0444);
+MODULE_PARM_DESC(av_legacy_openat_hook,
+                 "Track write-intent opens via the legacy __x64_sys_openat kprobe instead of security_file_open (default 0 = security_file_open); escape hatch, remove once the new hook has soaked");
+
+/* The one probe that tracks write-intent opens for this load. */
+static inline struct kprobe *av_open_probe(void) {
+  return av_legacy_openat_hook ? &kp_openat : &kp_file_open;
+}
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1591,6 +1614,99 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
   return 0;
 }
 
+/* ---- security_file_open: write-intent open tracking at the VFS layer ----
+ *
+ * Replaces the __x64_sys_openat probe as the source for the rapid-write
+ * and sensitive-path-write heuristics. What changes, and why:
+ *   - No user-memory copy. The syscall-entry hook copied the filename
+ *     with strncpy_from_user() in atomic context, which fails (the event
+ *     is silently dropped) when the string sits on a page that is not
+ *     resident, and reads the string before the kernel does, so another
+ *     thread can rewrite it in between. Here the kernel has already
+ *     resolved the file; we pin its struct path and d_path() it later.
+ *   - Every spelling of open is seen: open(), creat(), openat2(),
+ *     io_uring, not just openat().
+ *   - The path is canonical (symlinks followed, no "..", no dfd/cwd
+ *     resolution to get wrong), unlike resolve_absolute_path()'s purely
+ *     lexical result.
+ *   - Only opens that passed the permission checks are seen: a denied
+ *     write to a sensitive path is no longer counted. That is deliberate:
+ *     a write the kernel refused did no harm, and counting it only adds
+ *     false-positive kill risk.
+ *
+ * Skipped: kernel threads, O_PATH, and FMODE_BACKING files (overlayfs
+ * opens a backing file for every overlay open; the overlay file itself
+ * is the one the user sees, and counting both would double every open in
+ * a container toward the rapid-write threshold).
+ *
+ * security_file_open() runs before O_CREAT/O_EXCL/O_TRUNC are cleared
+ * from f_flags (do_dentry_open()), so the existing write-intent flag test
+ * in behavior.c still sees them. */
+struct av_fileopen_work {
+  struct work_struct work;
+  struct pid *target_pid;
+  pid_t pid; /* tgid, not thread id - same keying as av_openat_work */
+  int flags;
+  struct path path; /* pinned with path_get() in the handler, released in
+                     * av_fileopen_work_fn(); d_path()'d there, in process
+                     * context */
+};
+
+static void av_fileopen_work_fn(struct work_struct *w) {
+  struct av_fileopen_work *fw = container_of(w, struct av_fileopen_work, work);
+  char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
+
+  if (buf) {
+    char *abs_path = d_path(&fw->path, buf, PATH_MAX);
+
+    if (!IS_ERR(abs_path))
+      av_behavior_check_openat(fw->pid, abs_path, fw->flags, fw->target_pid);
+    kfree(buf);
+  }
+  path_put(&fw->path);
+  put_pid(fw->target_pid);
+  kfree(fw);
+  av_work_release();
+}
+
+/* security_file_open(struct file *file) */
+static int handler_pre_file_open(struct kprobe *p, struct pt_regs *regs) {
+  const struct file *file =
+      (const struct file *)regs_get_kernel_argument(regs, 0);
+  struct av_fileopen_work *fw;
+  unsigned int flags;
+
+  if (!file || (current->flags & PF_KTHREAD))
+    return 0;
+  if (file->f_mode & FMODE_BACKING)
+    return 0;
+  flags = file->f_flags;
+  if (flags & O_PATH)
+    return 0;
+  /* Same cheap integer pre-filter as the syscall hook: read-only opens
+   * are the overwhelming majority and behavior.c would discard them. */
+  if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
+    return 0;
+
+  if (!av_work_admit_nonexec())
+    return 0;
+
+  fw = kmalloc(sizeof(*fw), GFP_ATOMIC);
+  if (!fw) {
+    av_work_release();
+    return 0;
+  }
+  fw->path = file->f_path;
+  path_get(&fw->path);
+  fw->flags = (int)flags;
+  fw->pid = task_tgid_nr(current);
+  fw->target_pid = get_task_pid(current, PIDTYPE_PID);
+  INIT_WORK(&fw->work, av_fileopen_work_fn);
+  queue_work(av_wq, &fw->work);
+
+  return 0;
+}
+
 /* ---- unlink/unlinkat: sensitive-path deletion (self-delete is the
  * inode-level probe above) ---- */
 
@@ -2060,10 +2176,17 @@ static int __init av_init(void) {
     goto err_netlink;
   }
 
-  kp_openat.pre_handler = handler_pre_openat;
-  ret = register_kprobe(&kp_openat);
+  if (av_legacy_openat_hook) {
+    kp_openat.pre_handler = handler_pre_openat;
+    pr_info("kernel-av: av_legacy_openat_hook=1, write-intent opens tracked "
+            "via __x64_sys_openat\n");
+  } else {
+    kp_file_open.pre_handler = handler_pre_file_open;
+  }
+  ret = register_kprobe(av_open_probe());
   if (ret < 0) {
-    pr_err("kernel-av: register_kprobe(openat) failed: %d\n", ret);
+    pr_err("kernel-av: register_kprobe(%s) failed: %d\n",
+           av_open_probe()->symbol_name, ret);
     goto err_kp_bprm_check;
   }
 
@@ -2145,7 +2268,7 @@ err_kp_unlinkat:
 err_kp_unlink:
   unregister_kprobe(&kp_unlink);
 err_kp_openat:
-  unregister_kprobe(&kp_openat);
+  unregister_kprobe(av_open_probe());
 err_kp_bprm_check:
   unregister_kprobe(&kp_bprm_check);
 err_netlink:
@@ -2175,7 +2298,7 @@ static void __exit av_exit(void) {
   unregister_kprobe(&kp_rename);
   unregister_kprobe(&kp_unlinkat);
   unregister_kprobe(&kp_unlink);
-  unregister_kprobe(&kp_openat);
+  unregister_kprobe(av_open_probe());
   unregister_kprobe(&kp_bprm_check);
   /* destroy_workqueue() flushes all pending work first, so no work
    * item can run against unloaded module .text after this returns. */
