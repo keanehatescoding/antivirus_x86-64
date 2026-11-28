@@ -588,6 +588,16 @@ about 77 MiB, must be convicted in a worker as in process) and was checked to
 fail on the old limit with exactly the old symptom (`verdict=0
 inconclusive=1`, not quarantined).
 
+That guarantee assumes the process's **`RLIMIT_AS` is unlimited**. Unlike
+`RLIMIT_DATA`, an address-space limit does count libyara's read-only
+whole-file mapping; a finite value below the scan cap makes every large scan
+fail open the same way the old limit did. `privsep_start()` now checks it and
+refuses to start workers with an actionable message (`ulimit -v unlimited` or
+`LimitAS=infinity`), and the inconclusive log names the address-space limit
+so it cannot be misattributed to `AVD_PRIVSEP_DATA_HEADROOM_MB`. An
+inconclusive verdict is not harmless: it sends `FAN_ALLOW`, skips quarantine
+and is not cached. This regression is tracked in #257.
+
 What `RLIMIT_DATA` does not count, checked on a live kernel (6.18) with a
 256 MiB limit, is the reason for the `mmap` rule above. The kernel counts a
 mapping as data only if it is writable, private and not stack-flagged, so two

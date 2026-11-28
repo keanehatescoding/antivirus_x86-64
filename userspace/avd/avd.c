@@ -94,6 +94,7 @@
 #include <string.h>
 #include <sys/fanotify.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -2543,6 +2544,11 @@ static void analyze_content(int fd, const char *path, const char *hash,
 #define AVD_PRIVSEP_DATA_HEADROOM_MB_MAX 65536
 static int privsep_data_headroom_mb = AVD_PRIVSEP_DATA_HEADROOM_MB_DEFAULT;
 static unsigned long long privsep_data_limit_mb; /* the limit workers got */
+/* Cached at startup for diagnostic logs. Only the CURRENT process's limit
+ * matters: workers inherit it and cannot raise a hard limit after dropping
+ * privileges. Unlimited is encoded as unlimited=true, value 0. */
+static unsigned long long privsep_as_limit_mb;
+static bool privsep_as_unlimited = true;
 
 /* Each scan thread holds one worker and a replacement can briefly coexist
  * with its predecessor, so the spawner's table must cover twice the pool. */
@@ -2643,6 +2649,30 @@ static int privsep_start(uid_t uid, gid_t gid) {
                                 << 20;
   pid_t spawner_pid;
   int ctl_fd;
+  struct rlimit as_limit;
+
+  /* libyara maps the whole scanned file (up to
+   * MAX_FUZZY_TLSH_FILE_SIZE) with MAP_PRIVATE. RLIMIT_DATA does not
+   * count that mapping, but RLIMIT_AS does. If the operator has set a
+   * finite address-space limit (ulimit -v, systemd LimitAS=, a
+   * container limit), a padded file cannot be mapped and the worker
+   * answers CLEAN + inconclusive - which sends FAN_ALLOW, skips
+   * quarantine and skips the verdict cache. Refuse to start privsep
+   * with an actionable message instead of failing open silently. */
+  if (getrlimit(RLIMIT_AS, &as_limit) == 0) {
+    privsep_as_unlimited = as_limit.rlim_cur == RLIM_INFINITY;
+    privsep_as_limit_mb = privsep_as_unlimited ? 0 : as_limit.rlim_cur >> 20;
+    if (!privsep_as_unlimited && as_limit.rlim_cur <
+                                     vm + MAX_FUZZY_TLSH_FILE_SIZE) {
+      fprintf(stderr,
+              "avd: privsep: RLIMIT_AS is %llu MiB but scanning needs "
+              "to map up to %u MiB per file; raise it (ulimit -v unlimited "
+              "or systemd LimitAS=infinity) - refusing to fail open on "
+              "large files\n",
+              privsep_as_limit_mb, MAX_FUZZY_TLSH_FILE_SIZE >> 20);
+      return -1;
+    }
+  }
 
   memset(&cfg, 0, sizeof(cfg));
   cfg.harden.uid = uid;
@@ -2855,13 +2885,22 @@ static void analyze_in_worker(int fd, const char *path, const char *hash,
      * reply carries no reason, so the cause is not known here. Name the
      * likeliest one's inputs, so that an operator who finds a large file
      * fail open can tell a memory limit from a timeout. */
-    if (fstat(fd, &st) == 0)
+    if (fstat(fd, &st) == 0) {
+      char as_buf[32];
+
+      if (privsep_as_unlimited)
+        snprintf(as_buf, sizeof(as_buf), "unlimited");
+      else
+        snprintf(as_buf, sizeof(as_buf), "%llu MiB", privsep_as_limit_mb);
       fprintf(stderr,
               "avd: privsep: scan of \"%s\" inconclusive in the worker (file "
-              "%llu MiB, worker data limit %llu MiB; if the worker ran out of "
-              "memory, raise AVD_PRIVSEP_DATA_HEADROOM_MB)\n",
+              "%llu MiB, data limit %llu MiB, address space %s; a finite "
+              "RLIMIT_AS also blocks libyara's whole-file mapping - check "
+              "ulimit -v / LimitAS= before changing "
+              "AVD_PRIVSEP_DATA_HEADROOM_MB)\n",
               path, (unsigned long long)st.st_size >> 20,
-              privsep_data_limit_mb);
+              privsep_data_limit_mb, as_buf);
+    }
   }
   if (v.verdict == PS_VERDICT_MALICIOUS) {
     out->verdict = AV_VERDICT_MALICIOUS;

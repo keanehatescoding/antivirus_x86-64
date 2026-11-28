@@ -802,6 +802,17 @@ fi
 # inherited data plus 64 MiB.
 echo
 echo "== a file bigger than the worker's data limit =="
+# Finite RLIMIT_AS makes libyara's 256 MiB whole-file mapping fail in the
+# worker, which answers CLEAN + inconclusive (FAN_ALLOW, no quarantine).
+# Refuse to run with a clear message instead of reporting a misleading
+# verdict mismatch; the shell and systemd unit both default to unlimited.
+if [ "$(id -u)" -eq 0 ]; then
+    as_kib=$(ulimit -v)
+    if [ "$as_kib" != "unlimited" ] && [ "$as_kib" -lt 262144 ]; then
+        fail "ulimit -v is ${as_kib} KiB (RLIMIT_AS); libyara must map up to 256 MiB in a worker - raise it (or set LimitAS=infinity) before running this case"
+        exit 1
+    fi
+fi
 BIG_WANT='verdict=1 rule="T_Override" score=10 inconclusive=0 still_at_path=0'
 run_mode big-inproc HARNESS_BIG=1
 got="$(grep -F 'CASE big_over_data_limit ' "$OUT" | sed -E 's/ sha=[0-9a-f]*//')"
