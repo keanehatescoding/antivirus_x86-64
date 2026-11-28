@@ -147,6 +147,44 @@ jobs:
             -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
             'sudo timeout 1800 bash /tmp/avtest/.github/scripts/avd_unit_vm_guest.sh ${{ matrix.distro }} /tmp/avtest'
 
+      # A bulk-write test that SKIPs on a kernel where security_file_open
+      # does not fire keeps run_all.sh green while the write-intent
+      # heuristics are dead. Assert coverage independently on every leg,
+      # including the 7.x one: the module's load-time self-test must pass
+      # and real user writes must move av_open_hook_hits. A fallback to
+      # the legacy openat kprobe is a loud failure here, not a pass.
+      - name: Assert the write-intent hook fires on this kernel
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
+            'set -e
+             sudo dmesg -c >/dev/null
+             cd /tmp/avtest
+             sudo insmod av/av.ko
+             sudo dmesg | grep -E "self-test|falling back|never fired" || true
+             if sudo dmesg | grep -q "never fired in self-test"; then
+               echo "security_file_open did not fire on $(uname -r)" >&2
+               sudo rmmod av || true
+               exit 1
+             fi
+             if sudo dmesg | grep -q "falling back to"; then
+               echo "open hook fell back on $(uname -r)" >&2
+               sudo rmmod av || true
+               exit 1
+             fi
+             before=$(cat /sys/module/av/parameters/av_open_hook_hits)
+             mkdir -p /tmp/av_hook_check
+             for i in $(seq 1 20); do printf x > /tmp/av_hook_check/f$i; done
+             after=$(cat /sys/module/av/parameters/av_open_hook_hits)
+             echo "kernel=$(uname -r) av_open_hook_hits before=$before after=$after"
+             sudo rmmod av
+             if [ "$after" -le "$before" ]; then
+               echo "write-intent hook did not observe real writes on $(uname -r)" >&2
+               exit 1
+             fi'
+
       - name: Dump logs on failure
         if: failure()
         run: |
