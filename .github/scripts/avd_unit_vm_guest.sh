@@ -74,7 +74,7 @@ lsmod | grep -E '^av[[:space:]]' || fail "av.ko is not loaded"
 systemctl daemon-reload
 systemctl enable avd.service >/dev/null 2>&1 || true
 systemctl restart avd.service
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     systemctl is-active --quiet avd.service && break
     sleep 1
 done
@@ -97,7 +97,7 @@ nnp=$(awk '/^NoNewPrivs/{print $2}' "/proc/$pid/status")
 # The parent narrows its own capabilities after the spawner starts, so the
 # CAP_SETUID check belongs on the spawner (the child that does capset()).
 spawner=""
-for i in $(seq 1 10); do
+for _ in $(seq 1 10); do
     spawner=$(pgrep -P "$pid" -x avd | head -1 || true)
     [ -n "$spawner" ] && break
     sleep 1
