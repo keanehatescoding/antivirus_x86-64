@@ -1495,6 +1495,21 @@ static int write_quarantine_meta(int qdirfd, const char *name,
     return -1;
   }
 
+  /* The sidecar is a line-oriented key=value file. A newline or carriage
+   * return in any string field would corrupt the record: fgets() in
+   * read_quarantine_meta() would split it, truncating ORIGINAL_PATH (and
+   * therefore restoring to the wrong location) or mangling the other
+   * fields. Linux filenames may contain newlines, so reject rather than
+   * write a malformed sidecar; the caller keeps the quarantine itself and
+   * logs that restore via avctl will not be possible. */
+  if ((orig_path && strpbrk(orig_path, "\r\n")) ||
+      (rule_name && strpbrk(rule_name, "\r\n")) ||
+      (sha256_hex && strpbrk(sha256_hex, "\r\n"))) {
+    fclose(f);
+    unlinkat(qdirfd, meta_name, 0);
+    return -1;
+  }
+
   if (fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600) < 0 ||
       fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0) < 0 ||
       fprintf(f, "ORIGINAL_GID=%d\n", orig_st ? (int)orig_st->st_gid : 0) < 0 ||
