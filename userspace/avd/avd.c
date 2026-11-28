@@ -362,7 +362,24 @@ struct scan_result {
    * because every check ran and came back clean. The fanotify verdict
    * cache refuses to remember such a result - see fan_cache_store(). */
   bool inconclusive;
+  /* Deterministic, attacker-controlled failure: the file is at or past
+   * the scan cap and the content pipeline could not cover it. Unlike a
+   * transient worker death/timeout, sizing a file to defeat the scan is
+   * not a temporary condition, so it is handled by an explicit policy
+   * (AVD_SCAN_LIMIT_POLICY) instead of a silent fail-open. */
+  bool over_limit;
+  /* Set from over_limit by the policy in perform_scan(); fanotify denies
+   * the exec when this is true. It is kept separate from the verdict so
+   * an unscannable file is refused without being quarantined as malware. */
+  bool deny_exec;
 };
+
+/* Over-limit policy. Default deny: allowing a file whose size was chosen
+ * to defeat the scanner is a silent fail-open. "alert" logs loudly and
+ * still allows (for operators who need compatibility), "allow" keeps the
+ * old silent behaviour. Parsed once at startup; a typo aborts startup. */
+enum { AVD_SCAN_LIMIT_ALLOW, AVD_SCAN_LIMIT_ALERT, AVD_SCAN_LIMIT_DENY };
+static int scan_limit_policy = AVD_SCAN_LIMIT_DENY;
 
 /* Bounded producer/consumer queue between the scan producers (the single
  * netlink recv thread via msg_handler(), plus one control-connection
@@ -2366,6 +2383,11 @@ static void analyze_content(int fd, const char *path, const char *hash,
     fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
             ret);
     out->inconclusive = true;
+    /* A timeout is transient and stays fail-open. A deterministic
+     * mapping/memory failure on a file the sender sized past the cap is
+     * not: it is an attacker-controlled way to skip content scanning. */
+    if (ret != ERROR_SCAN_TIMEOUT)
+      out->over_limit = true;
     return;
   }
 
@@ -2888,6 +2910,11 @@ static void analyze_in_worker(int fd, const char *path, const char *hash,
     if (fstat(fd, &st) == 0) {
       char as_buf[32];
 
+      /* A worker death/timeout is transient and stays fail-open. A file
+       * at or past the scan cap that the worker could not scan is a
+       * deterministic, attacker-sized condition. */
+      if (st.st_size >= (off_t)MAX_FUZZY_TLSH_FILE_SIZE)
+        out->over_limit = true;
       if (privsep_as_unlimited)
         snprintf(as_buf, sizeof(as_buf), "unlimited");
       else
@@ -3016,6 +3043,33 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   clock_gettime(CLOCK_MONOTONIC, &scan_t0);
 
   analyze_fd(fd, path, sha256_hex, pid, on_demand, out);
+
+  /* Deterministic over-limit is not a transient failure. Log it loudly
+   * and, under the default policy, deny the exec (without quarantining a
+   * file we have no malware verdict for). A worker death or timeout only
+   * sets `inconclusive` and still fails open. */
+  if (out->over_limit) {
+    const char *pol = scan_limit_policy == AVD_SCAN_LIMIT_ALLOW
+                          ? "allow"
+                          : (scan_limit_policy == AVD_SCAN_LIMIT_ALERT
+                                 ? "alert"
+                                 : "deny");
+
+    fprintf(stderr,
+            "avd: scan limit: \"%s\" (%llu MiB) exceeded the %u MiB scan "
+            "cap or could not be mapped; policy=%s - %s\n",
+            path,
+            owner_uid == (uid_t)-1 ? 0ULL
+                                   : (unsigned long long)owner_st.st_size >> 20,
+            MAX_FUZZY_TLSH_FILE_SIZE >> 20, pol,
+            scan_limit_policy == AVD_SCAN_LIMIT_DENY
+                ? "denying execution"
+                : (scan_limit_policy == AVD_SCAN_LIMIT_ALERT
+                       ? "allowing with an alert"
+                       : "allowing"));
+    if (scan_limit_policy == AVD_SCAN_LIMIT_DENY)
+      out->deny_exec = true;
+  }
 
   /* The one place a scan acts on its verdict. Every MALICIOUS result
    * (signature, YARA, fuzzy, TLSH) used to quarantine inline at the point
@@ -3474,7 +3528,8 @@ static void fan_run_task(struct fan_pending *p) {
   late = p->responded;
   released = fan_fd < 0;
   if (!late && !released)
-    fan_respond(p->fd, res.verdict != AV_VERDICT_MALICIOUS);
+    fan_respond(p->fd,
+                res.verdict != AV_VERDICT_MALICIOUS && !res.deny_exec);
   p->responded = true;
   pthread_mutex_unlock(&fan_pending_lock);
 
@@ -5639,6 +5694,27 @@ int main(int argc, char **argv) {
               "avd: AVD_PRIVSEP_SECCOMP must be \"kill\" or \"log\", not "
               "\"%s\" - aborting\n",
               sc_env);
+      return 1;
+    }
+  }
+
+  /* What to do when a file is at/past the scan cap and the content
+   * pipeline cannot cover it. A transient worker death/timeout stays
+   * fail-open regardless; this only governs the deterministic case. */
+  {
+    const char *sl_env = getenv("AVD_SCAN_LIMIT_POLICY");
+
+    if (!sl_env || !*sl_env || strcmp(sl_env, "deny") == 0) {
+      scan_limit_policy = AVD_SCAN_LIMIT_DENY;
+    } else if (strcmp(sl_env, "alert") == 0) {
+      scan_limit_policy = AVD_SCAN_LIMIT_ALERT;
+    } else if (strcmp(sl_env, "allow") == 0) {
+      scan_limit_policy = AVD_SCAN_LIMIT_ALLOW;
+    } else {
+      fprintf(stderr,
+              "avd: AVD_SCAN_LIMIT_POLICY must be \"deny\", \"alert\" or "
+              "\"allow\", not \"%s\" - aborting\n",
+              sl_env);
       return 1;
     }
   }

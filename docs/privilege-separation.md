@@ -598,6 +598,24 @@ so it cannot be misattributed to `AVD_PRIVSEP_DATA_HEADROOM_MB`. An
 inconclusive verdict is not harmless: it sends `FAN_ALLOW`, skips quarantine
 and is not cached. This regression is tracked in #257.
 
+### Over-limit policy
+
+An `inconclusive` result has two distinct causes and they are no longer
+treated the same. A worker death, spawn failure or timeout is transient:
+it still fails open with a loud log. A file that is at or past the scan cap
+(256 MiB) and could not be mapped or scanned is deterministic and
+attacker-controlled — padding a malicious sample is enough to trigger it —
+so it is a policy decision instead of a silent allow:
+
+- `AVD_SCAN_LIMIT_POLICY=deny` (default): log loudly and send `FAN_DENY`,
+  without quarantining a file for which there is no malware verdict.
+- `AVD_SCAN_LIMIT_POLICY=alert`: log loudly and still allow, for operators
+  who need compatibility with very large files.
+- `AVD_SCAN_LIMIT_POLICY=allow`: the old silent behaviour.
+
+`tests/test_perform_scan.sh` includes a known-bad sample padded to 512 MiB
+and asserts it is either convicted or denied, never silently allowed.
+
 What `RLIMIT_DATA` does not count, checked on a live kernel (6.18) with a
 256 MiB limit, is the reason for the `mmap` rule above. The kernel counts a
 mapping as data only if it is writable, private and not stack-flagged, so two
