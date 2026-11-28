@@ -1,0 +1,218 @@
+name: avd unit under real systemd
+
+# Tier 3 CI: boots throwaway Ubuntu and Fedora cloud VMs, builds avd and
+# av.ko from this checkout, starts avd.service through the real `make
+# install` unit and checks that real execs reach it and are scanned with
+# privilege separation on. This is the check that would have caught #252:
+# the in-guest end-to-end tests start avd outside systemd under setpriv,
+# which applies capability sets as declared and cannot reproduce what a
+# service manager does to a root service's CapPrm (see #254).
+#
+# Both matrix legs are real systemd releases, not containers: Ubuntu 26.04
+# (systemd 259) and Fedora 43 (systemd 258). The logs are dumped on failure
+# so a startup regression shows the actual avd message, not just "activating".
+
+# Hosted runners have no /dev/kvm, so both legs fall back to TCG: the
+# observed run took 9m23s (Ubuntu) and 14m20s (Fedora). Fine for a nightly
+# or manual job, too expensive for every PR, and it must not be a required
+# check. Push-on-master with path filters catches the merge that would
+# break the shipped unit; nightly catches image drift (Ubuntu's URL floats).
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'av/**'
+      - 'userspace/avd/**'
+      - 'packaging/**'
+      - 'tests/**'
+      - '.github/**'
+
+permissions:
+  contents: read
+  # Nightly failures must reach a human, not just sit in the Actions UI.
+  issues: write
+
+jobs:
+  avd-unit-systemd:
+    runs-on: ubuntu-latest
+    # Hosted TCG legs took 9m23s and 14m20s end to end; leave headroom
+    # but fail a stuck VM well before an hour.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # resolute/current floats on purpose: a new systemd release
+          # should reach this job without a workflow edit. That also means
+          # an image change can break CI for reasons unrelated to the PR -
+          # check the image/serial log before blaming the diff.
+          - distro: ubuntu
+            user: ubuntu
+            port: 2222
+            image: https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
+          # The Fedora mirror has dropped a download mid-transfer before;
+          # keep the curl retries below rather than pinning a single URL.
+          - distro: fedora
+            user: fedora
+            port: 2223
+            image: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install VM tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils \
+            cloud-image-utils openssh-client
+
+      - name: Create an ephemeral SSH key and cloud-init seed
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          mkdir -p "$WORK/seed"
+          ssh-keygen -q -t ed25519 -N '' -f "$WORK/key"
+          chmod 600 "$WORK/key"
+          cat > "$WORK/seed/user-data" <<EOF
+          #cloud-config
+          hostname: avd-unit
+          manage_etc_hosts: true
+          ssh_authorized_keys:
+            - $(cat "$WORK/key.pub")
+          package_update: false
+          package_upgrade: false
+          growpart:
+            mode: auto
+            devices: ['/']
+          EOF
+          cat > "$WORK/seed/meta-data" <<EOF
+          instance-id: avd-unit-${{ matrix.distro }}-${{ github.run_id }}-${{ github.run_attempt }}
+          local-hostname: avd-unit
+          EOF
+          cloud-localds "$WORK/seed.iso" "$WORK/seed/user-data" "$WORK/seed/meta-data"
+
+      - name: Download the cloud image
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          curl -fL --retry 3 -o "$WORK/base.img" "${{ matrix.image }}"
+          qemu-img create -f qcow2 -b "$WORK/base.img" -F qcow2 "$WORK/vm.qcow2" 40G
+
+      - name: Boot the VM
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          # Free-tier runners often have no /dev/kvm; TCG is slow but works.
+          if [ -r /dev/kvm ]; then ACCEL=kvm; else ACCEL=tcg; fi
+          qemu-system-x86_64 -name "avd-unit-${{ matrix.distro }}" -daemonize \
+            -machine "accel=$ACCEL" -m 3072 -smp 2 \
+            -drive "file=$WORK/vm.qcow2,if=virtio" \
+            -drive "file=$WORK/seed.iso,if=virtio,readonly=on" \
+            -nic "user,model=virtio-net-pci,hostfwd=tcp::${{ matrix.port }}-:22" \
+            -display none -serial "file:$WORK/serial.log" -pidfile "$WORK/vm.pid"
+          echo "qemu accel=$ACCEL pid=$(cat "$WORK/vm.pid")"
+
+      - name: Wait for cloud-init
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+               -o ConnectTimeout=5 -i "$WORK/key" -p ${{ matrix.port }} \
+               ${{ matrix.user }}@127.0.0.1)
+          up=0
+          for i in $(seq 1 120); do
+            if "${SSH[@]}" true 2>/dev/null; then up=1; break; fi
+            sleep 5
+          done
+          if [ "$up" -ne 1 ]; then tail -100 "$WORK/serial.log"; exit 1; fi
+          "${SSH[@]}" 'sudo cloud-init status --wait'
+
+      - name: Copy the checkout into the VM
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          tar --exclude=.git -czf - -C "$GITHUB_WORKSPACE" . | \
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
+              'mkdir -p /tmp/avtest && tar xzf - -C /tmp/avtest'
+
+      - name: Run avd under the shipped unit
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
+            'sudo timeout 1800 bash /tmp/avtest/.github/scripts/avd_unit_vm_guest.sh ${{ matrix.distro }} /tmp/avtest'
+
+      # A bulk-write test that SKIPs on a kernel where security_file_open
+      # does not fire keeps run_all.sh green while the write-intent
+      # heuristics are dead. Assert coverage independently on every leg,
+      # including the 7.x one: the module's load-time self-test must pass
+      # and real user writes must move av_open_hook_hits. A fallback to
+      # the legacy openat kprobe is a loud failure here, not a pass.
+      - name: Assert the write-intent hook fires on this kernel
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/avd-unit"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
+            'set -e
+             sudo dmesg -c >/dev/null
+             cd /tmp/avtest
+             sudo insmod av/av.ko
+             sudo dmesg | grep -E "self-test|falling back|never fired" || true
+             if sudo dmesg | grep -q "never fired in self-test"; then
+               echo "security_file_open did not fire on $(uname -r)" >&2
+               sudo rmmod av || true
+               exit 1
+             fi
+             if sudo dmesg | grep -q "falling back to"; then
+               echo "open hook fell back on $(uname -r)" >&2
+               sudo rmmod av || true
+               exit 1
+             fi
+             before=$(cat /sys/module/av/parameters/av_open_hook_hits)
+             mkdir -p /tmp/av_hook_check
+             for i in $(seq 1 20); do printf x > /tmp/av_hook_check/f$i; done
+             after=$(cat /sys/module/av/parameters/av_open_hook_hits)
+             echo "kernel=$(uname -r) av_open_hook_hits before=$before after=$after"
+             sudo rmmod av
+             if [ "$after" -le "$before" ]; then
+               echo "write-intent hook did not observe real writes on $(uname -r)" >&2
+               exit 1
+             fi'
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          WORK="$RUNNER_TEMP/avd-unit"
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
+            'sudo journalctl -u avd.service --no-pager -n 200' 2>/dev/null || true
+          tail -100 "$WORK/serial.log" 2>/dev/null || true
+
+      - name: Stop the VM
+        if: always()
+        run: |
+          WORK="$RUNNER_TEMP/avd-unit"
+          if [ -f "$WORK/vm.pid" ]; then
+            kill "$(cat "$WORK/vm.pid")" 2>/dev/null || true
+          fi
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="avd-unit-systemd failed (run ${{ github.run_id }})"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "Scheduled/dispatch run failed on ${{ matrix.distro }} (${{ matrix.image }}). Logs: $RUN_URL"
+          fi
