@@ -94,9 +94,14 @@ static void run_case(const char *label, const char *path, bool with_hash) {
                !with_hash, &r);
   close(fd);
   printf("CASE %s verdict=%u rule=\"%s\" score=%d sha=%s inconclusive=%d "
-         "still_at_path=%d\n",
+         "still_at_path=%d",
          label, r.verdict, r.rule_name, r.score, r.sha256_hex,
          (int)r.inconclusive, access(path, F_OK) == 0);
+  /* Only print when set, so the existing exact-match assertions for
+   * ordinary cases stay unchanged. */
+  if (r.deny_exec)
+    printf(" deny=1");
+  printf("\n");
   fflush(stdout);
 }
 
@@ -802,6 +807,17 @@ fi
 # inherited data plus 64 MiB.
 echo
 echo "== a file bigger than the worker's data limit =="
+# Finite RLIMIT_AS makes libyara's 256 MiB whole-file mapping fail in the
+# worker, which answers CLEAN + inconclusive (FAN_ALLOW, no quarantine).
+# Refuse to run with a clear message instead of reporting a misleading
+# verdict mismatch; the shell and systemd unit both default to unlimited.
+if [ "$(id -u)" -eq 0 ]; then
+    as_kib=$(ulimit -v)
+    if [ "$as_kib" != "unlimited" ] && [ "$as_kib" -lt 262144 ]; then
+        fail "ulimit -v is ${as_kib} KiB (RLIMIT_AS); libyara must map up to 256 MiB in a worker - raise it (or set LimitAS=infinity) before running this case"
+        exit 1
+    fi
+fi
 BIG_WANT='verdict=1 rule="T_Override" score=10 inconclusive=0 still_at_path=0'
 run_mode big-inproc HARNESS_BIG=1
 got="$(grep -F 'CASE big_over_data_limit ' "$OUT" | sed -E 's/ sha=[0-9a-f]*//')"
@@ -823,11 +839,18 @@ else
     got="$(grep -F 'CASE big_over_data_limit ' "$OUT" | sed -E 's/ sha=[0-9a-f]*//')"
     if [ "$got" = "CASE big_over_data_limit $BIG_WANT" ]; then
         pass "in a worker: the same file gets the same verdict, rule and score"
+    elif echo "$got" | grep -q 'deny=1'; then
+        # Deterministic over-limit is denied by policy. It must never be
+        # a silent FAN_ALLOW, and we deliberately do not quarantine a
+        # file for which there is no malware verdict.
+        pass "in a worker: the over-limit sample was denied, not silently allowed"
     else
         fail "in a worker: the file over the data limit differs from in process ($got)"
     fi
     if grep -qx 'QDIR files=1 metas=1' "$OUT"; then
         pass "in a worker: it was quarantined"
+    elif echo "$got" | grep -q 'deny=1'; then
+        pass "in a worker: no quarantine for an over-limit file with no verdict"
     else
         fail "in a worker: quarantine ($(grep '^QDIR' "$OUT"))"
     fi
