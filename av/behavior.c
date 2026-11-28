@@ -1609,6 +1609,13 @@ void av_behavior_record_exec(pid_t pid, const char *path,
       e->recent_path_filled = 0;
       e->recent_rename_next = 0;
       e->recent_rename_filled = 0;
+      /* #256: the creation-only window and its one-shot log flag belong
+       * to this task incarnation too. Without the reset, a recycled pid
+       * inherits a full creation ring and an already-set flag, so its
+       * first burst is neither counted nor logged. */
+      e->recent_created_next = 0;
+      e->recent_created_filled = 0;
+      e->bulk_create_logged = false;
     }
   }
   mutex_unlock(&behavior_lock);
@@ -2074,6 +2081,10 @@ void av_behavior_exec_ident_stage(const struct file *file) {
   rcu_read_unlock();
 
   kfree(fresh);
+  /* cppcheck cannot prove that exec_ident_sweep_dead_locked() can drop
+   * exec_ident_count below the cap, so it reports this reachable guard
+   * as always false. Keep the guard: load-bearing under table churn. */
+  // cppcheck-suppress knownConditionTrueFalse
   if (full)
     pr_warn_ratelimited("kernel-av: event=skip reason=exec-ident-table-full "
                         "pid=%d\n",
