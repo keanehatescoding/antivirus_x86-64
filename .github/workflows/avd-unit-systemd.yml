@@ -32,6 +32,8 @@ on:
 
 permissions:
   contents: read
+  # Nightly failures must reach a human, not just sit in the Actions UI.
+  issues: write
 
 jobs:
   avd-unit-systemd:
@@ -160,4 +162,19 @@ jobs:
           WORK="$RUNNER_TEMP/avd-unit"
           if [ -f "$WORK/vm.pid" ]; then
             kill "$(cat "$WORK/vm.pid")" 2>/dev/null || true
+          fi
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="avd-unit-systemd failed (run ${{ github.run_id }})"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "Scheduled/dispatch run failed on ${{ matrix.distro }} (${{ matrix.image }}). Logs: $RUN_URL"
           fi
