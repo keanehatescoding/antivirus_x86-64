@@ -167,6 +167,43 @@ precisely: the implementation bug is gone; the inherent limitation of
 finite counting-based rate limiting is not, and isn't something this
 design can fully close.
 
+## 5. Write-intent hook coverage depends on the kernel
+
+Since #249 the default source for write-intent opens is a
+`security_file_open` kretprobe; the old `__x64_sys_openat` kprobe is only
+an escape hatch (`av_legacy_openat_hook=1`). Both the rapid-write and the
+sensitive-path-write heuristics depend on that hook: if it never fires,
+neither heuristic runs at all, while the rest of avd (exec hashing, YARA,
+fanotify) keeps working and nothing in the logs says why.
+
+This is not hypothetical. The hook was observed to fire on Fedora 43 /
+kernel 6.17.1 but not on this host's 7.3.6-3-cachyos: loading the module
+produced no write-intent behavior events there, and a bulk-write test had
+to SKIP on that kernel rather than fail. `av_file_open_nmissed` does not
+catch this — it counts missed *return-probe instances*, not a probe that
+is never entered, so it stays at zero when coverage is completely lost.
+
+Two observability guarantees now exist:
+
+- `av_file_open_hits` (read-only sysfs param) counts write-intent opens
+  seen by the active hook's entry handler, before work admission. Zero
+  after real write activity means the hook is not firing.
+- At load time the module opens `/dev/null` for writing and checks that
+  `av_file_open_hits` moved. If the kretprobe registered but did not
+  fire, it logs an error, unregisters and **falls back** to the legacy
+  `__x64_sys_openat` kprobe. The fallback restores write-intent coverage
+  but is a syscall-entry hook: it has no access to the VFS-layer
+  `FMODE_CREATED` bit, so newly created files cannot be distinguished
+  from modifications of existing ones there. A fallback therefore also
+  reintroduces the bulk-extraction false positive described in #256 —
+  operators should check `dmesg` for the fallback warning before
+  attributing a false positive to the creation/modification split.
+
+A test that SKIPs because the hook does not fire is only safe if something
+else is loud. The nightly systemd job asserts a nonzero hit count on its
+kernel legs; a bare SKIP from `test_bulk_write.sh` must never be read as
+"the heuristic was validated on this kernel".
+
 ## Overall takeaways for the report
 
 - Every individual detection layer has a known, demonstrable evasion.
