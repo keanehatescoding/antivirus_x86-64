@@ -2,9 +2,9 @@
 #
 # .githooks/pre-push - runs the full build+load+detect+unload test suite
 # before anything leaves your machine, but ONLY when the push actually
-# touches av/, userspace/avctl/, userspace/avd/, userspace/av-gui/,
-# rules/, corpus/, or packaging/ - a docs-only push shouldn't insmod
-# a kernel module.
+# touches code the suite exercises: av/, userspace/avctl/, userspace/avd/,
+# userspace/av-gui/, rules/ or corpus/. Docs-, unit- and packaging-only
+# pushes don't insmod a kernel module or stop avd.service.
 #
 # This needs root (insmod/rmmod) and should only run inside your VM.
 # Runs via pkexec rather than sudo: pkexec goes through the system's
@@ -70,12 +70,19 @@ done
 # match result, so a real match could be misreported as "no match"
 # and the test suite silently skipped. A herestring has no second
 # process and no pipe to close early, so this can't happen.
-if ! grep -qE '^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/|packaging/)' <<< "$CHANGED_FILES"; then
-    echo "pre-push: no changes under av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, corpus/, or packaging/ - skipping test suite"
+#
+# Only paths the suite actually exercises trigger it. run_all.sh stops
+# avd.service and insmod/rmmod's av.ko, which can leave avd in a restart
+# loop if the module isn't reloaded, so a docs-, unit- or packaging-only
+# push must not pay that cost. A push touching any of these code paths
+# still gets the full suite, even if it also changes docs/ or packaging/.
+SUITE_PATHS='^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/)'
+if ! grep -qE "$SUITE_PATHS" <<< "$CHANGED_FILES"; then
+    echo "pre-push: no changes to code exercised by the suite (av/, avctl/, avd/, av-gui/, rules/, corpus/) - skipping"
     exit 0
 fi
 
-echo "==> pre-push: changes detected in av/, userspace/avctl/, userspace/avd/, userspace/av-gui/, rules/, corpus/, or packaging/"
+echo "==> pre-push: changes detected in code exercised by the suite"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
 # No separate preflight credential check: 'pkexec tests/run_all.sh'
