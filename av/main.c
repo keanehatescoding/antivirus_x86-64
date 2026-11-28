@@ -1680,6 +1680,10 @@ struct av_fileopen_work {
   bool sensitive_known;
   bool pseudo;
   bool noise;
+  /* FMODE_CREATED frozen at hook entry: a file that did not exist before
+   * this open is counted in the creation-only window, not the kill
+   * counter (#256). */
+  bool created;
   u32 path_hash; /* rapid-write sliding-window key from the entry path */
   struct path path; /* pinned with path_get() in the entry handler, released
                      * in av_fileopen_work_fn(); d_path()'d there only for
@@ -1731,7 +1735,7 @@ static void av_fileopen_work_fn(struct work_struct *w) {
   av_behavior_check_openat_preclassified(fw->pid, abs_path, fw->flags,
                                          fw->target_pid, sensitive,
                                          fw->pseudo, fw->noise,
-                                         fw->path_hash);
+                                         fw->path_hash, fw->created);
   kfree(buf);
   path_put(&fw->path);
   put_pid(fw->target_pid);
@@ -1828,6 +1832,10 @@ static int entry_file_open(struct kretprobe_instance *ri,
   fw->path = file->f_path;
   path_get(&fw->path);
   fw->flags = (int)flags;
+  /* FMODE_CREATED is set by namei.c before do_dentry_open() calls
+   * security_file_open(), so it is already valid here (checked on 6.12,
+   * 6.18 and 7.3). Freeze it at entry like the other verdicts. */
+  fw->created = !!(file->f_mode & FMODE_CREATED);
   fw->pid = task_tgid_nr(current);
   fw->target_pid = get_task_pid(current, PIDTYPE_PID);
   *slot = fw;
