@@ -1102,7 +1102,12 @@ fanotify 29 and 34). Two limits:
   unset) is still off, which manual runs and the baseline test cases rely on.
 - Latency matters on the fanotify path, which holds every exec. One
   socketpair round trip is expected to be small compared with a YARA scan,
-  but it should be measured, not assumed. The same measurement decides the
+  but **this has not been measured reliably**. A standalone socketpair
+  ping-pong gives about 8–17 us p50, yet the flag never touches that harness,
+  so it is only "not alarming". `STATUS` pending-scan A/B runs under
+  `AVD_FANOTIFY=1` with `AVD_PRIVSEP=1` vs `=0` ranged from 0 to ~830 ms and
+  the ordering flipped between runs, dominated by scheduling noise. A quiet
+  measurement of the real path is still needed before it can decide the
   worker-recycling question.
 - Worker count follows the existing scan pool size.
 
@@ -1265,7 +1270,8 @@ cannot lock itself down stops avd at startup.
    copy-on-write should share most pages, but YARA's refcounting may dirty
    some; measure.
 3. Worker lifetime: long-lived, recycled after K scans, or one per scan (see
-   the residual-risk section). Needs the latency measurement.
+   the residual-risk section). Still open: the available latency numbers are
+   too noisy to decide it (see "Rollout").
 4. Spawner death or hang: exit and let systemd restart avd (proposed), or
    degrade to all-inconclusive and keep running; and how many consecutive
    missed replies count as a hang.
