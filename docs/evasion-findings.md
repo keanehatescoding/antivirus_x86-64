@@ -167,6 +167,28 @@ precisely: the implementation bug is gone; the inherent limitation of
 finite counting-based rate limiting is not, and isn't something this
 design can fully close.
 
+### Known limit: creation-heavy writes and unlink-without-rename
+
+The rapid-write counter distinguishes files that an open **created** from
+opens that modify pre-existing files (#256): bulk extraction (tar, unzip,
+rpm, git checkout) creates hundreds of new files, so those opens are
+counted in a separate ring that logs (`event=bulk-create`) instead of
+killing. The standalone kill is preserved for writes to existing files.
+
+This creates a known evasion shape: a process that writes **new** files
+and then unlinks the originals, without an extension-append rename, is
+not caught by the rapid-write kill (new files only log) and is not caught
+by the rename heuristic (no rename of that shape). That gap existed in
+the old heuristic too whenever the writes were paced or shaped
+differently, and it is common to any fix in this area, not specific to
+the FMODE_CREATED split. Closing it needs a signal beyond event counting
+— for example correlating creation with later unlink/exec identity — and
+is not claimed to be solved here.
+
+`cp -r` over an existing tree still overwrites pre-existing files and can
+trip the in-place counter; that is deliberate, since it is the same
+shape as an in-place encryption pass.
+
 ## Overall takeaways for the report
 
 - Every individual detection layer has a known, demonstrable evasion.

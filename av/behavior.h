@@ -109,12 +109,17 @@ u32 av_behavior_path_hash(const char *path);
  * rendering failed, the caller supplies a per-(tgid, dentry) key so
  * unrelated files do not merge. The pseudo/noise exclusions must not be
  * recomputed from the late string either (the worker's root can render a
- * chrooted /documents/f under /.cache/). Only the security_file_open work
- * handler uses this; every other caller should use the wrapper above. */
+ * chrooted /documents/f under /.cache/). `created` is the hook-time
+ * FMODE_CREATED bit: opens that created a new file go into a separate
+ * window that logs bulk creation instead of killing (#256), since
+ * tar/unzip/rpm/git extraction creates hundreds of new files. Only the
+ * security_file_open work handler uses this; every other caller should
+ * use the wrapper above. */
 void av_behavior_check_openat_preclassified(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
                                             bool sensitive, bool pseudo,
-                                            bool noise, u32 path_hash);
+                                            bool noise, u32 path_hash,
+                                            bool created);
 
 /* Called from the unlink/unlinkat work handler. Kills target_pid if
  * `path` (the normalized absolute target) is on the sensitive-path

@@ -126,6 +126,10 @@ echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 
 echo
+echo "### test_bulk_write.sh (creation vs in-place write, #256) ###"
+"$REPO_ROOT/tests/test_bulk_write.sh" || FAIL=1
+
+echo
 echo "### test_sigtable.sh (avctl/proc protocol) ###"
 # test_detection.sh unloads the module as part of its own cleanup, so
 # reload it here for the sigtable protocol tests.

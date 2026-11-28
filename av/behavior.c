@@ -323,6 +323,22 @@ struct av_behavior_entry {
   unsigned int
       recent_path_filled; /* valid entries, caps at MAX_TRACKED_PATHS */
 
+  /* Separate ring for opens that CREATED their file (FMODE_CREATED at
+   * security_file_open). Bulk extraction legitimately creates hundreds
+   * of distinct files in one window; counting those toward the kill
+   * threshold killed `tar xzf` (and previously PID 1) while a process
+   * overwriting existing files still trips the kill unchanged. Kept as
+   * its own ring so a 200-file extraction cannot prime the kill
+   * counter and kill the same process on its first in-place write. */
+  u32 recent_created_hashes[MAX_TRACKED_PATHS];
+  unsigned long recent_created_jiffies[MAX_TRACKED_PATHS];
+  unsigned int recent_created_next;
+  unsigned int recent_created_filled;
+  /* Log the creation burst once per process, not once per file: a
+   * ratelimited pr_info can be suppressed by an earlier extraction and
+   * hide a later burst entirely. */
+  bool bulk_create_logged;
+
   /* Same true-sliding-window dedup-ring-buffer idea as
    * recent_path_hashes above, but for the rename heuristic: counts
    * DISTINCT source files renamed with an extension-append shape
@@ -1617,7 +1633,8 @@ u32 av_behavior_path_hash(const char *path) {
 static void av_behavior_check_openat_common(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
                                             bool sensitive, bool pseudo,
-                                            bool noise, u32 path_hash) {
+                                            bool noise, u32 path_hash,
+                                            bool created) {
   struct av_behavior_entry *e;
   bool rapid = false;
 
@@ -1642,13 +1659,39 @@ static void av_behavior_check_openat_common(pid_t pid, const char *path,
      * not just given a higher threshold. The sensitive-path check
      * above still applies regardless; only the volume-based signal
      * is exempted. */
-    unsigned int in_window = sliding_window_note(
-        path_hash, jiffies, WRITE_OPEN_WINDOW_MS, e->recent_path_hashes,
-        e->recent_path_jiffies, MAX_TRACKED_PATHS, &e->recent_path_next,
-        &e->recent_path_filled);
+    if (created) {
+      /* The file did not exist before this open: tar/unzip/rpm/git
+       * extraction creates hundreds of distinct files and is not
+       * ransomware. Count these in their own ring and only log a burst,
+       * preserving the standalone kill for writes to existing files. */
+      unsigned int created_n = sliding_window_note(
+          path_hash, jiffies, WRITE_OPEN_WINDOW_MS,
+          e->recent_created_hashes, e->recent_created_jiffies,
+          MAX_TRACKED_PATHS, &e->recent_created_next,
+          &e->recent_created_filled);
+      if (created_n > WRITE_OPEN_THRESHOLD) {
+        if (!e->bulk_create_logged) {
+          char *esc = av_log_escape(path, GFP_KERNEL);
 
-    if (in_window > WRITE_OPEN_THRESHOLD)
-      rapid = true;
+          e->bulk_create_logged = true;
+          pr_info(
+              "kernel-av: event=bulk-create type=behavioral path=\"%s\" "
+              "count=%u (new files; not killed)\n",
+              av_log_str(esc), created_n);
+          kfree(esc);
+        }
+      } else {
+        e->bulk_create_logged = false;
+      }
+    } else {
+      unsigned int in_window = sliding_window_note(
+          path_hash, jiffies, WRITE_OPEN_WINDOW_MS, e->recent_path_hashes,
+          e->recent_path_jiffies, MAX_TRACKED_PATHS, &e->recent_path_next,
+          &e->recent_path_filled);
+
+      if (in_window > WRITE_OPEN_THRESHOLD)
+        rapid = true;
+    }
   }
   mutex_unlock(&behavior_lock);
 
@@ -1665,15 +1708,18 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
                                   path_is_sensitive(path),
                                   path_is_pseudo_fs(path),
                                   path_is_rapid_write_noise(path),
-                                  av_behavior_path_hash(path));
+                                  av_behavior_path_hash(path),
+                                  false); /* legacy openat hook has no
+                                             FMODE_CREATED information */
 }
 
 void av_behavior_check_openat_preclassified(pid_t pid, const char *path,
                                             int flags, struct pid *target_pid,
                                             bool sensitive, bool pseudo,
-                                            bool noise, u32 path_hash) {
+                                            bool noise, u32 path_hash,
+                                            bool created) {
   av_behavior_check_openat_common(pid, path, flags, target_pid, sensitive,
-                                  pseudo, noise, path_hash);
+                                  pseudo, noise, path_hash, created);
 }
 
 void av_behavior_check_unlink(const char *path, struct pid *target_pid) {
