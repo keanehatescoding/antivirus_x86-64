@@ -86,6 +86,16 @@ Environment=AVD_PRIVSEP=1
 # the end-to-end tests under them; keep each on one line, the allowlist
 # first and only "~" lines after it.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL
+# Observed on systemd 258 (Fedora 43), 259 (Ubuntu 26.04) and 262 (Arch):
+# with these SystemCallFilter=/SystemCallArchitectures= lines and
+# NoNewPrivileges=yes, a root service starts with CAP_SETUID absent from its
+# permitted set (0x20116f rather than 0x2011ef). The spawner then cannot
+# raise it in capset(), fails lockdown step 2, and avd exits without
+# scanning. Declaring the spawner's four capabilities here makes avd start
+# on those systems without changing NoNewPrivileges=; the workers still
+# narrow their own sets. /proc/<pid>/status captures and validation results
+# are in PR #254. See #103 and docs/privilege-separation.md.
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL
 NoNewPrivileges=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service seccomp fanotify_init fanotify_mark

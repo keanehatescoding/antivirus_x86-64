@@ -3,8 +3,8 @@
 # .githooks/pre-push - runs the full build+load+detect+unload test suite
 # before anything leaves your machine, but ONLY when the push actually
 # touches code the suite exercises: av/, userspace/avctl/, userspace/avd/,
-# userspace/av-gui/, rules/ or corpus/. Docs-, unit- and packaging-only
-# pushes don't insmod a kernel module or stop avd.service.
+# userspace/av-gui/, rules/, corpus/ or tests/. Docs-, unit- and packaging-
+# only pushes don't insmod a kernel module or stop avd.service.
 #
 # This needs root (insmod/rmmod) and should only run inside your VM.
 # Runs via pkexec rather than sudo: pkexec goes through the system's
@@ -74,11 +74,14 @@ done
 # Only paths the suite actually exercises trigger it. run_all.sh stops
 # avd.service and insmod/rmmod's av.ko, which can leave avd in a restart
 # loop if the module isn't reloaded, so a docs-, unit- or packaging-only
-# push must not pay that cost. A push touching any of these code paths
-# still gets the full suite, even if it also changes docs/ or packaging/.
-SUITE_PATHS='^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/)'
+# push must not pay that cost. That was the point of #253: the setpriv-
+# based suite cannot see the systemd capability failure class anyway.
+# tests/ is in here because helpers like avd_unit_caps.sh are sourced by
+# the end-to-end tests and are not exercised by a syntax check on their
+# own. Unit changes are covered by the real-systemd CI job (#255) instead.
+SUITE_PATHS='^(av/|userspace/avctl/|userspace/avd/|userspace/av-gui/|rules/|corpus/|tests/)'
 if ! grep -qE "$SUITE_PATHS" <<< "$CHANGED_FILES"; then
-    echo "pre-push: no changes to code exercised by the suite (av/, avctl/, avd/, av-gui/, rules/, corpus/) - skipping"
+    echo "pre-push: no changes to code exercised by the suite (av/, avctl/, avd/, av-gui/, rules/, corpus/, tests/) - skipping"
     exit 0
 fi
 

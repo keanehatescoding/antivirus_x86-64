@@ -839,18 +839,33 @@ each step. `tests/test_fanotify_exec.sh --privsep` also reads `CapEff`, `CapPrm`
   any of its four, and with `AVD_PRIVSEP=1` the parent drops those four itself
   afterwards. Without `AVD_PRIVSEP=1`, avd runs with these ten instead of all
   of them.
+- `AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_KILL`. With the
+  unit's `SystemCallFilter=`/`SystemCallArchitectures=` and
+  `NoNewPrivileges=yes`, a root service was observed starting on systemd 258
+  (Fedora 43), 259 (Ubuntu 26.04) and 262 (Arch) with `CAP_SETUID` absent
+  from `CapPrm` (`0x20116f` rather than `0x2011ef`). The spawner then cannot
+  raise it in `capset()`, fails lockdown step 2, and avd exits instead of
+  scanning. Declaring the spawner's four capabilities as ambient makes avd
+  start on those systems without changing `NoNewPrivileges=`. The workers
+  still narrow their own sets. The four caps are the minimum needed here;
+  the `/proc/<pid>/status` captures and validation results are in PR #254.
 - `NoNewPrivileges=yes`. avd never `exec()`s, so this costs nothing.
 
 Still no filesystem sandboxing, which the unit comment explains. The
 end-to-end tests run avd outside systemd (virtme-ng has no systemd as init),
-so `tests/avd_unit_caps.sh` reads both settings out of the unit file and
-starts avd under `setpriv --bounding-set ... --no-new-privs`, which gives a
-root process the same capabilities systemd would. `tests/test_avd_socket.sh`
-and `tests/test_fanotify_exec.sh` start every avd that way and the socket
-test checks `CapBnd` and `NoNewPrivs` of the running daemon. All four runs
-pass in a virtme-ng guest (socket 28 and 30 checks, fanotify 28 and 33,
-without and with `--privsep`), and removing `CAP_SETPCAP` from the unit makes
-avd refuse to start with `AVD_PRIVSEP=1` (parent lockdown step 1).
+so `tests/avd_unit_caps.sh` reads the bounding set, the ambient set and
+`NoNewPrivileges=` out of the unit file and starts avd under `setpriv`, which
+gives a root process roughly the same capabilities systemd would. It cannot
+reproduce the capability state observed under systemd with these settings:
+setpriv applies the sets as declared, while the service manager started the
+process with `CAP_SETUID` absent from `CapPrm` (captures in PR #254). The
+unit's `AmbientCapabilities=` line therefore has to be validated by starting
+avd under real systemd before it is changed. `tests/test_avd_socket.sh` and `tests/test_fanotify_exec.sh` start
+every avd through the helper and check `CapBnd` and `NoNewPrivs` of the
+running daemon. All four runs pass in a virtme-ng guest (socket 28 and 30
+checks, fanotify 28 and 33, without and with `--privsep`), and removing
+`CAP_SETPCAP` from the unit makes avd refuse to start with `AVD_PRIVSEP=1`
+(parent lockdown step 1).
 
 #### Step 3 as built: the main process's filter
 
