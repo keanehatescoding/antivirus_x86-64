@@ -199,6 +199,13 @@ Two observability guarantees now exist:
   operators should check `dmesg` for the fallback warning before
   attributing a false positive to the creation/modification split.
 
+The legacy workaround is not guaranteed either: on the same 7.3 host,
+loading with `av_legacy_openat_hook=1` registered the `__x64_sys_openat`
+kprobe (visible in `/sys/kernel/debug/kprobes/list`) but still saw zero
+hits after 80 write-intent `open()` calls. The fallback is therefore
+best-effort coverage, not a promise; the observable signal is the hit
+counter plus the CI assertion, not the module's load success.
+
 A test that SKIPs because the hook does not fire is only safe if something
 else is loud. The nightly systemd job asserts a nonzero hit count on its
 kernel legs; a bare SKIP from `test_bulk_write.sh` must never be read as
