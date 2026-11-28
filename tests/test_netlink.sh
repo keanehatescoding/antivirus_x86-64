@@ -563,7 +563,12 @@ else
         chmod +x "$p"
         MARK="$(dmesg_mark)"
         echo "$TOCTOU_DELAY_MS" > "$TOCTOU_DELAY_PARAM"
-        read -r -n 1 -t 0 -u 9 || :  # discard a stale byte from a failed attempt
+        # 'read -t 0' only tests availability, it does not consume. Drain
+        # every leftover byte with a second, bounded read so a child that
+        # wrote just after a prior timeout cannot author this launch.
+        while read -r -t 0 -u 9; do
+            read -r -n 1 -t 1 -u 9 || break
+        done
         "$p" >/dev/null 2>&1 &
         cpid=$!
         if toctou_execd; then
@@ -631,7 +636,9 @@ CEOF
             chmod +x "$p"
             printf 'clean decoy %s\n' "$i" > "$p.decoy"
             echo "$TOCTOU_DELAY_MS" > "$TOCTOU_DELAY_PARAM"
-            read -r -n 1 -t 0 -u 9 || :  # discard a stale byte
+            while read -r -t 0 -u 9; do
+                read -r -n 1 -t 1 -u 9 || break
+            done
             "$p" "$TOCTOU_READY" >/dev/null 2>&1 &
             cpid=$!
             if toctou_execd; then
