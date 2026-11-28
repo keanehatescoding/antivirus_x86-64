@@ -167,6 +167,67 @@ precisely: the implementation bug is gone; the inherent limitation of
 finite counting-based rate limiting is not, and isn't something this
 design can fully close.
 
+## 5. Write-intent hook coverage depends on the kernel
+
+Write-intent opens feed both the rapid-write and the sensitive-path-write
+heuristics; if the hook never fires, neither heuristic runs, while the
+rest of avd keeps working and nothing in the logs says why. This is not
+hypothetical. On the host's Clang/thin-LTO 7.3.6-3-cachyos build,
+`security_file_open()` has **zero call sites** — `do_dentry_open()` calls
+the `__SCT__lsm_static_call_file_open_*` trampolines directly — and the
+legacy `__x64_sys_openat()` symbol also has zero call sites because
+syscalls dispatch through `x64_sys_call()`. Live tracefs probes on both
+recorded zero hits while `security_bprm_check` recorded six, so kprobes
+in general still work. GCC-built kernels are fine: Fedora 6.17.1 and
+Ubuntu 7.0.0 both fired the old hook (11/11 in `test_bulk_write.sh`;
+an earlier Ubuntu SKIP was a wrapped-`dmesg` harness bug, now fixed).
+This is a property of the **build**, not the version number — and Clang
+LTO is the normal configuration for Android GKI kernels, which is
+relevant to the arm64 direction in #261.
+
+The fix is to probe `vfs_open()` instead. On the thin-LTO host it has 8
+live call sites (from `path_openat`, `dentry_open`, `vfs_lookup_open`,
+`backing_file_open`, ...); `do_dentry_open()` has none (inlined into
+`vfs_open`), and `path_openat()` fires but has no `struct file *` at
+entry. At `vfs_open()` entry the file pointer is argument 1, and both
+`f_flags` and `FMODE_CREATED` are intact (`do_dentry_open()` has not run
+yet), so the creation/modification split from #256 still works. Caveats:
+overlayfs opens a backing file per user open (already filtered via
+`FMODE_BACKING`), filesystems using `atomic_open()` may skip `vfs_open()`
+entirely, and `security_file_post_open()` can still deny after a zero
+return. `av_file_open_nmissed` cannot detect a never-entered probe; it
+counts only missed return instances.
+
+Two observability guarantees now exist:
+
+- `av_file_open_hits` (read-only sysfs param) counts write-intent opens
+  seen by the active hook's entry handler, before work admission. Zero
+  after real write activity means the hook is not firing.
+- At load time the module opens `/dev/null` for writing and checks that
+  `av_file_open_hits` moved. If the kretprobe registered but did not
+  fire, it logs an error, unregisters and **falls back** to the legacy
+  `__x64_sys_openat` kprobe. On Clang-LTO kernels that fallback is also
+  dead, so it only makes the failure loud — it does **not** restore
+  coverage. The legacy hook is a syscall-entry hook with no access to the
+  VFS-layer
+  `FMODE_CREATED` bit, so newly created files cannot be distinguished
+  from modifications of existing ones there. A fallback therefore also
+  reintroduces the bulk-extraction false positive described in #256 —
+  operators should check `dmesg` for the fallback warning before
+  attributing a false positive to the creation/modification split.
+
+The legacy workaround is not guaranteed either: on the same 7.3 host,
+loading with `av_legacy_openat_hook=1` registered the `__x64_sys_openat`
+kprobe (visible in `/sys/kernel/debug/kprobes/list`) but still saw zero
+hits after 80 write-intent `open()` calls. The fallback is therefore
+best-effort coverage, not a promise; the observable signal is the hit
+counter plus the CI assertion, not the module's load success.
+
+A test that SKIPs because the hook does not fire is only safe if something
+else is loud. The nightly systemd job asserts a nonzero hit count on its
+kernel legs; a bare SKIP from `test_bulk_write.sh` must never be read as
+"the heuristic was validated on this kernel".
+
 ## Overall takeaways for the report
 
 - Every individual detection layer has a known, demonstrable evasion.

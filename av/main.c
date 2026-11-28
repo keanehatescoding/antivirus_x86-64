@@ -179,19 +179,22 @@ static struct kprobe kp_inode_rename = {
 static struct kprobe kp_openat = {
     .symbol_name = "__x64_sys_openat",
 };
-/* Write-intent open tracking at the VFS layer (#105, #94): the kernel
- * calls security_file_open() with the file it actually resolved, for
- * every open (open/creat/openat/openat2, io_uring, kernel-internal),
- * so there is no user string to copy and no syscall ABI to name.
- * kp_openat above is kept only behind av_legacy_openat_hook.
+/* Write-intent open tracking at the VFS layer (#105, #94): vfs_open()
+ * receives the struct file the kernel actually resolved, for every open
+ * that reaches the VFS (open/creat/openat/openat2, kernel-internal), so
+ * there is no user string to copy and no syscall ABI to name. kp_openat
+ * above is kept only behind av_legacy_openat_hook.
  *
- * A kretprobe, not a plain kprobe: security_file_open() itself runs the
- * LSM and fanotify permission checks in its body, so the event may only
- * be queued once the function returns 0. The entry handler retains the
- * state; the exit handler either queues it or drops it on denial. */
+ * vfs_open() is chosen over security_file_open() because the latter is
+ * inlined into the LSM static-call trampolines on Clang thin-LTO kernels
+ * (the out-of-line symbol has no callers there), and over do_dentry_open()
+ * because that is inlined into vfs_open() on the same builds. On the
+ * thin-LTO 7.3 host vfs_open() has 8 live call sites, while security_file
+ * _open() and __x64_sys_openat() have none. A kretprobe gives us the
+ * open's return value so failed opens can be dropped. */
 struct av_fileopen_work; /* defined with the deferred work item below */
 static struct kretprobe kr_file_open = {
-    .kp.symbol_name = "security_file_open",
+    .kp.symbol_name = "vfs_open",
     .data_size = sizeof(struct av_fileopen_work *),
 };
 static struct kprobe kp_unlink = {
@@ -304,17 +307,17 @@ module_param(av_toctou_test_delay_ms, int, 0644);
 MODULE_PARM_DESC(av_toctou_test_delay_ms,
                  "TEST ONLY: ms to sleep before the deferred exec work looks at the file, so a regression test can swap or unlink the pathname mid-flight and prove avd scans the hashed file (default 0 = disabled; clamped to [0, 2000]); never set in production");
 
-/* Escape hatch while the security_file_open hook is new: load with
- * av_legacy_openat_hook=1 to track write-intent opens through the old
- * __x64_sys_openat kprobe instead. Exactly one of the two is ever
+/* Escape hatch from the vfs_open hook: load with av_legacy_openat_hook=1
+ * to track write-intent opens through the old __x64_sys_openat kprobe
+ * instead (it is itself dead on Clang-LTO kernels). Exactly one of the two is ever
  * registered (never both: that would double-count every open toward
  * the rapid-write threshold). Read-only at runtime (0444). */
 static bool av_legacy_openat_hook;
 module_param(av_legacy_openat_hook, bool, 0444);
 MODULE_PARM_DESC(av_legacy_openat_hook,
-                 "Track write-intent opens via the legacy __x64_sys_openat kprobe instead of security_file_open (default 0 = security_file_open); escape hatch, remove once the new hook has soaked");
+                 "Track write-intent opens via the legacy __x64_sys_openat kprobe instead of vfs_open (default 0 = vfs_open); escape hatch");
 
-/* Read-only observability for the security_file_open kretprobe. nmissed
+/* Read-only observability for the vfs_open kretprobe. nmissed
  * counts probe hits for which no return-probe instance was available: in
  * that case even entry_file_open() is skipped, so the work-admission
  * budget never gets a chance to decide. It counts ALL opens, including
@@ -331,7 +334,26 @@ static const struct kernel_param_ops av_file_open_nmissed_ops = {
 };
 module_param_cb(av_file_open_nmissed, &av_file_open_nmissed_ops, NULL, 0444);
 MODULE_PARM_DESC(av_file_open_nmissed,
-                 "security_file_open kretprobe instances missed since load (read-only; nonzero means write-intent open coverage may have been lost)");
+                 "vfs_open kretprobe instances missed since load (read-only; nonzero means write-intent open coverage may have been lost)");
+
+/* How many write-intent opens the ACTIVE hook's entry handler has seen
+ * since load, counted before work admission so an overloaded workqueue
+ * cannot make a firing hook look dead. Both the kretprobe and the legacy
+ * openat kprobe increment it. Zero after real write activity means the
+ * hook is not firing at all - nmissed above cannot tell you that, because
+ * it only counts misses of a probe that actually ran. Exposed to sysfs
+ * so CI (and operators) can assert coverage on a given kernel. */
+static atomic_t av_open_hook_hits = ATOMIC_INIT(0);
+static int av_open_hook_hits_get(char *buffer,
+                                 const struct kernel_param *kp) {
+  return sprintf(buffer, "%d\n", atomic_read(&av_open_hook_hits));
+}
+static const struct kernel_param_ops av_open_hook_hits_ops = {
+    .get = av_open_hook_hits_get,
+};
+module_param_cb(av_open_hook_hits, &av_open_hook_hits_ops, NULL, 0444);
+MODULE_PARM_DESC(av_open_hook_hits,
+                 "write-intent opens seen by the active open hook's entry handler since load (read-only; zero after writes means the hook is not firing)");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1595,6 +1617,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
    * scheduling work for events behavior.c would discard anyway. */
   if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
     return 0;
+  atomic_inc(&av_open_hook_hits);
 
   /* Resolve dfd BEFORE allocating/copying anything else - if the fd
    * doesn't resolve (bogus/racing close) there's nothing useful to
@@ -1635,7 +1658,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
   return 0;
 }
 
-/* ---- security_file_open: write-intent open tracking at the VFS layer ----
+/* ---- vfs_open: write-intent open tracking at the VFS layer ----
  *
  * Replaces the __x64_sys_openat probe as the source for the rapid-write
  * and sensitive-path-write heuristics. What changes, and why:
@@ -1663,9 +1686,12 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
  * is the one the user sees, and counting both would double every open in
  * a container toward the rapid-write threshold).
  *
- * security_file_open() runs before O_CREAT/O_EXCL/O_TRUNC are cleared
- * from f_flags (do_dentry_open()), so the existing write-intent flag test
- * in behavior.c still sees them. */
+ * vfs_open() receives the struct file before do_dentry_open() runs, so
+ * both f_flags (O_CREAT/O_EXCL/O_TRUNC) and FMODE_CREATED are intact;
+ * entry_file_open() freezes them into the work item. A successful
+ * vfs_open() can still be denied later by security_file_post_open(), so
+ * the exit handler's zero return is not a final guarantee - the same
+ * residual false-positive risk the old hook had. */
 struct av_fileopen_work {
   struct work_struct work;
   struct pid *target_pid;
@@ -1739,19 +1765,23 @@ static void av_fileopen_work_fn(struct work_struct *w) {
   av_work_release();
 }
 
-/* security_file_open(struct file *file) - entry half. Nothing is queued
- * here: the LSM/fanotify checks live inside the probed function and may
- * still reject the open. */
+/* vfs_open(const struct path *path, struct file *file) - entry half.
+ * Argument 1 (rsi) is the file, argument 0 (rdi) is the resolved path.
+ * The path MUST come from argument 0: do_dentry_open() has not run yet,
+ * so file->f_path is still uninitialised here. Nothing is queued in this
+ * half; the exit handler drops opens that returned an error. */
 static int entry_file_open(struct kretprobe_instance *ri,
                            struct pt_regs *regs) {
+  const struct path *path =
+      (const struct path *)regs_get_kernel_argument(regs, 0);
   const struct file *file =
-      (const struct file *)regs_get_kernel_argument(regs, 0);
+      (const struct file *)regs_get_kernel_argument(regs, 1);
   struct av_fileopen_work **slot = (struct av_fileopen_work **)ri->data;
   struct av_fileopen_work *fw;
   unsigned int flags;
 
   *slot = NULL;
-  if (!file || (current->flags & PF_KTHREAD))
+  if (!file || !path || (current->flags & PF_KTHREAD))
     return 0;
   if (file->f_mode & FMODE_BACKING)
     return 0;
@@ -1762,6 +1792,7 @@ static int entry_file_open(struct kretprobe_instance *ri,
    * are the overwhelming majority and behavior.c would discard them. */
   if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
     return 0;
+  atomic_inc(&av_open_hook_hits);
 
   if (!av_work_admit_nonexec())
     return 0;
@@ -1788,7 +1819,7 @@ static int entry_file_open(struct kretprobe_instance *ri,
     u32 path_hash;
 
     if (buf) {
-      entry_path = d_path(&file->f_path, buf, PATH_MAX);
+      entry_path = d_path(path, buf, PATH_MAX);
       if (IS_ERR(entry_path))
         entry_path = NULL;
     }
@@ -1808,7 +1839,7 @@ static int entry_file_open(struct kretprobe_instance *ri,
       char fallback[128];
 
       snprintf(fallback, sizeof(fallback), "<unresolved:%d:%p>",
-               task_tgid_nr(current), file->f_path.dentry);
+               task_tgid_nr(current), path->dentry);
       path_hash = av_behavior_path_hash(fallback);
     }
     fw->sensitive_known = (entry_path != NULL);
@@ -1825,7 +1856,8 @@ static int entry_file_open(struct kretprobe_instance *ri,
     fw->path_hash = path_hash;
   }
 
-  fw->path = file->f_path;
+  /* Pin the path argument, not file->f_path (uninitialised at entry). */
+  fw->path = *path;
   path_get(&fw->path);
   fw->flags = (int)flags;
   fw->pid = task_tgid_nr(current);
@@ -1837,11 +1869,9 @@ static int entry_file_open(struct kretprobe_instance *ri,
   return 0;
 }
 
-/* Exit half: only a granted open is allowed to become a behavioral
- * event. security_file_open() calls call_int_hook(file_open, ...) and
- * fsnotify_open_perm() in its body, either of which can deny; counting
- * a rejected attempt would risk killing a process for a write the
- * kernel never permitted. */
+/* Exit half: only an open vfs_open() reported as successful becomes a
+ * behavioral event; counting a rejected attempt would risk killing a
+ * process for a write the kernel never permitted. */
 static int exit_file_open(struct kretprobe_instance *ri,
                           struct pt_regs *regs) {
   struct av_fileopen_work **slot = (struct av_fileopen_work **)ri->data;
@@ -1863,9 +1893,46 @@ static int exit_file_open(struct kretprobe_instance *ri,
   return 0;
 }
 
+/* A kretprobe can register successfully and still never fire, e.g. when
+ * the probed function is inlined or reached through another symbol on a
+ * newer kernel. nmissed cannot detect that case: it only counts hits for
+ * which no return instance was available, so a probe that never runs
+ * leaves it at zero. Open a throwaway write-only file from process
+ * context and require the entry handler to have seen it. /dev/null is
+ * a pseudo-file the behavior engine ignores, so the self-test does not
+ * feed a real event into the rapid-write window. */
+static bool av_open_probe_selftest(void) {
+  struct file *f;
+  int before = atomic_read(&av_open_hook_hits);
+  int after;
+
+  f = filp_open("/dev/null", O_WRONLY | O_NOCTTY, 0);
+  if (IS_ERR(f)) {
+    pr_err("kernel-av: open-hook self-test could not open /dev/null (%ld); "
+           "write-intent coverage is UNCONFIRMED\n",
+           PTR_ERR(f));
+    return false;
+  }
+  filp_close(f, NULL);
+  after = atomic_read(&av_open_hook_hits);
+  if (after <= before) {
+    pr_err("kernel-av: vfs_open kretprobe registered but never "
+           "fired in self-test (hits %d -> %d, nmissed=%d); write-intent "
+           "heuristics would be INACTIVE\n",
+           before, after, kr_file_open.nmissed);
+    return false;
+  }
+  pr_info("kernel-av: vfs_open self-test passed (write-intent "
+          "hits %d -> %d)\n",
+          before, after);
+  return true;
+}
+
 /* Register whichever open probe this load uses. Defined after the
  * handlers so the kretprobe callbacks are in scope. */
 static int av_register_open_probe(void) {
+  int ret;
+
   if (av_legacy_openat_hook) {
     kp_openat.pre_handler = handler_pre_openat;
     pr_info("kernel-av: av_legacy_openat_hook=1, write-intent opens tracked "
@@ -1881,7 +1948,30 @@ static int av_register_open_probe(void) {
   kr_file_open.maxactive = AV_MAX_INFLIGHT_WORK - AV_EXEC_RESERVED_WORK;
   kr_file_open.entry_handler = entry_file_open;
   kr_file_open.handler = exit_file_open;
-  return register_kretprobe(&kr_file_open);
+  ret = register_kretprobe(&kr_file_open);
+  if (ret < 0) {
+    pr_warn("kernel-av: register_kretprobe(vfs_open) failed: %d; "
+            "falling back to the legacy openat hook\n",
+            ret);
+    goto fallback;
+  }
+  if (av_open_probe_selftest())
+    return 0;
+  unregister_kretprobe(&kr_file_open);
+
+fallback:
+  /* Restoring coverage is more important than keeping the VFS-layer
+   * signal. The legacy hook sees only syscall arguments, so it cannot
+   * know the VFS FMODE_CREATED bit: every write looks like a
+   * modification of an existing file. On a creation-heavy workload that
+   * means the old bulk-extraction false positive is back; operators can
+   * use the trust list for a specific binary. */
+  av_legacy_openat_hook = true;
+  kp_openat.pre_handler = handler_pre_openat;
+  pr_warn("kernel-av: falling back to __x64_sys_openat for write-intent "
+          "opens; creation-vs-modification discrimination is unavailable "
+          "on this path and bulk extraction may trip the rapid-write kill\n");
+  return register_kprobe(&kp_openat);
 }
 
 static void av_unregister_open_probe(void) {
