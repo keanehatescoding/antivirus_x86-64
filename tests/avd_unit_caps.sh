@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # tests/avd_unit_caps.sh - sourced, not run. Defines avd_unit_wrap(),
-# which reads CapabilityBoundingSet= and NoNewPrivileges= from
-# packaging/avd.service and fills the array AVD_UNIT_WRAP with a setpriv
-# prefix that applies the same two restrictions to a single command:
+# which reads CapabilityBoundingSet=, AmbientCapabilities= and
+# NoNewPrivileges= from packaging/avd.service and fills the array
+# AVD_UNIT_WRAP with a setpriv prefix that applies the same restrictions to
+# a single command:
 #
 #   avd_unit_wrap "$REPO_ROOT/packaging/avd.service" || exit 1
 #   exec "${AVD_UNIT_WRAP[@]}" "$AVD_DIR/avd" ...
@@ -14,6 +15,12 @@
 # unit actually ships. A root process exec'd under a bounding set ends up
 # with permitted and effective = that set, which is what systemd does for
 # CapabilityBoundingSet= with User=root.
+#
+# NOTE: setpriv applies these sets as declared, so it does NOT reproduce the
+# capability state observed under systemd with this unit: a root service
+# started with CAP_SETUID absent from CapPrm (captures in PR #254). That is
+# why the unit declares AmbientCapabilities= as well, and why that part of
+# the unit has to be validated by starting avd under real systemd, not here.
 #
 # Also sets AVD_UNIT_CAPBND to the bounding set as /proc/<pid>/status prints
 # it (16 hex digits), for checking that the wrapper took effect.
@@ -57,6 +64,18 @@ avd_unit_wrap() {
     done
     AVD_UNIT_CAPBND="$(printf '%016x' "$mask")"
     AVD_UNIT_WRAP=(setpriv --bounding-set "-all$spec")
+    # setpriv only keeps an ambient set if the same caps are in the
+    # inheritable set too, so mirror systemd's AmbientCapabilities= into
+    # both (the workers clear both again in their own lockdown).
+    ambient="$(sed -n 's/^AmbientCapabilities=//p' "$unit")"
+    if [[ -n $ambient ]]; then
+        local amb_spec=""
+        for c in $ambient; do
+            c="${c#CAP_}"
+            amb_spec+="${amb_spec:+,}+${c,,}"
+        done
+        AVD_UNIT_WRAP+=(--inh-caps "$amb_spec" --ambient-caps "$amb_spec")
+    fi
     nnp="$(sed -n 's/^NoNewPrivileges=//p' "$unit")"
     case "$nnp" in
         yes|true|1|on) AVD_UNIT_WRAP+=(--no-new-privs) ;;
