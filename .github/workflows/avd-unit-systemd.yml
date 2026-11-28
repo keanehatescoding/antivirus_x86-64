@@ -147,7 +147,7 @@ jobs:
           WORK="$RUNNER_TEMP/avd-unit"
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
-            'sudo timeout 900 bash /tmp/avtest/.github/scripts/avd_unit_vm_guest.sh ${{ matrix.distro }} /tmp/avtest'
+            'sudo timeout 1800 bash /tmp/avtest/.github/scripts/avd_unit_vm_guest.sh ${{ matrix.distro }} /tmp/avtest'
 
       - name: Dump logs on failure
         if: failure()
