@@ -41,8 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     # TCG (no /dev/kvm) makes the in-guest build and scan workload much
     # slower than KVM; leave room for it rather than trusting a 15-minute
-    # guest timeout measured on a KVM host.
-    timeout-minutes: 60
+    # guest timeout measured on a KVM host; a local TCG run had dnf alone
+    # still working after 20 minutes.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -147,7 +148,7 @@ jobs:
           WORK="$RUNNER_TEMP/avd-unit"
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -i "$WORK/key" -p ${{ matrix.port }} ${{ matrix.user }}@127.0.0.1 \
-            'sudo timeout 1800 bash /tmp/avtest/.github/scripts/avd_unit_vm_guest.sh ${{ matrix.distro }} /tmp/avtest'
+            'sudo timeout 3600 bash /tmp/avtest/.github/scripts/avd_unit_vm_guest.sh ${{ matrix.distro }} /tmp/avtest'
 
       - name: Dump logs on failure
         if: failure()
