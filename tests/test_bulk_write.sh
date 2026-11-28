@@ -30,8 +30,22 @@ FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $*"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $*"; }
 section() { echo; echo "== $* =="; }
-dmesg_mark() { dmesg | wc -l; }
-dmesg_since() { dmesg | tail -n +"$1"; }
+# The kernel ring buffer is bounded and wraps. `dmesg | wc -l` can be a
+# LARGER number than the current number of lines after it fills up, so
+# `tail -n +$MARK` silently returns nothing and a hook that DID fire
+# looks like a SKIP (observed on the Ubuntu 26.04 VM: a bulk-create line
+# was present in dmesg while the canary reported no events). This test
+# already owns the module and the daemon for its run, so clear the
+# buffer at each mark instead of trusting a line count.
+dmesg_mark() { dmesg -c >/dev/null 2>&1; echo 1; }
+dmesg_since() { dmesg; }
+# If the buffer cannot be cleared, every assertion below could match an
+# old line from a previous run. Refuse to run instead of reporting a
+# misleading PASS or SKIP.
+if ! dmesg -c >/dev/null 2>&1; then
+    echo "FAIL: cannot clear the kernel log buffer (root required)" >&2
+    exit 1
+fi
 
 WORK="$(mktemp -d /tmp/av_bulk_write.XXXXXX)" || exit 1
 AVD_PID=""
