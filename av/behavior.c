@@ -2028,6 +2028,10 @@ void av_behavior_exec_ident_stage(const struct file *file) {
   rcu_read_unlock();
 
   kfree(fresh);
+  /* cppcheck cannot prove that exec_ident_sweep_dead_locked() can drop
+   * exec_ident_count below the cap, so it reports this reachable guard
+   * as always false. Keep the guard: load-bearing under table churn. */
+  // cppcheck-suppress knownConditionTrueFalse
   if (full)
     pr_warn_ratelimited("kernel-av: event=skip reason=exec-ident-table-full "
                         "pid=%d\n",
