@@ -66,6 +66,21 @@ getent passwd hyprav-scan >/dev/null || useradd -r -s /usr/sbin/nologin -d / hyp
 getent group hyprav >/dev/null || groupadd -r hyprav
 id hyprav-scan
 
+log "require an active audit collector for the SECCOMP assertion"
+# The check below treats "no type=SECCOMP records" as success. That is only
+# meaningful if an audit collector was actually running for the whole test;
+# a missing/unreadable log must not be read as zero violations.
+(systemctl enable --now auditd || service auditd start) >/dev/null 2>&1 || true
+for _ in $(seq 1 10); do
+    systemctl is-active --quiet auditd && break
+    pgrep -x auditd >/dev/null && break
+    sleep 1
+done
+systemctl is-active --quiet auditd || pgrep -x auditd >/dev/null || \
+    fail "auditd is not active; cannot assert SECCOMP audit records"
+[ -r /var/log/audit/audit.log ] || \
+    fail "/var/log/audit/audit.log is not readable; cannot assert SECCOMP audit records"
+
 log "load module, start the shipped unit"
 cd "$REPO/av"
 rmmod av 2>/dev/null || true
@@ -121,11 +136,17 @@ for _ in $(seq 1 60); do
 done
 sleep 3
 scans=$($JOURNAL | grep -c 'scan request' || true)
-inconclusive=$($JOURNAL | grep -ci 'result inconclusive' || true)
+# analyze_in_worker() logs "inconclusive in the worker" when the worker
+# itself returns an inconclusive verdict, and "result inconclusive" when no
+# worker can be spawned or its socket drops. Match both, or a worker-side
+# inconclusive is silently counted as zero and the scan flood passes.
+inconclusive=$($JOURNAL | grep -Eci 'result inconclusive|inconclusive in the worker' || true)
 workers=$(ps -eo user:20,comm | awk '$1 == "hyprav-scan" && $2 == "avd" {n++} END {print n+0}')
 sigsys=$(dmesg | grep -ic SIGSYS || true)
+# The audit collector and a readable log were verified above; zero records
+# here is a real assertion, not an artefact of a missing log file.
 seccomp=0
-if [ -f /var/log/audit/audit.log ]; then
+if [ -r /var/log/audit/audit.log ]; then
     seccomp=$(grep -c type=SECCOMP /var/log/audit/audit.log || true)
 fi
 echo "scans=$scans inconclusive=$inconclusive workers=$workers audit_seccomp=$seccomp sigsys=$sigsys"
