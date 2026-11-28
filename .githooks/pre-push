@@ -43,7 +43,11 @@ while read -r _ local_sha _ remote_sha; do
             base="$(git merge-base "$local_sha" origin/master 2>/dev/null)"
         fi
         if [ -n "$base" ]; then
-            files="$(git diff --name-only "$base" "$local_sha")"
+            # --no-renames: a moved test must still report its old tests/
+            # path as deleted. Git's rename detection would emit only the
+            # destination, so a push that removes tests/test_avd_socket.sh
+            # (which run_all.sh still calls) could skip this suite.
+            files="$(git diff --name-only --no-renames "$base" "$local_sha")"
         else
             # No usable base found (e.g. pushing to a remote with no
             # default/master branch yet). git diff-tree on a single
@@ -56,7 +60,7 @@ while read -r _ local_sha _ remote_sha; do
             files="$(git ls-tree -r --name-only "$local_sha")"
         fi
     else
-        files="$(git diff --name-only "$remote_sha" "$local_sha")"
+        files="$(git diff --name-only --no-renames "$remote_sha" "$local_sha")"
     fi
     CHANGED_FILES="$CHANGED_FILES
 $files"
