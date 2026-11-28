@@ -141,6 +141,7 @@ cleanup() {
     # so the host isn't left delaying every exec until rmmod.
     echo 0 > /sys/module/av/parameters/av_toctou_test_delay_ms 2>/dev/null
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
+    exec 9>&- 2>/dev/null || true
     rm -rf "$TEST_TMP_DIR"
     rm -f "$BUILD_LOG" "$INSMOD_LOG" "$AVD_LOG" "$RMMOD_LOG"
 }
@@ -527,23 +528,20 @@ section "daemon scans the hashed file, not what the path names now (#227)"
 # keeps sleeping, and one not yet started no longer needs to.
 TOCTOU_DELAY_PARAM=/sys/module/av/parameters/av_toctou_test_delay_ms
 TOCTOU_DELAY_MS=1000
-# toctou_wait_until CMD... - spin (no execs, see above) until CMD
-# succeeds, for up to 3s. Returns CMD's last status.
-toctou_wait_until() {
-    local deadline=$(( ${EPOCHSECONDS:-$(date +%s)} + 3 ))
-    until "$@"; do
-        [ "$EPOCHSECONDS" -ge "$deadline" ] && return 1
-    done
-}
-# script_execd PID PATH - PID has exec'd the script PATH (its argv[1]
-# under the interpreter).
-script_execd() {
-    local -a args=()
-    mapfile -d '' -t args < "/proc/$1/cmdline" 2>/dev/null || return 1
-    [ "${args[1]:-}" = "$2" ]
-}
-# binary_execd PID PATH - PID's image is PATH's inode.
-binary_execd() { [[ "/proc/$1/exe" -ef "$2" ]]; }
+# Explicit exec handshake. The child writes one byte to this FIFO as its
+# first action after execve, so the parent can block on `read` instead of
+# polling /proc in a tight loop: the old observer timed out on a 2-vCPU
+# guest because the spin loop starved the just-forked child before its
+# cmdline/exe became readable. No execs are added to the poll path while
+# the delay knob is set - `read` is a bash builtin.
+TOCTOU_READY="$TEST_TMP_DIR/exec-ready"
+mkfifo "$TOCTOU_READY" || exit 1
+# Open O_RDWR before any child starts: a `< "$TOCTOU_READY"` redirection
+# would block forever on the FIFO open if the child never execs, and `-t`
+# only bounds the read after the open succeeds. fd 9 stays open for the
+# whole section and is closed by cleanup.
+exec 9<>"$TOCTOU_READY" || exit 1
+toctou_execd() { read -r -n 1 -t 3 -u 9; }
 
 if [ ! -w "$TOCTOU_DELAY_PARAM" ]; then
     fail "$TOCTOU_DELAY_PARAM missing - av.ko built without the test knob?"
@@ -560,17 +558,20 @@ else
     UNL_CLEAN=0
     for i in 1 2 3; do
         p="$TEST_TMP_DIR/id_unlink_$i.sh"
-        printf '#!/bin/sh\n# attempt %s\necho "/bin/sh -i" >/dev/null\nsleep 3\n' \
-            "$i" > "$p"
+        printf '#!/bin/sh\n# attempt %s\nprintf x > "%s"\necho "/bin/sh -i" >/dev/null\nsleep 3\n' \
+            "$i" "$TOCTOU_READY" > "$p"
         chmod +x "$p"
         MARK="$(dmesg_mark)"
         echo "$TOCTOU_DELAY_MS" > "$TOCTOU_DELAY_PARAM"
+        read -r -n 1 -t 0 -u 9 || :  # discard a stale byte from a failed attempt
         "$p" >/dev/null 2>&1 &
         cpid=$!
-        if toctou_wait_until script_execd "$cpid" "$p"; then
+        if toctou_execd; then
             rm -f "$p"
         else
             echo "  (attempt $i: exec of $p not observed in time)"
+            kill "$cpid" 2>/dev/null || true
+            wait "$cpid" 2>/dev/null || true
         fi
         echo 0 > "$TOCTOU_DELAY_PARAM"
         if wait_dmesg_since "$MARK" "event=unverified type=daemon path=\"$p" 15; then
@@ -601,13 +602,19 @@ else
     LINGER_SRC="$TEST_TMP_DIR/linger.c"
     LINGER_BIN="$TEST_TMP_DIR/linger"
     cat > "$LINGER_SRC" <<'CEOF'
+#include <fcntl.h>
 #include <unistd.h>
 /* Matches tests/fixtures/test.yar (Suspicious_Shell_Reverse_Shell_String);
  * never runs a shell. */
 __attribute__((used)) static const char marker[] = "/bin/sh -i";
-int main(void) {
+int main(int argc, char **argv) {
   volatile const char *keep = marker;
   (void)keep;
+  /* Handshake: prove execve happened before the parent swaps the path. */
+  if (argc > 1) {
+    int fd = open(argv[1], O_WRONLY);
+    if (fd >= 0) { (void)!write(fd, "x", 1); close(fd); }
+  }
   sleep(8);
   return 43;
 }
@@ -624,12 +631,15 @@ CEOF
             chmod +x "$p"
             printf 'clean decoy %s\n' "$i" > "$p.decoy"
             echo "$TOCTOU_DELAY_MS" > "$TOCTOU_DELAY_PARAM"
-            "$p" >/dev/null 2>&1 &
+            read -r -n 1 -t 0 -u 9 || :  # discard a stale byte
+            "$p" "$TOCTOU_READY" >/dev/null 2>&1 &
             cpid=$!
-            if toctou_wait_until binary_execd "$cpid" "$p"; then
+            if toctou_execd; then
                 mv -f "$p.decoy" "$p"
             else
                 echo "  (attempt $i: exec of $p not observed in time)"
+                kill "$cpid" 2>/dev/null || true
+                wait "$cpid" 2>/dev/null || true
             fi
             echo 0 > "$TOCTOU_DELAY_PARAM"
             wait "$cpid" 2>/dev/null
