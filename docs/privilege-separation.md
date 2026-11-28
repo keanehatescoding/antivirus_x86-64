@@ -1053,7 +1053,10 @@ fanotify 29 and 34). Two limits:
 ## Rollout
 
 - Opt-in first: `AVD_PRIVSEP=1`, like `AVD_FANOTIFY` today, then default on
-  after one release of soak.
+  after one release of soak. The packaged `avd.service` now sets
+  `Environment=AVD_PRIVSEP=1`, so packaged installs run with it on and opt out
+  with `Environment=AVD_PRIVSEP=0` in a drop-in. The code default (variable
+  unset) is still off, which manual runs and the baseline test cases rely on.
 - Latency matters on the fanotify path, which holds every exec. One
   socketpair round trip is expected to be small compared with a YARA scan,
   but it should be measured, not assumed. The same measurement decides the

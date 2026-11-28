@@ -35,6 +35,16 @@ User=root
 # to.
 ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib/av-quarantine @SYSCONFDIR@/tlsh_hashes.txt
 
+# Privilege separation (#103): YARA, ssdeep and TLSH parse untrusted file
+# content, so with AVD_PRIVSEP=1 that work runs in seccomp-confined worker
+# processes under the unprivileged hyprav-scan user (declared in
+# hyprav.sysusers, created at package install) instead of in the root
+# process. avd refuses to start, rather than scan as root, if that user is
+# missing. The code default stays off for manual and test runs; the packaged
+# unit turns it on. To opt out, `systemctl edit avd.service` adding
+# Environment=AVD_PRIVSEP=0. See docs/privilege-separation.md.
+Environment=AVD_PRIVSEP=1
+
 # Pre-exec enforcement (fanotify FAN_OPEN_EXEC_PERM, #176) is opt-in:
 # it holds every exec on the machine until avd answers. Enable with
 # `systemctl edit avd.service` adding Environment=AVD_FANOTIFY=1 - see
