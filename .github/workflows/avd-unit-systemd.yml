@@ -12,9 +12,26 @@ name: avd unit under real systemd
 # (systemd 259) and Fedora 43 (systemd 258). The logs are dumped on failure
 # so a startup regression shows the actual avd message, not just "activating".
 
+# Only PRs and pushes to master: push+pull_request together would boot two
+# VMs twice for every PR-branch update. Path filters keep unrelated docs
+# changes from paying for two VM boots; .github/ is included so changes to
+# this job itself always run it.
 on:
   push:
+    branches: [master]
+    paths:
+      - 'av/**'
+      - 'userspace/avd/**'
+      - 'packaging/**'
+      - 'tests/**'
+      - '.github/**'
   pull_request:
+    paths:
+      - 'av/**'
+      - 'userspace/avd/**'
+      - 'packaging/**'
+      - 'tests/**'
+      - '.github/**'
 
 permissions:
   contents: read
@@ -22,15 +39,24 @@ permissions:
 jobs:
   avd-unit-systemd:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # TCG (no /dev/kvm) makes the in-guest build and scan workload much
+    # slower than KVM; leave room for it rather than trusting a 15-minute
+    # guest timeout measured on a KVM host.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
+          # resolute/current floats on purpose: a new systemd release
+          # should reach this job without a workflow edit. That also means
+          # an image change can break CI for reasons unrelated to the PR -
+          # check the image/serial log before blaming the diff.
           - distro: ubuntu
             user: ubuntu
             port: 2222
             image: https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img
+          # The Fedora mirror has dropped a download mid-transfer before;
+          # keep the curl retries below rather than pinning a single URL.
           - distro: fedora
             user: fedora
             port: 2223
