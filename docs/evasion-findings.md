@@ -176,12 +176,28 @@ sensitive-path-write heuristics depend on that hook: if it never fires,
 neither heuristic runs at all, while the rest of avd (exec hashing, YARA,
 fanotify) keeps working and nothing in the logs says why.
 
-This is not hypothetical. The hook was observed to fire on Fedora 43 /
-kernel 6.17.1 but not on this host's 7.3.6-3-cachyos: loading the module
-produced no write-intent behavior events there, and a bulk-write test had
-to SKIP on that kernel rather than fail. `av_file_open_nmissed` does not
-catch this — it counts missed *return-probe instances*, not a probe that
-is never entered, so it stays at zero when coverage is completely lost.
+This is not hypothetical. The hook fires on Fedora 43 / kernel 6.17.1
+and on Ubuntu 26.04 / kernel 7.0.0 (11/11 in `test_bulk_write.sh` on
+both), but not on this host's 7.3.6-3-cachyos: loading the module
+produced no write-intent behavior events there, and a bulk-write test
+had to SKIP on that kernel rather than fail. (An earlier SKIP on Ubuntu
+7.0 was a test-harness bug — a wrapped `dmesg` count hid a line that had
+actually been logged — not a hook failure.) `av_file_open_nmissed` does
+not catch the real failure — it counts missed *return-probe instances*,
+not a probe that is never entered, so it stays at zero when coverage is
+completely lost.
+
+Disassembly of the host's `vmlinux` shows why: `do_dentry_open()` calls
+the `__SCT__lsm_static_call_file_open_*` trampolines directly, and the
+out-of-line `security_file_open()` symbol has **no callers** in the
+running text (the host kernel is Clang-built with thin LTO); a live
+tracefs probe on it recorded zero hits while the exec kprobe on
+`security_bprm_check` recorded six, so kprobes in general still work.
+The legacy `__x64_sys_openat` symbol is similarly out of line on that
+kernel — syscalls dispatch through `x64_sys_call()` — which is why the
+escape hatch has no hits there either. The break is therefore between
+the GCC-built 7.0 kernel (works) and the Clang/LTO 7.3 build (does not),
+not simply "any kernel 7.x".
 
 Two observability guarantees now exist:
 
